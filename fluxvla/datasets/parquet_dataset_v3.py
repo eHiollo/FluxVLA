@@ -191,6 +191,11 @@ class ParquetDatasetV3(ParquetDataset):
         self.tasks = all_tasks
         self.episodes = all_episodes
         self.episodes_by_dataset = episodes_by_dataset
+        self.episode_metadata_by_dataset = [
+            {int(record.get('episode_index', index)): record
+             for index, record in enumerate(records)}
+            for records in episodes_by_dataset
+        ]
 
         datasets = []
         dataset_sizes = []
@@ -346,6 +351,8 @@ class ParquetDatasetV3(ParquetDataset):
         data['task_description'] = self._resolve_task_description(
             dataset_idx, data)
         data['data_root'] = self.data_root_path[dataset_idx]
+        data['episode_meta'] = self.episode_metadata_by_dataset[
+            dataset_idx][int(data['episode_index'])]
         for transform in self.transforms:
             data = transform(data)
 

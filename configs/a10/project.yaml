@@ -1,0 +1,93 @@
+# A10 workflow configuration. Site-specific values may be overridden in
+# configs/a10/site.local.yaml; never put passwords or tokens in this file.
+version: 1
+paths:
+  fluxvla_python: null  # Use the currently active platform environment.
+  outputs: work_dirs/a10
+robot:
+  backend: A10LegacyFollower
+  host: 192.168.110.124
+  port: 8080
+  timeout_ms: 300000
+  state_dim: 7
+  action_dim: 7
+  # Set only after onsite confirmation of controller, cameras and limits.
+  allow_motion: false
+  max_joint_step_rad: null
+  gripper_mm_range: null
+  idle_poll_s: 0.005
+  idle_timeout_s: 120
+  post_idle_settle_s: 0.05
+cameras:
+  # These are the established recording assignments; confirm device identities
+  # with `doctor` before physical use. Prefer /dev/v4l/by-id paths on site.
+  base_0_rgb: {device: 1, width: 640, height: 480, fps: 30, rotate_180: false, exclusive_per_read: false}
+  right_wrist_0_rgb: {device: 0, width: 640, height: 480, fps: 30, rotate_180: true, exclusive_per_read: false}
+vr:
+  arm: right
+  control_fps: 30
+  pos_scale: 0.9
+  angle_scale: 1.3
+  vr_to_robot_scale: 1.0
+  fine_trigger_threshold: 0.5
+  fine_scale_factor: 0.5
+  position_control_mode: safe_frame_delta
+  stale_timeout_s: 0.25
+  max_vr_speed_m_s: 2.0
+  spike_recovery_frames: 2
+  compute_anchor_shadow: true
+  motion_shaping_mode: robot_controller
+  position_cutoff_hz: 5.0
+  max_linear_speed_m_s: 0.25
+  max_linear_accel_m_s2: 1.0
+  engage_ramp_s: 0.35
+  record_vr_diagnostics: true
+  diagnostics_queue_size: 2048
+  diagnostics_flush_every: 30
+  pos_deadzone_m: 0.0005
+  angle_deadzone_deg: 0.05
+  max_delta_pos_m: null
+  max_delta_angle_deg: null
+  require_squeeze_to_move: true
+  gripper_thumbstick_axis: x
+  gripper_thumbstick_deadzone: 0.05
+  axis_remap: [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]
+  enable_left_events: true
+  thumbstick_event_threshold: 0.7
+vr_server:
+  host_ip: 127.0.0.1
+  https_port: 8443
+  websocket_port: 8442
+  tls_directory: work_dirs/a10/vr/tls
+dataset:
+  root: datasets/a10/a10_vr_9_21_4
+  repo_id: local/a10_vr
+  task: pick_and_place
+  fps: 30
+  num_episodes: 1
+  episode_time_s: 600
+  reset_time_s: 600
+  push_to_hub: false
+model:
+  family: pi05
+  action_source: observation.state
+  joint_action_mode: delta_from_current_state
+  gripper_action_mode: absolute
+  # Intended A10 chunk length. OpenPI h30 checkpoint still needs provenance.
+  action_horizon: 30
+  padded_action_dim: 32
+  prompt: pick_and_place
+  base_checkpoint: checkpoints/pi05_base/model.safetensors
+  tokenizer_path: checkpoints/pi05_base
+  trained_checkpoint: null
+  statistics_path: null
+  train_steps: 20000
+  batch_size: 1
+  grad_accumulation_steps: 1
+  ema_decay: null
+inference:
+  host: 127.0.0.1
+  port: 5555
+  timeout_s: 30
+  max_cycles: 0
+  max_action_chunk: 30

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<!-- Adapted from XLeVR; see ../NOTICE.md and ../LICENSE.xlevr. -->
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>FluxVLA · A10 VR</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
+<script src="vr-config.js"></script><script src="vr_app.js" defer></script>
+<link rel="stylesheet" href="styles.css"></head><body>
+<div style="position:fixed;z-index:10;padding:12px;background:#ffffffdd;border-radius:8px">
+<strong>FluxVLA · A10 VR</strong><br>进入 VR 后使用右手侧键控制机械臂、摇杆控制夹爪。<br>
+左手摇杆：右=开始/保存，左=重录，下=停止，上=复位。<br>
+相机、机器人地址和运动参数在平台配置中设置。
+</div>
+    <a-scene vr-mode-ui="enabled: true;">
+      <!-- Passthrough setup -->
+      <a-entity webxr-passthrough="referenceSpaceType: local-floor"></a-entity>
+
+      <!-- Headset tracking entity -->
+      <a-entity id="headset" camera>
+        <a-entity id="recordHudRoot" position="0 0.18 -0.72" scale="0.03 0.03 0.03">
+          <a-plane width="6.4" height="2.6" color="#000000" opacity="0.55" position="0 0 -0.04" material="shader: flat; transparent: true; opacity: 0.55"></a-plane>
+          <a-text id="recordHud" value="WAITING" color="#90CAF9" align="center" width="6" wrap-count="16" baseline="center"></a-text>
+        </a-entity>
+        <a-text id="headsetInfo" value="" position="0 -0.16 -0.72" rotation="0 0 0" scale="0.035 0.035 0.035" color="#777777" align="center"></a-text>
+      </a-entity>
+
+      <!-- Controllers: laser-controls 兼容 Quest / Pico / 其他 WebXR 手柄 -->
+      <a-entity id="leftHand" laser-controls="hand: left" oculus-touch-controls="hand: left">
+        <a-text id="leftHandInfo" value="Pos: ...\nRot: ..." position="0 0.04 -0.05" rotation="0 0 0" scale="0.05 0.05 0.05" color="white" align="center"></a-text>
+      </a-entity>
+      <a-entity id="rightHand" laser-controls="hand: right" oculus-touch-controls="hand: right">
+        <a-text id="rightHandInfo" value="Pos: ...\nRot: ..." position="0 0.04 -0.05" rotation="0 0 0" scale="0.05 0.05 0.05" color="white" align="center"></a-text>
+      </a-entity>
+    </a-scene>
+</body></html>

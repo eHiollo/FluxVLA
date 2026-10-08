@@ -51,6 +51,12 @@ class Profile:
 
 
 PROFILES = {
+    'a10':
+    Profile(
+        state_key='observation.state',
+        action_key='observation.state',
+        delta_mask=(True, ) * 6 + (False, ),
+        expected_dim=7),
     'absolute':
     Profile(state_key='observation.state', action_key='action', delta_mask=()),
     'aloha':
@@ -553,9 +559,9 @@ def compute_statistics_from_dataset_config(
     dataset_paths = []
     for source_config in source_configs:
         source_type = _config_value(source_config, 'type')
-        if source_type != 'ParquetDataset':
+        if source_type not in ('ParquetDataset', 'ParquetDatasetV3'):
             raise ValueError('Automatic transformed statistics only supports '
-                             'ParquetDataset '
+                             'ParquetDataset or ParquetDatasetV3 '
                              f'sources, got {source_type!r}.')
         roots = _config_value(source_config, 'data_root_path')
         if isinstance(roots, (str, Path)):

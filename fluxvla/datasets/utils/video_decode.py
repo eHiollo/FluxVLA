@@ -204,6 +204,61 @@ def decode_video_frames_torchcodec(
     return closest_frames
 
 
+def decode_video_frames_pyav(
+    video_path: Union[Path, str],
+    timestamps: List[float],
+    tolerance_s: float = 0.1,
+    log_loaded_timestamps: bool = False,
+) -> torch.Tensor:
+    """Decode RGB frames with PyAV when torchvision has no VideoReader."""
+    import av
+
+    if not timestamps:
+        raise ValueError('At least one video timestamp is required.')
+    first_ts, last_ts = min(timestamps), max(timestamps)
+
+    def load_candidates(seek_ts):
+        frames, points = [], []
+        with av.open(str(video_path)) as container:
+            stream = container.streams.video[0]
+            if seek_ts > 0:
+                container.seek(int(seek_ts / stream.time_base),
+                               stream=stream, backward=True)
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                pts = float(frame.pts * stream.time_base)
+                points.append(pts)
+                frames.append(torch.from_numpy(
+                    frame.to_ndarray(format='rgb24')).permute(2, 0, 1))
+                if log_loaded_timestamps:
+                    overwatch.info('Frame loaded at timestamp=%.4f', pts)
+                if pts >= last_ts:
+                    break
+        return frames, points
+
+    def match(frames, points):
+        if not points:
+            return None
+        distance = (
+            torch.tensor(timestamps, dtype=torch.float64)[:, None]
+            - torch.tensor(points, dtype=torch.float64)[None, :]).abs()
+        errors, indices = distance.min(dim=1)
+        if not bool((errors <= tolerance_s).all()):
+            return None
+        return torch.stack([frames[int(index)] for index in indices])
+
+    frames, points = load_candidates(first_ts)
+    result = match(frames, points)
+    if result is None and first_ts > 0:
+        frames, points = load_candidates(0.0)
+        result = match(frames, points)
+    if result is None:
+        raise ValueError(
+            f'Failed to find frames within tolerance for {video_path}')
+    return result
+
+
 def decode_video_frames(
     video_path: Union[Path, str],
     timestamps: List[float],
@@ -229,6 +284,11 @@ def decode_video_frames(
                 f'tolerance_s={tolerance_s}. No fallback was attempted. '
                 'Run `bash scripts/update_env.sh --skip-pull` if the '
                 'dependency is missing or incompatible.') from err
+
+    if backend == 'pyav' and not hasattr(torchvision.io, 'VideoReader'):
+        return decode_video_frames_pyav(
+            video_path, timestamps, tolerance_s=tolerance_s,
+            log_loaded_timestamps=log_loaded_timestamps)
 
     if backend in ('pyav', 'video_reader'):
         return decode_video_frames_torchvision(

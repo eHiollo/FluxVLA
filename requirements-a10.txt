@@ -1,0 +1,3 @@
+# Additional dependency for the platform-owned WebXR HTTPS/WebSocket input.
+# Install after requirements-base.txt in the same FluxVLA environment.
+websockets==15.0.1

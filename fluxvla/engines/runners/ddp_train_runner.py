@@ -773,8 +773,19 @@ class DDPTrainRunner(BaseTrainRunner):
         if overwatch.is_rank_zero():
             overwatch.info(
                 f'Resuming training from checkpoint: {self.resume_from}')
-        checkpoint_info = torch.load(
-            self.resume_from, map_location='cpu', weights_only=True)
+        # Native checkpoints contain full FP32 model and optimizer states.
+        # Map their CPU storages on demand so restoring on unified-memory GPUs
+        # does not keep an extra anonymous-RAM copy of the entire checkpoint.
+        try:
+            checkpoint_info = torch.load(
+                self.resume_from, map_location='cpu', weights_only=True,
+                mmap=True)
+        except RuntimeError as exc:
+            if 'mmap can only be used with files saved with' not in str(exc):
+                raise
+            # Preserve support for checkpoints written with legacy torch.save.
+            checkpoint_info = torch.load(
+                self.resume_from, map_location='cpu', weights_only=True)
 
         if 'model' in checkpoint_info:
             if (getattr(self, 'ema_decay', None) is not None
@@ -784,6 +795,11 @@ class DDPTrainRunner(BaseTrainRunner):
                 self._load_model_state(checkpoint_info['train_model'])
             else:
                 self._load_model_state(checkpoint_info['model'])
+
+        # Model tensors have now been copied into the live model. Release the
+        # CPU references before moving the optimizer states onto the GPU.
+        checkpoint_info.pop('model', None)
+        checkpoint_info.pop('train_model', None)
 
         # Restore training state (reuse base class logic)
         if 'global_step' in checkpoint_info:

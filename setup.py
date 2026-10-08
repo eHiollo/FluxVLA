@@ -68,6 +68,9 @@ setup(
     long_description_content_type='text/markdown',
     url=None,
     packages=find_packages(),
+    package_data={'fluxvla.projects.a10.vr': [
+        'web-ui/*.html', 'web-ui/*.js', 'web-ui/*.css', 'web-ui/media/*',
+        'LICENSE.*', 'NOTICE.md']},
     classifiers=[
         'Programming Language :: Python :: 3',
         'Operating System :: OS Independent',

@@ -99,6 +99,12 @@ def _doctor(cfg: dict) -> int:
               f'旋转180={item["rotate_180"]}；启动前确认实体相机身份')
     print(f'机器人：{cfg["robot"]["host"]}:{cfg["robot"]["port"]} '
           '(doctor 不连接机器人)')
+    network = cfg['vr_server']
+    print(f'VR 页面：https://{network["host_ip"]}:{network["https_port"]} '
+          f'（WebSocket 端口 {network["websocket_port"]}，doctor 不启动服务）')
+    if network['host_ip'] in {'127.0.0.1', 'localhost', '::1'}:
+        print('待配置  VR 当前仅监听本机，头显无法通过局域网访问；'
+              '请在 site.local.yaml 中将 vr_server.host_ip 设为本机局域网地址。')
     print(f'配置 SHA256：{fingerprint(cfg)}')
     print('基础模型：' + (str(cfg['model']['base_checkpoint'])
                       if cfg['model']['base_checkpoint'] else '尚未指定'))

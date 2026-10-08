@@ -201,6 +201,15 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 
 ## 下一阶段：现场验收与正式训练
 
+### 2026-10-08：修复 FluxVLA VR 无法从头显连接
+
+- 用户反馈旧 LeRobot `--vr-only` 能连接，FluxVLA 不能。排查发现原 XLeVR 默认绑定 `0.0.0.0`；平台配置绑定 `127.0.0.1`，且没有站点覆盖文件。头显无法通过电脑局域网地址访问只监听回环的服务，这是已确认的配置问题。
+- 创建本机 `configs/a10/site.local.yaml`，仅将 `vr_server.host_ip` 设置为当前无线网卡的 `192.168.110.119`。该文件继续由 Git 忽略；共享默认配置和机器人运动设置未改变。换网络／IP 后需更新此站点值。
+- `doctor` 增加 VR 页面及 WebSocket 端口显示，并在回环配置时提示头显不能通过局域网连接；VR 启动输出也增加此提示和首次使用本地证书的说明。操作文档补充专门排查步骤。
+- 用真实统一入口启动 `teleop --vr-only --execute`：两个端口均绑定本机局域网地址；通过该地址访问首页、配置脚本、业务 JS、样式及配置 API，全部 HTTP 200；WSS 握手通过，发送 75 个模拟手柄包后，服务终端显示 `ee.enabled=true`。报告：`work_dirs/a10/vr_lan_fix_report.json`，服务日志：`work_dirs/a10/vr_lan_fix.log`。
+- 平台原生相机／录制／HTTPS+WSS 的 3 项回归测试全部通过，日志：`work_dirs/a10/vr_lan_fix_tests.log`。网络检查是在本机经局域网接口完成，测试客户端接受了本地自签名证书；实际头显浏览器的信任和 WebXR 行为仍需用户重试确认。
+- 测试只启动 VR-only，没有连接机械臂。测试服务完成后退出，用户可重新运行原命令。
+
 详细操作见 [现场接入操作说明](a10_onsite_guide.md)，站点模板为 `configs/a10/site.example.yaml`。
 
 现场接入准备已恢复，实机验证按用户最新要求暂缓。后续配合现场人员，从下面的第一项开始：

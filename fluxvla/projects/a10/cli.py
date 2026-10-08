@@ -59,14 +59,14 @@ def _run(command: list[str], *, cwd: Path, cfg: dict, name: str,
     print(f'运行记录：{run_dir / "run_manifest.json"}', flush=True)
     child_env = dict(os.environ if env is None else env)
     child_env['FLUXVLA_A10_RUN_DIR'] = str(run_dir)
-    if name in {'teleop', 'record', 'infer'}:
+    if name in {'teleop', 'record', 'infer', 'check-hardware'}:
         lock_path = Path(cfg['paths']['outputs']) / 'robot.lock'
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open('w', encoding='utf-8') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise ValueError('Another A10 teleop/record/infer command is active') from exc
+                raise ValueError('Another A10 teleop/record/infer/check-hardware command is active') from exc
             return subprocess.run(command, cwd=cwd, env=child_env,
                                   check=False).returncode
     return subprocess.run(command, cwd=cwd, env=child_env,
@@ -126,6 +126,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--site', default=str(DEFAULT_SITE))
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('doctor', help='只读检查环境和配置')
+    hardware = sub.add_parser('check-hardware', help='采集相机并查询机器人状态，保存现场检查报告')
+    selection = hardware.add_mutually_exclusive_group()
+    selection.add_argument('--cameras-only', action='store_true')
+    selection.add_argument('--robot-only', action='store_true')
+    hardware.add_argument('--frames', type=int, default=60)
+    hardware.add_argument('--timeout', type=float, default=60,
+                          help='每项检查的最长秒数，包含模块启动时间')
+    hardware.add_argument('--execute', action='store_true')
     teleop = sub.add_parser('teleop', help='启动 XLeVR 遥操作')
     teleop.add_argument('--vr-only', action='store_true')
     teleop.add_argument('--execute', action='store_true')
@@ -168,6 +176,17 @@ def main(argv: list[str] | None = None) -> int:
         env = os.environ.copy()
         env['FLUXVLA_A10_CONFIG'] = str(Path(args.config).resolve())
         env['FLUXVLA_A10_SITE'] = str(Path(args.site).resolve())
+        if args.command == 'check-hardware':
+            if not 2 <= args.frames <= 600 or not 1 <= args.timeout <= 300:
+                raise ValueError('frames must be within [2, 600], timeout within [1, 300] seconds')
+            command = [flux_python, '-m', 'fluxvla.projects.a10.hardware_check',
+                       '--frames', str(args.frames), '--timeout', str(args.timeout)]
+            if args.cameras_only:
+                command.append('--cameras-only')
+            if args.robot_only:
+                command.append('--robot-only')
+            return _run(command, cwd=PROJECT_ROOT, cfg=cfg,
+                        name='check-hardware', execute=args.execute, env=env)
         if args.command == 'teleop':
             if args.execute and not args.vr_only and not cfg['robot']['allow_motion']:
                 raise ValueError('Set robot.allow_motion=true in site.local.yaml')

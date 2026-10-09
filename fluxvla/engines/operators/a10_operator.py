@@ -455,9 +455,11 @@ class A10Operator(BaseOperator):
                 raise RuntimeError(
                     f'Cartesian follower requires Cartesian jog coordinates, got {coordinate!r}; '
                     'explicitly call set_tool_coordinate() before starting')
-            self._connection.send_command('follower_cart')
+            # Record the attempt before send: Ctrl+C can arrive after bytes
+            # leave the socket but before send() returns to Python.
             self._started_here = True
             try:
+                self._connection.send_command('follower_cart')
                 return self._wait_mode(True)
             except A10ControllerError:
                 # A rejection may precede the outstanding get reply. Never reuse

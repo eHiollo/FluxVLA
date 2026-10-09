@@ -292,3 +292,12 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 - 启动 follower 要求 Enabled/Stopped；状态回读发现掉使能时撤销 UDP 发送资格。公开 follower_stop_pending 供控制台判断本次启动是否仍待清理；停止回读确认未运行时，即使有其他报警也可确认退出 follower，报警仍保留。
 - 本机回环测试 27/27 PASS，新增使能/掉使能往返、前置条件零控制发送、仅 ACK 超时、拒绝、故障下掉使能及停止、未使能禁止启动等检查。没有连接实机或发送硬件命令。
 - 用户此前截图已确认 Tool 设置成功、Disabled、follower 未运行；该现场进度同步至本分支。后续真实启停、UDP 目标和夹爪仍待验证。
+
+
+### 2026-10-09：命令行控制台小任务 2——交互入口及异常清理
+
+- 新增 scripts/a10_control.py，仅解析参数、显示中文状态、调用 A10Operator 公开方法，没有复制协议或访问内部连接。支持 shell 持续连接、单次 get/使能/掉使能/坐标系/夹爪操作、help 和 get --raw；端口默认 WS 5999、UDP 9998，host 显式填写，可用 --read-only 禁止所有控制。
+- shell 指令沿用 manual_en/manual_ds/set_jog_coordinate --tool/follower_cart/stop_follower/g_move --pos=...，pq 使用七个数字，米和 xyzw。跟随启停及 pq 仅限同一 shell 会话；不提供任意原始命令透传，也不猜测清错命令。
+- exit/Ctrl+D/Ctrl+C 尝试停止本次会话启动的 follower 并回读；预先已运行的 follower 不接管、不自动停止。断线后不重发命令，停止未确认时明确提示现场处理并以非零状态退出；关闭连接不自动掉使能。
+- 修复发送启动指令时 Ctrl+C 的边界：在 send 之前记录待清理状态，避免指令已发出但清理标记尚未写入。新增回环用例模拟该时机并确认停止请求。
+- 本机测试 37/37 PASS（operator 27 项、控制台 10 项）。覆盖完整 WS/UDP 往返、只读、错误输入、EOF/中断、已有 follower、断线、停止超时、单次命令与 help 无网络。git diff --check 通过。所有端点均为 127.0.0.1；没有实机操作。

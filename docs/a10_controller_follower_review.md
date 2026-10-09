@@ -311,3 +311,14 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 - 最终验证：`/home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -q`，**38/38 PASS**（operator 27、控制台 11）；git diff --check 通过。既有 Pydantic 字段警告不影响本次测试，没有修改依赖。
 - 小任务 1 提交 a199c14；小任务 2 提交 6ae09ba。当前分支 kaanh_follower，工作目录 /home/robot/VLA/FluxVLA_follower。原 FluxVLA 目录的 runner 开发内容保持原状。
 - 本阶段软件实现、模拟通信测试、使用说明已完成。没有访问 192.168.110.124 或发送实机控制命令。下一步由用户现场逐条验证 get → Tool → manual_en → follower_cart → get → stop_follower；UDP 目标执行和夹爪实际到位仍未验收。
+
+
+### 2026-10-09：修复空闲 Ping 超时与断线后退出控制台
+
+- 用户截图：get/manual_ds 报 sent 1011 ... keepalive ping timeout; no close frame received，随后控制台退出。核对当前 websockets 15.0.1 源码，默认 ping_interval=20、ping_timeout=20；该 1011 来自客户端保活失败，不是机器人业务 ret_code。截图不能确定是远端缺失 Pong、网络中断还是服务停止，也不能据此认定 manual_ds 已生效。
+- A10Operator 连接显式使用 ping_interval=None，避免空闲会话依赖尚未验证的控制器 Pong 支持。业务 request/get 的超时、坏包检查和不确定事务断开策略保留。没有后台机器人状态监视，不宣称在空闲时立即发现所有断线。
+- shell 断线及初次连接失败均保留交互提示符；新增 reconnect 显式重建连接并只读查询。重连不补发使能/掉使能/运动指令；单次终端命令失败仍非零退出，exit/Ctrl+D/Ctrl+C 仍按原规则退出。
+- 保留旧会话跟随尚未停止的不确定状态，重连不会继承旧启动归属；回读明确未运行才解除该提示。连接仍有效且有待停止的本次跟随时，reconnect 保留连接并提示 stop_follower。停止不了仍提示现场处理，不因为 UI 保留而假装可以继续控制。
+- 新增不回复 Pong 但可回复 get 的独立回环模拟，缩短库默认心跳时限验证空闲后查询；同时验证真实 get 超时仍关闭连接。新增设备离线启动、重复连接失败后恢复、断线保留提示符、失败指令不重发、旧跟随不接管及原连接停止归属测试。
+- 验证：`python -m unittest discover -s test -p 'test_a10_*.py' -q` **43/43 PASS**（operator 28、控制台 15）；git diff --check 通过。仅测试 127.0.0.1，没有连接工控机或发送实机命令；真实控制器的空闲长连接仍需现场复验。
+- 操作说明更新 reconnect、离线处理及保活说明，启动目录纠正为 /home/robot/VLA/FluxVLA（当前 kaanh_follower）；旧 FluxVLA_follower worktree 为 detached 历史版本。工作区同时存在的 projects/a10 等业务修改不纳入本次提交。

@@ -146,7 +146,7 @@ class ConsoleTest(unittest.TestCase):
             steps = iter(['follower_cart', 'get'])
             output = []
             def read(_):
-                line = next(steps)
+                line = next(steps, 'exit')
                 if line == 'get':
                     c.fault = 'disconnect'
                 return line
@@ -157,6 +157,82 @@ class ConsoleTest(unittest.TestCase):
             self.assertEqual(c.commands.count('follower_cart'), 1)
             self.assertNotIn('stop_follower', c.commands)
             self.assertIn('未能确认跟随停止', '\n'.join(output))
+
+    def test_disconnect_keeps_prompt_and_explicit_reconnect_does_not_replay(self):
+        with FakeController() as c:
+            lines = iter(['get', 'manual_ds', 'help', 'reconnect', 'get', 'exit'])
+            output = []
+            reads = 0
+            def read(_):
+                nonlocal reads
+                reads += 1
+                line = next(lines)
+                if reads == 1:
+                    c.fault = 'disconnect'
+                if line == 'reconnect':
+                    c.fault = None
+                return line
+            code = main(['--host','127.0.0.1','shell'],
+                        operator_factory=lambda **_: c.operator(), input_fn=read, output=output.append)
+            self.assertEqual(code, 0)
+            self.assertEqual(reads, 6)
+            self.assertIn('控制台保留', '\n'.join(output))
+            self.assertTrue(all(cmd == 'get' for cmd in c.commands))
+
+    def test_initial_connection_failure_stays_in_shell_and_can_recover(self):
+        with FakeController() as c:
+            robot = c.operator()
+            robot.close()
+            connect = robot.connect
+            calls = 0
+            def unavailable_then_ready():
+                nonlocal calls
+                calls += 1
+                if calls <= 2:
+                    raise ConnectionRefusedError('controller offline')
+                connect()
+            lines = iter(['help', 'reconnect', 'reconnect', 'get', 'exit'])
+            out = []
+            with patch.object(robot, 'connect', unavailable_then_ready):
+                code = main(['--host','127.0.0.1','shell'], operator_factory=lambda **_: robot,
+                            input_fn=lambda _: next(lines), output=out.append)
+            self.assertEqual(code, 0)
+            self.assertEqual(calls, 3)
+            self.assertIn('可用指令', '\n'.join(out))
+            self.assertTrue(all(cmd == 'get' for cmd in c.commands))
+
+    def test_reconnect_never_inherits_active_follower_and_remembers_uncertainty(self):
+        for still_active in (True, False):
+            with self.subTest(still_active=still_active), FakeController() as c:
+                lines = iter(['follower_cart','get','reconnect','pq 0 0 0 0 0 0 1','exit'])
+                reads = 0
+                output = []
+                def read(_):
+                    nonlocal reads
+                    reads += 1
+                    line = next(lines)
+                    if reads == 2:
+                        c.fault = 'disconnect'
+                    if line == 'reconnect':
+                        c.fault = None
+                        c.active = still_active
+                    return line
+                code = main(['--host','127.0.0.1','shell'],
+                            operator_factory=lambda **_: c.operator(), input_fn=read, output=output.append)
+                self.assertEqual(code, 1 if still_active else 0)
+                self.assertEqual(c.commands.count('follower_cart'), 1)
+                self.assertNotIn('stop_follower', c.commands)
+                with self.assertRaises(socket.timeout):
+                    c.udp.recvfrom(65535)
+                if still_active:
+                    self.assertIn('旧会话的跟随仍未确认停止', '\n'.join(output))
+
+    def test_reconnect_preserves_live_session_stop_ownership(self):
+        with FakeController() as c:
+            code, output = self.run_console(c, ['follower_cart','reconnect','stop_follower','exit'])
+            self.assertEqual(code, 0)
+            self.assertIn('连接已保留', output)
+            self.assertEqual(c.commands.count('stop_follower'), 1)
 
     def test_one_shot_and_help_have_expected_connection_scope(self):
         with FakeController() as c:

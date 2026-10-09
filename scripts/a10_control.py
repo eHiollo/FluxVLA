@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 HELP = """可用指令：
+  reconnect                     重新连接并查询状态，不重发控制指令（仅 shell）
   get [--raw]                   查看状态；--raw 显示完整回复
   manual_en                     手动使能，回读 Enabled
   manual_ds                     手动掉使能，回读 Disabled（不是急停）
@@ -29,9 +30,10 @@ pq 的 xyz 单位是米，四元数顺序是 xyzw，须为单位四元数。
 目标相对于跟随启动基准，不是绝对位置，也不是逐次累加的移动量。
 UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场核对。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
+断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
 清错仍使用现场控制器界面，本控制台不透传任意控制器命令。
 """
-SESSION_COMMANDS = {'follower_cart', 'stop_follower', 'pq'}
+SESSION_COMMANDS = {'follower_cart', 'stop_follower', 'pq', 'reconnect'}
 
 
 class CommandError(ValueError):
@@ -49,7 +51,7 @@ def parse_command(tokens):
                                  parser_class=CommandParser)
     get = subs.add_parser('get', add_help=False, allow_abbrev=False)
     get.add_argument('--raw', action='store_true')
-    for name in ('manual_en', 'manual_ds', 'follower_cart', 'stop_follower', 'exit', 'help'):
+    for name in ('manual_en', 'manual_ds', 'follower_cart', 'stop_follower', 'exit', 'help', 'reconnect'):
         subs.add_parser(name, add_help=False, allow_abbrev=False)
     coord = subs.add_parser('set_jog_coordinate', add_help=False, allow_abbrev=False)
     coord.add_argument('--tool', action='store_true', required=True)
@@ -89,6 +91,35 @@ def show_state(state, output=print):
 class A10Console:
     def __init__(self, robot, output=print):
         self.robot, self.output = robot, output
+        self.unresolved_follower = False
+
+    def observe(self, state):
+        if state.follower_active is False:
+            self.unresolved_follower = False
+        return state
+
+    def report_error(self, exc):
+        self.output(f'操作未完成：{exc}')
+        if not self.robot.is_connected:
+            self.unresolved_follower |= self.robot.follower_stop_pending
+            self.output('连接已断开，控制台保留。设备恢复后输入 reconnect；不会自动重发控制指令。')
+            if self.unresolved_follower:
+                self.output('之前的跟随尚未确认停止，请通过现场控制器确认；重连不会自动接管。')
+
+    def reconnect(self):
+        # An explicit reconnect mustn't discard a live session's ownership.
+        if self.robot.is_connected and self.robot.follower_stop_pending:
+            state = self.observe(self.robot.get_state())
+            self.output('当前连接有待停止的跟随，连接已保留；请先输入 stop_follower。')
+        else:
+            self.unresolved_follower |= self.robot.follower_stop_pending
+            self.robot.close()
+            self.robot.connect()
+            state = self.observe(self.robot.get_state())
+            self.output('连接成功（状态读取已确认），未发送使能或运动指令。')
+        show_state(state, self.output)
+        if self.unresolved_follower:
+            self.output('旧会话的跟随尚未确认停止，请在现场控制器处理；新连接不继承控制权限。')
 
     def execute(self, args):
         """Execute parsed commands via public operator methods only."""
@@ -97,33 +128,35 @@ class A10Console:
             out(HELP)
         elif cmd == 'exit':
             return False
+        elif cmd == 'reconnect':
+            self.reconnect()
         elif cmd == 'get':
-            state = robot.get_state()
+            state = self.observe(robot.get_state())
             if args.raw:
                 out(json.dumps(state.raw, ensure_ascii=False, indent=2))
             else:
                 show_state(state, out)
         elif cmd in ('manual_en', 'manual_ds'):
-            state = robot.enable() if cmd == 'manual_en' else robot.disable()
+            state = self.observe(robot.enable() if cmd == 'manual_en' else robot.disable())
             out('手动使能成功（反馈已确认）。' if cmd == 'manual_en'
                 else '手动掉使能成功（反馈已确认）。')
             show_state(state, out)
         elif cmd == 'set_jog_coordinate':
-            state = robot.set_tool_coordinate()
+            state = self.observe(robot.set_tool_coordinate())
             out('工具坐标系设置成功（Tool 反馈已确认）。')
             show_state(state, out)
         elif cmd == 'follower_cart':
-            state = robot.start_follower()
+            state = self.observe(robot.start_follower())
             out('笛卡尔跟随已启动（反馈已确认）；尚未发送 UDP 目标。')
             show_state(state, out)
         elif cmd == 'stop_follower':
-            state = robot.stop_follower()
+            state = self.observe(robot.stop_follower())
             out('跟随已停止（反馈已确认）。')
             show_state(state, out)
         elif cmd == 'pq':
             # Refresh permission before each manually issued target. This isn't
             # a background watchdog or a guarantee about the next instant.
-            robot.get_state()
+            self.observe(robot.get_state())
             robot.send_eepose({robot.arm_name: args.pose})
             out('UDP 目标已发送；没有接收确认，尚未确认运动或到位。')
         elif cmd == 'g_move':
@@ -149,10 +182,7 @@ class A10Console:
                 self.output('\n收到 Ctrl+C，正在退出。')
                 return 130
             except Exception as exc:
-                self.output(f'操作未完成：{exc}')
-                if not self.robot.is_connected:
-                    self.output('连接已断开，结束本次会话；不会自动重发控制指令。')
-                    return 1
+                self.report_error(exc)
 
     def cleanup(self):
         """Only stop this session's attempted start. Never take over another one."""
@@ -162,8 +192,10 @@ class A10Console:
                 self.output('正在请求停止本次跟随……')
                 if not self.robot.is_connected:
                     raise ConnectionError('连接已断开')
-                self.robot.stop_follower()
+                self.observe(self.robot.stop_follower())
                 self.output('本次跟随已停止（反馈已确认）。')
+            if self.unresolved_follower:
+                raise RuntimeError('旧会话的跟随仍未确认停止，新连接不能替旧会话自动停止')
         except (Exception, KeyboardInterrupt) as exc:
             ok = False
             self.output(f'未能确认跟随停止：{exc}。请在现场控制器确认并停止；异常运动时使用急停。')
@@ -193,7 +225,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     try:
         command = None if interactive else parse_command(tokens)
         if command and command.command in SESSION_COMMANDS:
-            raise CommandError('跟随启停与 pq 请在 shell 中执行，以保持同一连接。')
+            raise CommandError('跟随启停、pq 和 reconnect 请在 shell 中执行。')
     except CommandError as exc:
         output(f'指令格式错误：{exc}；使用 --host IP help 查看帮助。')
         return 2
@@ -211,13 +243,14 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
         robot = operator_factory(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
                                  timeout_s=args.timeout, allow_motion=not args.read_only)
         console = A10Console(robot, output)
-        robot.connect()
         if interactive:
-            state = robot.get_state()
-            output(f'已连接 A10：{args.host}（状态读取成功）')
-            show_state(state, output)
+            try:
+                console.reconnect()
+            except Exception as exc:
+                console.report_error(exc)
             result = console.shell(input_fn)
         else:
+            robot.connect()
             console.execute(command)
     except KeyboardInterrupt:
         output('操作被中断，正在清理连接。')

@@ -9,11 +9,11 @@
 工控机的 kaanhbin 需已正常运行；已运行时不要再启动一份。以下命令在运行 FluxVLA 的机器终端执行：
 
 ```bash
-cd /home/robot/VLA/FluxVLA_follower
+cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 shell
 ```
 
-本次实现位于 **kaanh_follower** 分支的独立 Git worktree `FluxVLA_follower`；原 `FluxVLA` 目录保留正在开发的 runner 分支。它们共享 Git 仓库历史，使用哪个目录启动，就加载哪份代码。worktree 本地复用原目录已编译的 CUDA 扩展；若删除原目录或换机，应按项目环境说明准备这些扩展。
+当前 **kaanh_follower** 分支位于 `/home/robot/VLA/FluxVLA`，runner 分支及其未提交修改保留在 `/home/robot/VLA/FluxVLA_runner`。请使用上面的当前目录；早期 `FluxVLA_follower` 目录是旧版本的 detached worktree，不包含后续修复。
 
 出现 `a10>` 后输入短指令即可。启动只连接并查询，不会自动使能、启动跟随或发送运动目标。
 
@@ -51,6 +51,7 @@ stop_follower
 | 输入 | 做什么／如何判断 |
 | --- | --- |
 | `help` | 查看命令及单位 |
+| `reconnect` | 断线后重新连接并查询；仅 shell，不补发任何控制命令 |
 | `get` | 中文显示模式、电机、坐标系、跟随、故障、关节及夹爪反馈 |
 | `get --raw` | 原始状态 JSON（含接收的嵌套字段），排查用 |
 | `manual_en` | 手动使能，等待 Enabled；仅 ACK 不算成功 |
@@ -68,7 +69,10 @@ get 没有实际夹爪字段时显示“暂无反馈”，不填假数据。夹�
 
 ### 4. 退出及错误处理
 
-- 普通错误显示“操作未完成”，连接仍有效时可继续 get/help；不会把错误命令自动重发。
+- 普通错误显示“操作未完成”。断线或启动时设备离线也保留 `a10>`，可继续 help/exit；设备恢复后输入 `reconnect`，再输入 `get`。重连失败仍保留控制台；未连接时控制命令不会发送。
+- 当前连接仍有本次跟随待停止时，reconnect 只查状态并提示先 stop_follower，保留已有连接及停止归属。断线后的新连接不继承旧会话控制权限；如果状态仍在跟随，请通过现场控制器处理。旧跟随未确认停止时，退出仍会提醒，不能误报已停止。
+- `keepalive ping timeout` 是 WebSocket Ping/Pong 保活超时，不是 get 的业务错误码。原库默认每 20 秒 Ping、等待 Pong 最多 20 秒；截图不足以区分远端未处理 Pong、网络或服务故障。适配器已禁用主动周期 Ping，get/控制回复仍有 `--timeout` 总等待上限；它不是后台断线监视器，空闲时设备断开通常在下次命令时发现。
+- 单纯 manual_ds 掉使能不等于关闭网络；工控机断电或 kaanhbin 退出会使通信失效。manual_ds 报通信错误时不算掉使能确认成功，需恢复后查询状态；控制台不自动重发失败命令。
 - exit、Ctrl+D、Ctrl+C 都尝试停止本次会话启动的 follower；不会停止预先已运行的其他会话的 follower，也不会自动掉使能。
 - 断线、强制杀进程、第二次中断或停止超时不能保证停机。若显示“未能确认跟随停止”，请在现场控制器确认并停止，异常运动时使用急停。关闭网络不代表机器人停止。
 - 单次命令失败退出码为 1，格式错误为 2；shell 正常退出为 0（不表示此前每条命令都成功），Ctrl+C 为 130，清理失败为 1。
@@ -76,7 +80,7 @@ get 没有实际夹爪字段时显示“暂无反馈”，不填假数据。夹�
 ### 5. 本机模拟测试
 
 ```bash
-cd /home/robot/VLA/FluxVLA_follower
+cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -v
 ```
 

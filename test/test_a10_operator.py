@@ -3,6 +3,7 @@
 import json
 import socket
 import threading
+import time
 import struct
 import unittest
 from unittest.mock import patch
@@ -147,10 +148,11 @@ class CodecTest(unittest.TestCase):
 class FakeController:
     """Independent loopback server implementing only the reference wire shape."""
 
-    def __init__(self, *, change_mode=True, initial_active=False, fault=None):
+    def __init__(self, *, change_mode=True, initial_active=False, fault=None, no_pong=False):
         self.change_mode = change_mode
         self.active = initial_active
         self.fault = fault
+        self.no_pong = no_pong
         self.commands, self.errors, self.operators = [], [], []
         self.actual = True
         self.mode = 'Cart' if initial_active else 'None'
@@ -168,11 +170,21 @@ class FakeController:
         self.lock = threading.Lock()
 
     def __enter__(self):
-        from websockets.sync.server import serve
+        from websockets.sync.server import serve, ServerConnection
+        from websockets.frames import OP_PING
+        class NoPongConnection(ServerConnection):
+            def __init__(self, sock, protocol, **kwargs):
+                receive = protocol.recv_frame
+                def without_pong(frame):
+                    if frame.opcode != OP_PING:
+                        receive(frame)
+                protocol.recv_frame = without_pong
+                super().__init__(sock, protocol, **kwargs)
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.bind(('127.0.0.1', 0))
         self.udp.settimeout(.2)
-        self.server = serve(self.handle, '127.0.0.1', 0)
+        self.server = serve(self.handle, '127.0.0.1', 0,
+                            create_connection=NoPongConnection if self.no_pong else None)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         return self
@@ -280,6 +292,26 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_idle_controller_without_pong_still_answers_get(self):
+        from websockets.sync.client import connect
+        def short_defaults(*args, **kwargs):
+            # Accelerate the library's default heartbeat for regression. An
+            # explicit None from the adapter must retain its usual semantics.
+            kwargs.setdefault('ping_interval', .02)
+            kwargs['ping_timeout'] = .02
+            return connect(*args, **kwargs)
+        with FakeController(no_pong=True) as controller:
+            with patch('websockets.sync.client.connect', short_defaults):
+                operator = controller.operator()
+            self.assertFalse(operator.get_state().follower_active)
+            self.assertFalse(operator._connection.ws.ping().wait(.03))
+            time.sleep(.08)
+            self.assertFalse(operator.get_state().follower_active)
+            controller.fault = 'timeout'
+            with self.assertRaises(TimeoutError):
+                operator.get_state(timeout_s=.05)
+            self.assertFalse(operator.is_connected)
+
     def test_manual_enable_disable_confirm_feedback(self):
         with FakeController() as controller:
             controller.activation = 'Disabled'

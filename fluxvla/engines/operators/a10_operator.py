@@ -210,6 +210,10 @@ class _FollowerConnection:
         from websockets.sync.client import connect
         try:
             self.ws = connect(f'ws://{self.host}:{self.ws_port}', proxy=None,
+                              # KAANH command replies are our health check. Do
+                              # not require an independently unverified Pong
+                              # implementation during an idle terminal session.
+                              ping_interval=None,
                               open_timeout=self.timeout_s, close_timeout=self.timeout_s,
                               max_size=_MAX_PAYLOAD + _HEADER.size)
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

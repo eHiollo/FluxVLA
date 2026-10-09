@@ -1,6 +1,6 @@
 # A10 控制器仿真与 follower 接口核查
 
-日期：2026-10-09。范围：本机 A10_new（提交 `c27a475`）及用户提供的 `robot.7z`。仅静态阅读和内存报文验证，没有 SSH、控制器连接、使能或运动。
+日期：2026-10-09。初次范围：本机 A10_new（提交 `c27a475`）及用户提供的 `robot.7z`，仅静态阅读和内存报文验证。随后经用户授权，以 `kaanh` 登录工控机做 SSH 只读核查，结果见下方新增章节。全程没有连接机器人业务端口、使能或发送运动指令。
 
 ## 架构约定
 
@@ -80,7 +80,7 @@
 - 修改本地 `follower_start_pq` 后，同一输入的 UDP 字节完全不变，确认客户端没有进行启动位姿相对转换。
 - 合成多模型 `get` 回复验证：关节展开为 20 维，默认 TCP 取模型 0，xyz 数值原样返回，没有单位转换。此检查验证解析行为，不验证控制器协议或机械性能。
 
-## 下一步向控制器侧核对
+## 初次核查后的控制器侧取证清单
 
 用户可在已 SSH 登录的工控机上做以下只读检查。只需提供相关版本、路径和接口片段，不需要凭据或完整配置中的账户信息。
 
@@ -94,3 +94,61 @@ rg -n 'FollowerCart|FollowerCartParam|UDPFollower|ARIS_USE_ETHERCAT_SIMULATION' 
 ```
 
 优先取得：实际库版本与仿真启动方式、FollowerCart 的目标处理源码、一条去除敏感内容的 `get` 状态样例、仿真相机输出接口。无需为本次核对启用电机或发送 follower 运动目标。
+
+## 2026-10-09：工控机 SSH 只读核查
+
+### 范围与证据限制
+
+按用户指定账号登录工控机，只使用目录／文件读取、定向文本搜索、`ss`、进程名称查询、`nm`／`readelf`、SHA256 和禁用可选锁的 Git 历史查询。没有执行附件客户端，没有向 8080、5888、5999、9998、9999 发送任何业务消息（包括 `get`），没有安装、编译、编辑、重启、切换虚拟模式或调用 sudo。检查完毕已关闭 SSH。凭据不写入文件或提交。
+
+发现 root 用户运行的 `kaanhbin` 进程，但当前账号无权读取其 `/proc/<pid>/exe` 和 `cwd`；因此下述磁盘源码／XML 不能直接认定为该进程正在使用的版本。工控机 A10_new 的 Git HEAD 为 `a9b0aaa`，源码仍在由同事开发；HEAD 也不能代表全部工作区内容或运行二进制版本。
+
+### 已确认的 follower 安装与接口
+
+| 项目 | 只读证据 | 结论及限制 |
+| --- | --- | --- |
+| 安装版本 | `/usr/aris/aris-2.5.7`、`/usr/kaanh/kaanh-2.5.7`、`/usr/kaanhbot/kaanhbot-2.5.7`；A10_new 的 CMakeCache 指向这些版本 | 工控机确有本机缺少的控制库；附件注释中的 2.5.10 multi 不能当作这里的版本 |
+| follower 声明 | `/usr/kaanh/kaanh-2.5.7/include/kaanh/follower/udpFollower.hpp` | 同时存在关节与 Cartesian follower，具体实现通过私有 `Imp` 隐藏 |
+| 已编译实现 | `lib/release/libkaanh_lib.so` 导出 `UDPFollower::init/execute`、`FollowerCart::prepareNrt/executeRT`、`FollowerCartParam::getPe/setPe/getInitPe` | 不是仅 XML 占位；在安装目录和已查项目／桌面安装包中未找到对应 `.cpp`，尚未读到完整目标处理实现 |
+| 位姿语义线索 | `udpFollower.hpp:207` 注释“下发的是相对原点的增量”；:100–108 有初始位姿、工具和工件坐标接口 | 支持相对量的判断；“原点”具体如何定义、旋转组合顺序、PQ 解码及掉包规则仍未确认，不得直接发送绝对位姿 |
+| 关节跟随能力 | :60–75 的 `FollowerAjParam` 提供轨迹生成器与直接队列入口；:188–203 的 `FollowerAjAbsolute2` 注释说明使用 MoveAbsolute2 规划 | 控制库已有关节跟随路线；实际单位、消息结构、保护及适用模式仍需服务端契约，不能仅凭方法名称接入 |
+| 端口配置 | `/home/kaanh/A10_new/kaanh.xml:4011–4015`：关节 UDP 9999、Cartesian UDP 9998；:1735／1738：WEB 5888／5999 | `ss` 同时看到这些端口及 TCP 8080 正在监听；监听不证明 follower 已启用，也没有据此确认进程归属 |
+| 消息头 | `/usr/aris/aris-2.5.7/include/aris/core/msg.hpp:15–26` 为 uint32 size、uint32 id、uint64 type、三个 int64 reserved | 字段布局与附件 40 字节 `<IIQqqq` 头一致；仅确认结构，尚未验证固定字段值和服务端载荷处理 |
+
+`FollowerParamBase` 还声明了 `setLastId/lastId`（:37–38），说明控制库有 ID 状态入口；不能由此推断附件的零值消息 ID 已满足去重或丢包处理。
+
+### 仿真现状
+
+- 工控机磁盘上的 `kaanh.xml:226–391` 仍是六个机械臂 EtherCAT 从站 `is_virtual=false`，是单臂配置；不能把附件硬编码的 20 轴布局直接套用。
+- 安装的 release `libaris_lib.so` 依赖 `libethercat.so.1`，支持实际 EtherCAT 通信。这不能排除库中同时具备虚拟驱动能力，也不能证明当前运行模式。
+- XML 指向的 `/robot/geometry/stl/Ka-Ur` 不存在。ARIS 的 `resource/robot/ur5` 里有 `L1.DWG` 等几何文件，但没有验证为 A10 模型，不能视为可用的抓取场景或双相机渲染器。
+- 在已查 A10_new、控制库安装目录、桌面 KAANH 安装包与相关项目路径，没有找到能够直接提供双路 RGB 的完整仿真启动入口。结论是“尚未找到／验证”，不是整台工控机绝对没有仿真。
+
+因此当前不能承诺“改一个地址就跑通视觉仿真”。仍需要控制器侧明确仿真服务、机器人／夹爪／物体场景、状态及相机输出；FluxVLA 继续只做协议与观测适配。
+
+### 新版 A10 TCP 与现有 FluxVLA 的差异
+
+以下来自工控机磁盘源码，尚未连接服务验证：
+
+1. **执行中反馈刷新已更新**：`main.cpp:125–151` 每约 33 ms 刷新 actualPos 和夹爪反馈，批次执行期间也刷新。本机旧版“批次期间跳过刷新”的结论不适用于这份新版源码；周期刷新也不等于具有控制器采样时间戳。
+2. **状态协议增加能力声明**：`a10_tcp_server.cpp:334` 起包含 `policy_protocol_version=2`、构建信息、`policy_running`、`batch_seq`、`motion_settling`、规划器和时间步等字段。`idle` 要求队列为空且不在收尾运动；队列为空不代表停稳。
+3. **批次支持时序和代际**：:637–697 的 `SET_JOINTS_BATCH` 保留每步 7 维，同时接受 `obs_age_s`、`expected_batch_seq` 和 `smooth`，回复 `batch_seq`。`a10_policy_batch.hpp` 按观测年龄与控制器本地时间对齐，具体使用需连同异步桥接契约一起核对。
+4. **平滑仍由控制器负责**：源码提供 `cubic_pv_v1`／`quintic_discrete_pva_v1` 能力，现场文档记录后者仍在开发核验。这里只记录磁盘能力，不宣称运行进程已使用最新版本，也不把其他团队的日志结论当作 FluxVLA 验收。
+5. **平台尚未跟进**：当前 `fluxvla/projects/a10/transport.py` 的 `send_batch()` 只发送 actions，`wait_idle()` 只检查 remaining==0；在线流程按整批完成后再推理。应先核对并适配新状态的停稳语义、能力版本和批次拒绝行为，再独立迁移观测年龄、异步重叠与代际校验。不能宣称当前平台已具有工控机新版异步衔接能力。
+
+上述差异作为下一小任务记录，本次只修改本地文档，没有改动平台控制逻辑或工控机实现。
+
+### 后续任务顺序
+
+1. 以最新 A10 TCP 源码建立离线协议样例／测试，优先修正 `idle`／`motion_settling` 的适配，明确旧版本回退规则；随后单独迁移异步推理协议。每个小任务更新文档并独立提交。
+2. 控制器侧提供 2.5.7 follower 目标处理源码或正式协议说明，明确相对基准、单位、频率、超时、模型索引、启停确认与夹爪接口。真实 `get` 样例本轮尚未取得。
+3. 确认控制器仿真与 RGB／状态输出后，增加相应 follower 和观测适配，再验证 VR→仿真运动→原生录制→训练／推理。保留现有 7 维关节训练路线；PQ 路线按独立动作语义接入。
+
+核查时关键文件 SHA256（仅用于区分后续版本，不代表运行进程版本）：
+
+```text
+udpFollower.hpp  e4f04d1d2ba817d7cbcc4a91524890114fbe9ac76b4843be5df60895ecd818da
+libkaanh_lib.so (release)  fbd638320e3025f5e3c4ec8ec8d9761c5f8499a7c69a96123b05dce039eb52b5
+A10_new/main.cpp  7f5567c357bc3fe87beaaeec02c368a3b4ac3a7dd172934dbf6841e66e83f59b
+A10_new/a10_tcp_server.cpp  dcc66ad750949d7af0f8a0c06953915956ddf6381ab85aca19f21efc9c68ab7b
+```

@@ -311,3 +311,10 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 用户发送 en 后仍 Disabled。只读调查确认控制器处于 Manual，日志 ID104（15:49:58）记录“自动使能”，历史同实例有“手动模式指令使能／掉使能”。配置 en 名称为自动模式使能，SystemSema 分开保存手动、自动和虚拟状态。
 - 纠正之前将 en/manual_en 简单等同于真机/虚拟的指导；当前现场下一步应验证 manual_en，并以 Enabled 回读为成功条件，手动掉使能对应 manual_ds。保持现有模式，不改变控制器配置或保护条件。
 - 本次 agent 只查询状态和远端日志（SQLite mode=ro），未执行使能或运动。功能代码未修改，无需重跑离线测试；只更新说明和现场记录。使能结果等待现场用户回传。
+
+
+### 2026-10-09：现场手动使能验证通过
+
+- 用户终端截图确认 manual_en 返回 ret_code=0，随后状态为 Manual／Enabled／Stopped／无故障。真实 WS 手动使能和状态确认通过，修正后的命令选择有效。
+- 连接关闭后电机保持使能；尚未进行 follower 启停或 UDP 目标执行验收。下一步为现场同连接的 follower 启动／停止测试，不发送位姿目标。
+- 本小任务只同步现场证据至两份开发文档，没有修改功能代码或远端状态。

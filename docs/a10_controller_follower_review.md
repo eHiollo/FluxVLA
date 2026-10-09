@@ -265,3 +265,10 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 据此，此前把 PDF 简化表述直接解释成“真机只能 en，manual_en 只能虚拟”的操作指导不适用于当前部署，应按实时操作模式核对。下一步由现场用户保持 Manual，发送 manual_en 并确认 Enabled；不自动切换 Auto 或修改虚拟配置。对应手动掉使能命令是 manual_ds。命令 ACK 与成功使能分开判断，失败时打印 ACK、故障和当前模式。
 
 本次没有新增运动测试或修改 operator；只是纠正命令选择指导。SSH／状态查询连接均已关闭。尚未收到本轮 manual_en 的实机结果，因此不记使能验收通过。
+
+
+### 现场回传：manual_en 使能成功
+
+2026-10-09，用户在现场执行修正后的单次 manual_en 验证脚本并提供终端截图：回复 ret_code=0、ret_context=""、ret_msg=""；随后 get 回读 op_mode=Manual、activate=Enabled、motion=Stopped、has_error=false。确认此部署下 FluxVLA 经 WS 的手动使能及状态回读链路通过；这不是仅依据 ACK 判定。
+
+脚本结束只关闭连接，未掉使能。该截图不证明 follower 启停或 UDP 位姿执行已通过。下一步由现场用户在同一连接中验证 follower_cart 启动和 stop_follower 退出，不发送 UDP 位姿或夹爪目标；异常时报告实际回读和停止结果，不把断开连接视为停止。本次 agent 未向控制器发送使能或运动命令。

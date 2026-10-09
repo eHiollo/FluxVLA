@@ -32,6 +32,12 @@ SSH 只读核查补充：工控机安装 KAANH／ARIS 2.5.7，已有编译后的
 
 依赖方向：项目配置／CLI → runners → operators／teleoperators／datasets。框架实现不得反向导入 `projects/a10`。`projects/a10` 只保留站点检查、配置装配和兼容入口。重构期间不连接工控机或真实运动，不修改控制器团队仓库，不启动正式训练。
 
+## 当前执行范围：单文件 follower 接入（2026-10-09）
+
+用户确认先做 follower，并要求运行实现全部集中在 `engines/operators/a10_operator.py`，使用 test 验证通信格式。当前在 `kaanh_follower` 分支实施；上方广泛结构重构计划暂缓。本次不创建 transports／teleoperators 等目录，不修改 runner、训练、录制或 VR，不连接真实控制器。
+
+通信沿用附件 WS 5999／UDP 9998 和 40 字节消息头，A10 仅解析六轴单臂；PQ 是相对目标 xyz 米＋xyzw，不是六关节＋夹爪状态。夹爪独立使用源码已有的 `g_move --pos=...` 封装，真实 WS 路由／反馈字段仍待控制器确认，默认反馈缺失。预计分别提交“单文件 operator＋离线测试”和“本地网络收发测试＋使用说明”。
+
 ## 实施清单
 
 | 模块 | 交付内容 | 验收 | 状态 |
@@ -270,3 +276,12 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 核查现有 BaseOperator、BaseInferenceRunner、注册器和 inference 脚本；确认没有框架级遥操作基类，现有 VR 内部接口不足以承担跨输入设备的扩展。
 - 修订结构目标和小任务顺序，优先解决用户指出的框架隔离问题；此前离线流程验收保留，但不再把它等同于框架集成完成。
 - 本小任务仅修改计划，后续各项分别验证并提交。
+
+### 2026-10-09：单文件 follower 小任务 1——协议和原生 operator
+
+- 从 `kaanh` 创建 `kaanh_follower`。新增 `engines/operators/a10_operator.py`，包含消息编解码、内部连接类、单臂反馈和 `A10Operator(BaseOperator)`；在既有 operators 包导出并注册，无新运行目录。
+- WS 头沿用模板的 id=1、type=0x1000、reserved1=0xA1B2C3D4；UDP 除载荷长度外均为 0。检查二进制帧、精确长度、JSON、ret_code、有限值及单位四元数；有界跳过空 ACK，异常事务关闭连接。
+- 原生接口：显式 connect/close、get_state/get_frame、start_follower/stop_follower、send_eepose、send_gripper。启停读取 running_state／Cart 确认，不自动登录或使能。仅允许本连接启动的 follower 接收目标／停止请求。close 只关网络，不保证控制器停止。
+- actual_pos 与 motor_pos 分别保留，不用目标值代替实际反馈；拒绝额外轴／多臂数组。关节按模板默认度→弧度，TCP 反馈单位默认未知，需明确配置后才转换。夹爪反馈默认 None；无实际夹爪反馈就不生成完整 qpos。配置路径只支持已确认的毫米数值字段，不宣称已找到真实字段。
+- g_move 命令依据本机 A10_new 的 A10GripperMove 定义，单独走 WS；ACK 只说明收到回复，不能确认到位。wait=True、关节命令、回零及平台轨迹执行明确不支持，避免复用不适用的 ROS 路径。
+- 验证：`python -m unittest discover -s test -p test_a10_operator.py -v`，7 项离线测试通过，覆盖协议字段、嵌套状态、坏帧、维度／单位、缺失反馈、四元数和注册器无网络构建。尚未进行网络收发或实机验收。

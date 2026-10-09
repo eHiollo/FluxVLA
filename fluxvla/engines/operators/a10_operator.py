@@ -157,7 +157,13 @@ def _parse_state(reply, *, joint_unit, position_unit, gripper_feedback_path):
     if joint_unit == 'deg':
         actual = None if actual is None else np.deg2rad(actual)
         target = None if target is None else np.deg2rad(target)
-    pose = _single_group(motion.get('pq'), 7, 'pq')
+    pq = motion.get('pq')
+    # The template allows [model TCP, model axis pose] even for a single arm.
+    # Joint groups above still have to describe exactly one six-axis arm.
+    if isinstance(pq, list) and len(pq) == 2 and all(isinstance(x, list) for x in pq):
+        _vector(pq[1], 7, 'auxiliary axis pq')
+        pq = pq[0]
+    pose = _single_group(pq, 7, 'pq')
     converted = None
     if pose is not None:
         _pose(pose)

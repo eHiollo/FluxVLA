@@ -36,7 +36,7 @@ SSH 只读核查补充：工控机安装 KAANH／ARIS 2.5.7，已有编译后的
 
 用户确认先做 follower，并要求运行实现全部集中在 `engines/operators/a10_operator.py`，使用 test 验证通信格式。当前在 `kaanh_follower` 分支实施；上方广泛结构重构计划暂缓。本次不创建 transports／teleoperators 等目录，不修改 runner、训练、录制或 VR，不连接真实控制器。
 
-通信沿用附件 WS 5999／UDP 9998 和 40 字节消息头，A10 仅解析六轴单臂；PQ 是相对目标 xyz 米＋xyzw，不是六关节＋夹爪状态。夹爪独立使用源码已有的 `g_move --pos=...` 封装，真实 WS 路由／反馈字段仍待控制器确认，默认反馈缺失。预计分别提交“单文件 operator＋离线测试”和“本地网络收发测试＋使用说明”。
+通信沿用附件 WS 5999／UDP 9998 和 40 字节消息头，A10 仅解析六轴单臂；PQ 是相对目标 xyz 米＋xyzw，不是六关节＋夹爪状态。夹爪独立使用源码已有的 `g_move --pos=...` 封装，真实 WS 路由／反馈字段仍待控制器确认，默认反馈缺失。已完成单文件 operator、离线及本机网络测试；真实控制器／VR 联调仍未执行。
 
 ## 实施清单
 
@@ -285,3 +285,12 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - actual_pos 与 motor_pos 分别保留，不用目标值代替实际反馈；拒绝额外轴／多臂数组。关节按模板默认度→弧度，TCP 反馈单位默认未知，需明确配置后才转换。夹爪反馈默认 None；无实际夹爪反馈就不生成完整 qpos。配置路径只支持已确认的毫米数值字段，不宣称已找到真实字段。
 - g_move 命令依据本机 A10_new 的 A10GripperMove 定义，单独走 WS；ACK 只说明收到回复，不能确认到位。wait=True、关节命令、回零及平台轨迹执行明确不支持，避免复用不适用的 ROS 路径。
 - 验证：`python -m unittest discover -s test -p test_a10_operator.py -v`，7 项离线测试通过，覆盖协议字段、嵌套状态、坏帧、维度／单位、缺失反馈、四元数和注册器无网络构建。尚未进行网络收发或实机验收。
+
+### 2026-10-09：单文件 follower 小任务 2——网络测试与说明
+
+- 小任务 1 提交：`2d13965`。扩展 `test/test_a10_operator.py`，本机真实 WebSocket 服务与 UDP 接收器独立核对 wire 字节；仅监听 127.0.0.1 随机端口，无工控机连接。
+- 新增完整查询→启动确认→UDP PQ→夹爪 WS→停止确认测试；覆盖只有 ACK 而未切换模式时禁止发目标、拒绝接管、缺实际关节禁止启动、只读门禁、损坏帧／错误返回／ACK 洪泛／超时／断线清理、非法输入不得上网、反馈故障撤销发送、并发查询序列化及重连不继承归属。
+- 核对模板后补充单臂 PQ 的 `[TCP, 辅助轴位姿]` 双组格式，仅选择该单臂 TCP；六轴反馈仍严格校验，额外机械臂不会被截断后假装兼容。
+- 最终验证：`python -m unittest discover -s test -p test_a10_operator.py -v` **17/17 PASS**；`python -m unittest discover -s test/test_datasets -p test_a10_workflow.py -v` **3/3 PASS**，既有相机／动作转换、旧 EE/reset 协议、假模型完整闭环保持通过。`git diff --check` 通过。测试 socket／服务均随上下文退出，没有新增测试结果大文件。
+- 使用说明、接口表、配置和已知限制写入 `docs/a10_controller_follower_review.md`。依赖复用 requirements-a10.txt 已有 websockets==15.0.1，未安装新包。
+- 本轮范围完成：新增运行逻辑只有 a10_operator.py 和既有包导出，未新建运行目录，未修改 runner／训练／录制／VR 或任何外部仓库。真实坐标语义、夹爪字段／命令路由及实机启停仍须另行确认；测试通过只证明符合参考报文与合成反馈，不宣称真实机器人执行通过。

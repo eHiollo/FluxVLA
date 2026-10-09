@@ -152,3 +152,59 @@ libkaanh_lib.so (release)  fbd638320e3025f5e3c4ec8ec8d9761c5f8499a7c69a96123b05d
 A10_new/main.cpp  7f5567c357bc3fe87beaaeec02c368a3b4ac3a7dd172934dbf6841e66e83f59b
 A10_new/a10_tcp_server.cpp  dcc66ad750949d7af0f8a0c06953915956ddf6381ab85aca19f21efc9c68ab7b
 ```
+
+## 2026-10-09：单文件 operator 实现与本机收发验证
+
+分支：`kaanh_follower`。运行实现集中在 `fluxvla/engines/operators/a10_operator.py`，由现有 `OPERATORS` 注册器导出；继承 `BaseOperator`，不依赖 `projects/a10`。没有新增运行目录，也没有切换旧 A10 CLI 的 TCP 8080 后端。本轮未连接真实控制器、VR 或相机。
+
+### 构建与接口
+
+```python
+from fluxvla.engines import build_operator_from_cfg
+
+operator = build_operator_from_cfg(dict(
+    type='A10Operator',
+    host='127.0.0.1',  # 示例地址；构造不建立连接
+    ws_port=5999,
+    udp_port=9998,
+    timeout_s=2.0,
+    allow_motion=False,
+    arm_name='right',
+    feedback_joint_unit='deg',    # 附件约定；实机须核实
+    feedback_position_unit=None,  # 未知时保留原始 pq，不猜米/毫米
+    gripper_feedback_path=None,   # 未取得实际毫米反馈字段
+))
+```
+
+| 方法 | 行为 |
+| --- | --- |
+| `connect()` / `close()` | 显式打开／关闭 WS 和 UDP；不登录、使能或自动启动 follower |
+| `get_state()` | 查询 `get`，返回 A10State，保留原始回复、实际／目标关节、TCP 和运行状态 |
+| `get_frame()` | 提供机器人反馈字典；完整实际关节＋实际夹爪齐全才有 qpos，不采集相机 |
+| `start_follower()` | 要求 allow_motion；拒绝接管已激活／未知 follower；发送命令后查询至 running_state=true 且 mode=Cart |
+| `send_eepose({'right': pose})` | 发送相对启动基准的 xyz 米＋xyzw；只允许本连接已启动并确认的 Cartesian follower；不做 VR／绝对位姿转换 |
+| `send_gripper({'right': 35.5})` | 封装 `g_move --pos=35.5`，范围 0–100 mm；回复不等于实际到位，wait=True 尚不支持 |
+| `stop_follower()` | 请求本连接启动的 follower 退出，并回读 running_state=false；不是物理急停 |
+
+`close()` **只释放连接，不发送停止命令**；控制器端掉线后的行为还需核实。启动超时不得继续发送位姿；如连接仍有效，可显式停止本次已发起的 follower。断线重连不继承启动归属。运行中需持续查询状态以观察故障／模式变化，本模块没有后台状态监视或已确认的控制器 watchdog。
+
+### 数据格式与限制
+
+- WS 请求头为 `<IIQqqq>`：载荷长度、1、0x1000、0xA1B2C3D4、0、0；UDP 头除长度外均为 0。接收严格检查二进制与长度，但响应 ID／保留字段没有已确认的回显约定，因此不强行要求等于请求头。
+- WS 回复要求整数 `ret_code`，非零作为失败；支持对象或 JSON 字符串形式的 `ret_context`。状态查询有总超时及跳过次数上限，可跳过延迟空 ACK。事务超时／协议错误后关闭连接，不继续复用不确定的回复队列。
+- ACK 没有可用的业务关联序号，因此不宣称普通命令 ACK 可严格归因到具体执行；follower 启停以状态回读确认，夹爪到位仍未验证。
+- `actual_pos` 与 `motor_pos` 分别解析，只接受平铺六值或单组六值；多臂／20 轴数组拒绝。PQ 接受平铺、单组或模板中的 `[TCP, 辅助轴位姿]` 两组形式，取 TCP；不把第二组作为另一条机械臂。
+- 关节可配置 wire 为 deg／rad，平台统一弧度；TCP 可配置 wire 为 m／mm，未配置时仅保留 `tcp_pq_raw`，`tcp_pq_m=None`。UDP 发送接口始终用米；不自动清零小量或修改四元数。
+- 夹爪路径相对 `ret_context`，只接受明确的毫米数字；默认没有路径，因此 `gripper_mm=None`、`qpos=None`。测试的 `test_gripper.actual_mm` **仅是合成字段，不是已验证的控制器字段**。
+- 目前未提供关节 follower、回零、轨迹定时执行、自动登录或电机使能。绝对位姿、逐帧增量与 follower 相对目标不能互换。
+- 实机待确认：状态字段／单位、相对坐标语义、夹爪 WS 命令路由和反馈、启动权限、掉包／失联行为；本地协议测试不能替代这些确认。
+
+### 复现本机测试
+
+```bash
+conda activate fluxvla-thor
+cd /home/robot/VLA/FluxVLA
+python -m unittest discover -s test -p test_a10_operator.py -v
+```
+
+测试监听仅 `127.0.0.1` 随机端口，接收端独立解包并验证头字段、长度及 JSON，不调用生产编解码来替自己证明正确。覆盖 8 项离线检查和 9 项网络检查，共 17 项：WS／UDP 完整收发、空 ACK、未确认启动、禁止接管、只读门禁、坏包／错误码／断线／超时、非法目标零发送、故障回读、并发查询和重连归属。服务和 socket 在结束时释放。

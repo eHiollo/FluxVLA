@@ -1,6 +1,8 @@
 """A10 reference protocol tests. All endpoints are loopback or in-memory."""
 
 import json
+import socket
+import threading
 import struct
 import unittest
 from unittest.mock import patch
@@ -84,6 +86,15 @@ class CodecTest(unittest.TestCase):
         flat['ret_context']['motion_msg']['actual_pos'] = [1.] * 6
         np.testing.assert_array_equal(parse(flat, joint_unit='rad').actual_joints_rad, [1.] * 6)
 
+    def test_single_arm_tcp_and_auxiliary_axis_pose(self):
+        reply = status_reply()
+        reply['ret_context']['motion_msg']['pq'].append([0, 0, 0, 0, 0, 0, 1])
+        state = parse(reply, position_unit='mm')
+        np.testing.assert_allclose(state.tcp_pq_m[:3], [.1, .2, .3])
+        reply['ret_context']['motion_msg']['pq'].append([0] * 7)
+        with self.assertRaises(A10ProtocolError):
+            parse(reply)
+
     def test_target_does_not_substitute_actual_feedback(self):
         reply = status_reply()
         del reply['ret_context']['motion_msg']['actual_pos']
@@ -128,6 +139,256 @@ class CodecTest(unittest.TestCase):
                 operator.send_joints({'right': [0] * 6})
             operator.close()
             operator.close()
+
+
+class FakeController:
+    """Independent loopback server implementing only the reference wire shape."""
+
+    def __init__(self, *, change_mode=True, initial_active=False, fault=None):
+        self.change_mode = change_mode
+        self.active = initial_active
+        self.fault = fault
+        self.commands, self.errors, self.operators = [], [], []
+        self.actual = True
+        self.mode = 'Cart' if initial_active else 'None'
+        self.driver_fault = False
+        self.lock = threading.Lock()
+
+    def __enter__(self):
+        from websockets.sync.server import serve
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp.bind(('127.0.0.1', 0))
+        self.udp.settimeout(.2)
+        self.server = serve(self.handle, '127.0.0.1', 0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def operator(self, **kwargs):
+        options = dict(host='127.0.0.1', ws_port=self.server.socket.getsockname()[1],
+                       udp_port=self.udp.getsockname()[1], timeout_s=.3,
+                       allow_motion=True)
+        options.update(kwargs)
+        operator = A10Operator(**options)
+        self.operators.append(operator)
+        operator.connect()
+        return operator
+
+    def handle(self, ws):
+        from websockets.exceptions import ConnectionClosed
+        try:
+            for packet in ws:
+                # Check reference fields independently, without production helpers.
+                assert isinstance(packet, bytes)
+                assert len(packet) >= 40
+                size, msg_id, kind, reserved1, reserved2, reserved3 = struct.unpack(
+                    '<IIQqqq', packet[:40])
+                assert (msg_id, kind, reserved1, reserved2, reserved3) == (
+                    1, 0x1000, 0xA1B2C3D4, 0, 0)
+                assert len(packet[40:]) == size
+                command = packet[40:].decode('utf-8')
+                with self.lock:
+                    self.commands.append(command)
+                if command == 'get':
+                    reply = status_reply(active=self.active, mode=self.mode)
+                    if not self.actual:
+                        del reply['ret_context']['motion_msg']['actual_pos']
+                    if self.driver_fault:
+                        reply['ret_context']['driver_msg']['driver_err_code'][0] = 8
+                    reply['ret_context']['test_gripper'] = {'actual_mm': 42.5}
+                    reply['ret_context'] = json.dumps(reply['ret_context'])
+                    if self.fault == 'timeout':
+                        continue
+                    if self.fault == 'disconnect':
+                        ws.close()
+                        return
+                    if self.fault == 'ret_code':
+                        reply = {'ret_code': 9, 'ret_msg': 'denied', 'ret_context': ''}
+                    if self.fault == 'bad_state':
+                        reply['ret_context'] = {'motion_msg': {'actual_pos': [0] * 20}}
+                    frame = wire_reply(reply)
+                    if self.fault == 'length':
+                        frame = frame[:-1]
+                    elif self.fault == 'text':
+                        frame = json.dumps(reply)
+                    elif self.fault == 'ack_flood':
+                        for _ in range(33):
+                            ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                        continue
+                    ws.send(frame)
+                elif command in ('follower_cart', 'stop_follower'):
+                    if self.change_mode:
+                        self.active = command == 'follower_cart'
+                        self.mode = 'Cart' if self.active else 'None'
+                    # Delayed empty ACK is intentionally ahead of the get reply.
+                    ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                elif command.startswith('g_move --pos='):
+                    float(command.split('=')[1])
+                    ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                else:
+                    raise AssertionError(f'Unexpected command: {command}')
+        except ConnectionClosed:
+            pass
+        except Exception as exc:
+            self.errors.append(exc)
+
+    def __exit__(self, exc_type, exc, tb):
+        for operator in self.operators:
+            operator.close()
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.udp.close()
+        if exc is None:
+            if self.thread.is_alive():
+                raise AssertionError('Fake server did not terminate')
+            if self.errors:
+                raise self.errors[0]
+
+
+class NetworkTest(unittest.TestCase):
+    def test_ws_status_start_udp_pose_gripper_and_stop(self):
+        with FakeController() as controller:
+            operator = controller.operator(feedback_position_unit='mm',
+                gripper_feedback_path=['test_gripper', 'actual_mm'])
+            frame = operator.get_frame()
+            np.testing.assert_allclose(frame['qpos'], [0, np.pi/2, -np.pi/2, np.pi, 0, np.pi/4, 42.5])
+            np.testing.assert_allclose(frame['tcp_pq_m'][:3], [.1, .2, .3])
+            self.assertTrue(operator.start_follower().follower_active)
+            target = [.001, -.002, .003, 0, 0, np.sin(.1), np.cos(.1)]
+            operator.send_eepose({'right': target})
+            packet, address = controller.udp.recvfrom(65535)
+            self.assertEqual(address[0], '127.0.0.1')
+            self.assertEqual(packet[4:40], bytes(36))
+            self.assertEqual(int.from_bytes(packet[:4], 'little'), len(packet) - 40)
+            payload = json.loads(packet[40:])
+            self.assertEqual(set(payload), {'type', 'pq'})
+            self.assertEqual(payload['type'], 'pq')
+            self.assertEqual(payload['pq'], [target])
+            self.assertEqual(operator.send_gripper({'right': 35.5})['ret_code'], 0)
+            self.assertFalse(operator.stop_follower().follower_active)
+            operator.close()
+            self.assertIsNone(operator._connection.ws)
+            self.assertIsNone(operator._connection.udp)
+            self.assertEqual(controller.commands,
+                ['get', 'get', 'follower_cart', 'get', 'get', 'g_move --pos=35.5', 'stop_follower', 'get'])
+
+    def test_ack_without_mode_transition_cannot_enable_udp(self):
+        with FakeController(change_mode=False) as controller:
+            operator = controller.operator(timeout_s=.15)
+            with self.assertRaises(TimeoutError):
+                operator.start_follower()
+            with self.assertRaisesRegex(RuntimeError, 'not been confirmed'):
+                operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
+            with self.assertRaises(socket.timeout):
+                controller.udp.recvfrom(65535)
+            # A timed-out start can still be explicitly stopped on this connection.
+            self.assertFalse(operator.stop_follower().follower_active)
+
+    def test_refuse_takeover_or_missing_actual_joints(self):
+        with FakeController(initial_active=True) as controller:
+            operator = controller.operator()
+            with self.assertRaisesRegex(RuntimeError, 'refusing takeover'):
+                operator.start_follower()
+            with self.assertRaisesRegex(RuntimeError, 'did not start'):
+                operator.stop_follower()
+            with self.assertRaises(RuntimeError):
+                operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
+            self.assertEqual(controller.commands, ['get'])
+        with FakeController() as controller:
+            controller.actual = False
+            operator = controller.operator()
+            with self.assertRaisesRegex(A10ProtocolError, 'requires joint'):
+                operator.start_follower()
+            self.assertEqual(controller.commands, ['get'])
+
+    def test_read_only_operator_never_sends_motion(self):
+        with FakeController() as controller:
+            operator = controller.operator(allow_motion=False)
+            self.assertIsNone(operator.get_frame()['qpos'])
+            for action in (operator.start_follower, operator.stop_follower,
+                           lambda: operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]}),
+                           lambda: operator.send_gripper({'right': 40})):
+                with self.assertRaises(PermissionError):
+                    action()
+            operator.close()
+            self.assertEqual(controller.commands, ['get'])
+
+    def test_faulty_transactions_close_connections(self):
+        from websockets.exceptions import ConnectionClosed
+        for fault, error in [('timeout', TimeoutError), ('disconnect', ConnectionClosed),
+                             ('ret_code', A10ControllerError), ('length', A10ProtocolError),
+                             ('text', A10ProtocolError), ('ack_flood', A10ProtocolError),
+                             ('bad_state', A10ProtocolError)]:
+            with self.subTest(fault=fault), FakeController(fault=fault) as controller:
+                operator = controller.operator(timeout_s=.1)
+                with self.assertRaises(error):
+                    operator.get_state()
+                self.assertFalse(operator.is_connected)
+                self.assertIsNone(operator._connection.udp)
+                self.assertFalse(operator._confirmed_active)
+
+    def test_invalid_targets_never_reach_wire(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            operator.start_follower()
+            commands = list(controller.commands)
+            for target in ({'left': [0] * 7}, {'right': [0] * 7},
+                           {'right': [0, 0, 0, 0, 0, 0, 1], 'left': [0] * 7}):
+                with self.assertRaises(ValueError):
+                    operator.send_eepose(target)
+            for target in ({'right': -1}, {'right': 101}, {'right': float('nan')},
+                           {'right': True}, {'left': 50}):
+                with self.assertRaises(ValueError):
+                    operator.send_gripper(target)
+            with self.assertRaises(NotImplementedError):
+                operator.send_gripper({'right': 50}, wait=True)
+            self.assertEqual(controller.commands, commands)
+            with self.assertRaises(socket.timeout):
+                controller.udp.recvfrom(65535)
+            operator.stop_follower()
+
+    def test_reported_fault_revokes_pose_send(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            operator.start_follower()
+            controller.driver_fault = True
+            self.assertTrue(operator.get_state().has_error)
+            with self.assertRaises(RuntimeError):
+                operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
+            with self.assertRaises(A10ControllerError):
+                operator.send_gripper({'right': 50})
+            self.assertFalse(any(x.startswith('g_move') for x in controller.commands))
+            controller.driver_fault = False
+            operator.stop_follower()
+
+    def test_parallel_reads_are_serialized(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            results, errors = [], []
+            def query():
+                try:
+                    results.append(operator.get_state())
+                except Exception as exc:
+                    errors.append(exc)
+            threads = [threading.Thread(target=query) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 6)
+            self.assertEqual(controller.commands, ['get'] * 6)
+
+    def test_reconnect_does_not_reuse_old_follower_ownership(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            operator.start_follower()
+            operator.close()
+            operator.connect()
+            self.assertTrue(operator.get_state().follower_active)
+            with self.assertRaises(RuntimeError):
+                operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
+            self.assertNotIn('stop_follower', controller.commands)
 
 
 if __name__ == '__main__':

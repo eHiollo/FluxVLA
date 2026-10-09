@@ -294,3 +294,13 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 最终验证：`python -m unittest discover -s test -p test_a10_operator.py -v` **17/17 PASS**；`python -m unittest discover -s test/test_datasets -p test_a10_workflow.py -v` **3/3 PASS**，既有相机／动作转换、旧 EE/reset 协议、假模型完整闭环保持通过。`git diff --check` 通过。测试 socket／服务均随上下文退出，没有新增测试结果大文件。
 - 使用说明、接口表、配置和已知限制写入 `docs/a10_controller_follower_review.md`。依赖复用 requirements-a10.txt 已有 websockets==15.0.1，未安装新包。
 - 本轮范围完成：新增运行逻辑只有 a10_operator.py 和既有包导出，未新建运行目录，未修改 runner／训练／录制／VR 或任何外部仓库。真实坐标语义、夹爪字段／命令路由及实机启停仍须另行确认；测试通过只证明符合参考报文与合成反馈，不宣称真实机器人执行通过。
+
+
+### 2026-10-09：PDF 协议核对和真实只读通信通过
+
+- 阅读用户提供的《遥操作使用说明》并 SSH 只读检查工控机，核对单六轴／单末端规划器及 WS／UDP 配置。PDF、robot.7z 保持未跟踪；没有改动远端文件或进程。
+- 使用现有 A10Operator 直接连接 192.168.110.124:5999，三次 get 全部解析成功。查询时机器人未使能、Stopped、无故障，follower 为 None／未运行。未发送 UDP 数据或任何使能、启停／运动命令。
+- 在 TCP 8080 状态确认 idle=true、policy_running=false 后，读取旧 GET_FOLLOWER_STATE；六轴＋夹爪七值可用，WS 度→弧度结果与 TCP 实际关节最大差约 3.63e-5 rad。旧接口夹爪读数约 0.026738 mm，但不把返回值当作夹爪硬件健康证明。
+- 文档区分 start_follower 与 follower_cart；现有 Python 启动方法沿模板只发送后者，真实启动次序仍待验证。WS 状态未确认夹爪反馈字段，新 operator 尚未合并旧 TCP 夹爪读数。
+- 结论：真实连接／状态读取通过；实际 follower 启停、目标接收执行和夹爪控制未验收。详情与下一步现场验证边界见 `docs/a10_controller_follower_review.md` 新增章节。
+- 本小任务仅更新两份开发文档；功能代码未修改，不需要重复运行离线回归测试。SSH 及业务查询连接均已退出。

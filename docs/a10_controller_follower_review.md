@@ -208,3 +208,44 @@ python -m unittest discover -s test -p test_a10_operator.py -v
 ```
 
 测试监听仅 `127.0.0.1` 随机端口，接收端独立解包并验证头字段、长度及 JSON，不调用生产编解码来替自己证明正确。覆盖 8 项离线检查和 9 项网络检查，共 17 项：WS／UDP 完整收发、空 ACK、未确认启动、禁止接管、只读门禁、坏包／错误码／断线／超时、非法目标零发送、故障回读、并发查询和重连归属。服务和 socket 在结束时释放。
+
+
+## 2026-10-09：使用说明核对与真实控制器只读通信
+
+用户提供 `遥操作使用说明(1).pdf`（5 页），并授权调查工控机。本次读取 PDF、SSH 检查磁盘配置，并由本机 FluxVLA 查询控制器真实状态；没有执行文档中的登录、使能、调速或运动指令，远端文件和进程未修改。PDF 保持原样、未加入 Git。
+
+### PDF 与实现对照
+
+- 第 1–2 页：关节 tg_id=0、六个关节；Cartesian tg_id=1、末端 ee_ids={0}；UDP 9999／9998。工控机 A10_new 当前磁盘 XML 与此配置一致。
+- 第 2–3 页：`get` 的 ret_context 是嵌套 JSON，包含 follower_msg.running_state／follower_mode；现有解析器与真实回复兼容。
+- 第 3–4 页：文档分别列出 `start_follower`（开始跟随功能）、`stop_follower`、`follower_aj`、`follower_cart`（运行 Cartesian 跟随）。当前 Python `start_follower()` 沿附件模板发送的是 **follower_cart**，没有发送同名 wire 命令 start_follower。文档未明确两者是否必须顺序调用，因此不能说已完成真实启动验证，也不在未确认时自行插入启动命令。
+- 第 4 页：Cartesian 目标采用二维数组，pe 为六维、pq 为七维，发送单位为米／弧度，值为增量；四元数无角度单位。文档示例展示 Euler 的 type=321；附件提供 type=pq 的具体发包模板。文档没有完整说明增量所用坐标系及旋转组合顺序，仍需实机受控验证／控制器说明。
+- 第 4–5 页：关节 jp 是绝对位置（度／毫米），与 Cartesian 增量不同。登录、虚拟使能 manual_en 和真机使能 en 是单独命令；当前 operator 不自动登录／使能。未从文档密码示例推断现机认证行为。
+
+### 实际查询结果
+
+使用已有 `A10Operator(host='192.168.110.124', allow_motion=False)`，连接 WS 5999，连续发送三次 get，三次均成功解包和解析。UDP socket 只进行本地 connect，没有发送载荷。
+
+| 项目 | 查询时结果 |
+| --- | --- |
+| WS 5999 | 连接和三次 get 均通过 |
+| 六轴实际反馈 | 解析为六维；保留 actual_pos 与 motor_pos 的区别 |
+| TCP 原始位姿（首条） | xyz 约 `[8.817572, -294.220446, 617.355520]`，xyzw 约 `[0.623286, -0.696897, 0.279013, 0.219093]` |
+| follower | running_state=false，mode=None |
+| 机器人 | activate=Disabled，motion=Stopped，op_mode=Manual，status=Normal，cs_error_code=0 |
+| 错误 | 三次 has_error=false |
+| 夹爪 | 该 WS 状态中未确认独立的实际毫米字段；当前 gripper_mm、qpos 仍为 None |
+
+随后独立只读查询 TCP 8080 的 GET_POLICY_STATUS，得到 idle=true、remaining=0、policy_running=false 后，才发送 GET_FOLLOWER_STATE：六轴弧度＋夹爪毫米共七值解析通过。构建标识为 `Oct 9 2026 10:50:24`。夹爪读数约 `0.026738 mm`，仅证明接口返回该值，不证明夹爪串口当前健康或采样新鲜度。
+
+TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（两次非同时采样），支持此控制器 WS 关节单位为度的约定。TCP 位姿数字与 PDF 示例呈毫米量级，但仅凭量级不作为坐标／单位最终验收；默认 position_unit 仍未更改。
+
+远端磁盘 Git HEAD 为 `97feb31`；控制进程为 root 运行的 kaanhbin，PID 与上次不同。磁盘 HEAD 不等于运行二进制。监听端口 5888、5999、8080、9998、9999 均存在；端口监听不等于跟随模式已激活。SSH、WS、TCP 和本地 UDP socket 检查后均已关闭。
+
+### 当前结论与下一步
+
+**FluxVLA 已能连接真实控制器并读取机械臂反馈。尚不能宣称运动通信完全验收。** 本轮没有发送 follower_cart／start_follower／stop_follower、UDP PQ、g_move 或使能命令。
+
+下一步实际运动验收需现场协调独占控制、由现场人员按真机流程使能，再确认 follower 启动顺序，以受控目标核对方向、尺度、回读及停止行为；不自动重启控制器或改 XML。用户此前要求不影响同事的工控机开发，因此本次调查没有扩展成真实运动操作。
+
+完整 A10 六轴＋夹爪观测目前可由旧 TCP 查询得到；新 WS operator 尚未接入该补充通道。后续可选择在控制器 WS 返回实际夹爪字段，或明确配置旧 TCP 只读补充，不能给新 operator 随意填一个不存在的字段路径。

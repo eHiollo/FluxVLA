@@ -24,7 +24,8 @@ def status_reply(*, active=False, mode='None'):
                        'pq': [[100, 200, 300, 0, 0, 0, 1]]},
         'follower_msg': {'running_state': active, 'follower_mode': mode},
         'driver_msg': {'driver_err_code': [0] * 6},
-        'robot_msg': {'cs_error_code': 0, 'motion': 'Stopped'},
+        'robot_msg': {'cs_error_code': 0, 'motion': 'Stopped',
+                      'op_mode': 'Manual', 'activate': 'Enabled'},
         'log_msg': {'has_error': False}}}
 
 
@@ -156,6 +157,10 @@ class FakeController:
         self.driver_fault = False
         self.coordinate = 'Tool'
         self.motion = 'Stopped'
+        self.op_mode = 'Manual'
+        self.activation = 'Enabled'
+        self.activation_change = True
+        self.reject_enable = False
         self.coordinate_change = True
         self.start_rejected = False
         self.active_after_rejection = False
@@ -201,6 +206,8 @@ class FakeController:
                     reply = status_reply(active=self.active, mode=self.mode)
                     reply['ret_context']['motion_msg']['jog_coordinate'] = self.coordinate
                     reply['ret_context']['robot_msg']['motion'] = self.motion
+                    reply['ret_context']['robot_msg']['op_mode'] = self.op_mode
+                    reply['ret_context']['robot_msg']['activate'] = self.activation
                     if not self.actual:
                         del reply['ret_context']['motion_msg']['actual_pos']
                     if self.driver_fault:
@@ -242,6 +249,13 @@ class FakeController:
                     if self.coordinate_change:
                         self.coordinate = 'Tool'
                     ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                elif command in ('manual_en', 'manual_ds'):
+                    if self.reject_enable:
+                        ws.send(wire_reply({'ret_code': 9, 'ret_msg': 'denied', 'ret_context': ''}))
+                        continue
+                    if self.activation_change:
+                        self.activation = 'Enabled' if command == 'manual_en' else 'Disabled'
+                    ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                 elif command.startswith('g_move --pos='):
                     float(command.split('=')[1])
                     ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
@@ -266,6 +280,56 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_manual_enable_disable_confirm_feedback(self):
+        with FakeController() as controller:
+            controller.activation = 'Disabled'
+            operator = controller.operator()
+            self.assertEqual(operator.enable().raw['ret_context']['robot_msg']['activate'], 'Enabled')
+            self.assertEqual(operator.disable().raw['ret_context']['robot_msg']['activate'], 'Disabled')
+            self.assertEqual(controller.commands, ['get', 'manual_en', 'get', 'get', 'manual_ds', 'get'])
+
+    def test_enable_preconditions_never_send_control(self):
+        for field, value in (('op_mode', 'Auto'), ('op_mode', None),
+                             ('motion', 'Running'), ('motion', None),
+                             ('driver_fault', True), ('active', True)):
+            with self.subTest(field=field), FakeController() as controller:
+                setattr(controller, field, value)
+                operator = controller.operator()
+                with self.assertRaises(RuntimeError):
+                    operator.enable()
+                self.assertEqual(controller.commands, ['get'])
+
+    def test_enable_ack_timeout_and_rejection(self):
+        for rejected in (False, True):
+            with self.subTest(rejected=rejected), FakeController() as controller:
+                controller.activation = 'Disabled'
+                controller.activation_change = False
+                controller.reject_enable = rejected
+                operator = controller.operator(timeout_s=.1)
+                with self.assertRaises(A10ControllerError if rejected else TimeoutError):
+                    operator.enable()
+                self.assertEqual(controller.commands.count('manual_en'), 1)
+
+    def test_disable_during_fault_and_stop_confirmation(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            operator.start_follower()
+            self.assertTrue(operator.follower_stop_pending)
+            controller.driver_fault = True
+            self.assertTrue(operator.disable().has_error)
+            with self.assertRaises(RuntimeError):
+                operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
+            self.assertFalse(operator.stop_follower().follower_active)
+            self.assertFalse(operator.follower_stop_pending)
+
+    def test_disabled_follower_start_refused(self):
+        with FakeController() as controller:
+            controller.activation = 'Disabled'
+            operator = controller.operator()
+            with self.assertRaisesRegex(RuntimeError, 'Enabled'):
+                operator.start_follower()
+            self.assertEqual(controller.commands, ['get'])
+
     def test_coordinate_precheck_and_explicit_selection(self):
         with FakeController() as controller:
             controller.coordinate = 'Axis'
@@ -394,6 +458,7 @@ class NetworkTest(unittest.TestCase):
             operator = controller.operator(allow_motion=False)
             self.assertIsNone(operator.get_frame()['qpos'])
             for action in (operator.start_follower, operator.stop_follower, operator.set_tool_coordinate,
+                           operator.enable, operator.disable,
                            lambda: operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]}),
                            lambda: operator.send_gripper({'right': 40})):
                 with self.assertRaises(PermissionError):

@@ -326,3 +326,12 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 启动返回控制器错误后，旧异常事务连接仍关闭，仅新建连接只读查状态。确认未运行才撤销本次待清理标记；否则保留不确定性，原始异常上报，不自动重发启动或发送停止／运动目标。
 - test_a10_operator.py 新增现场问题回归与失败路径检查，本机回环 **22/22 PASS**；git diff --check 通过。说明同步 docs/a10_controller_follower_review.md，仍保持单文件 operator 结构。
 - agent 对工控机仅 get／SSH 只读日志，无设置或运动。下一步由现场用户清除坐标系报警，验证 Tool 设置，再手动使能及验证 follower 启停；本机测试不能代替实机验收。
+
+
+### 2026-10-09：命令行控制台小任务 1——公开使能接口
+
+- 用户批准在 kaanh_follower 实施控制台。原目录处于 kaanh_a10_runner 且有未提交开发内容，因此使用独立 worktree `/home/robot/VLA/FluxVLA_follower`，原工作区未改。现有 fluxvla 环境可用；worktree 通过未跟踪的本地符号链接复用原目录三项 CUDA 扩展，无重新安装或编译。
+- 在 a10_operator.py 补充 enable()/disable()，分别发送 manual_en/manual_ds 并限时回读 Enabled/Disabled；仅支持已确认 Manual 模式，不自动切换模式。使能要求无故障、Stopped、follower 未运行；掉使能可在有故障时请求，但不视为急停。
+- 启动 follower 要求 Enabled/Stopped；状态回读发现掉使能时撤销 UDP 发送资格。公开 follower_stop_pending 供控制台判断本次启动是否仍待清理；停止回读确认未运行时，即使有其他报警也可确认退出 follower，报警仍保留。
+- 本机回环测试 27/27 PASS，新增使能/掉使能往返、前置条件零控制发送、仅 ACK 超时、拒绝、故障下掉使能及停止、未使能禁止启动等检查。没有连接实机或发送硬件命令。
+- 用户此前截图已确认 Tool 设置成功、Disabled、follower 未运行；该现场进度同步至本分支。后续真实启停、UDP 目标和夹爪仍待验证。

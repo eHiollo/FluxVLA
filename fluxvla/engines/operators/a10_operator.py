@@ -2,7 +2,7 @@
 
 Wire layout follows the user-supplied robot.7z reference. Controller-side
 planning stays on the controller. This module does not open connections at
-import/construction, enable motors, interpret VR increments, or invent a
+import/construction, automatically enable motors, interpret VR increments, or invent a
 seventh joint. A Cartesian target is an origin-relative pose, not joint state.
 """
 
@@ -317,6 +317,11 @@ class A10Operator(BaseOperator):
     def is_connected(self):
         return self._connection.ws is not None and self._connection.udp is not None
 
+    @property
+    def follower_stop_pending(self):
+        """This session sent a start that hasn't been confirmed inactive yet."""
+        return self._started_here
+
     def connect(self):
         with self._io_lock:
             if not self.is_connected:
@@ -343,6 +348,7 @@ class A10Operator(BaseOperator):
                                      gripper_feedback_path=self.gripper_feedback_path)
                 self._confirmed_active = (state.follower_active is True
                                           and state.follower_mode == 'Cart'
+                                          and state.raw['ret_context'].get('robot_msg', {}).get('activate') == 'Enabled'
                                           and not state.has_error)
                 return state
             except Exception:
@@ -363,13 +369,51 @@ class A10Operator(BaseOperator):
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
-            if state.has_error:
-                raise A10ControllerError('Controller reports a fault')
             if state.follower_active is active and (not active or state.follower_mode == 'Cart'):
+                if active and state.has_error:
+                    raise A10ControllerError('Controller reports a fault')
                 return state
+            if state.has_error and active:
+                raise A10ControllerError('Controller reports a fault')
             time.sleep(min(.02, max(0., deadline - time.monotonic())))
         self._confirmed_active = False
         raise TimeoutError('Follower mode change was not confirmed')
+
+    def enable(self):
+        """Request manual_en in Manual mode and confirm Enabled feedback."""
+        return self._set_manual_enable(True)
+
+    def disable(self):
+        """Request manual_ds in Manual mode; this is not an emergency stop."""
+        return self._set_manual_enable(False)
+
+    def _set_manual_enable(self, enabled):
+        with self._io_lock:
+            self._require_motion()
+            state = self.get_state()
+            info = state.raw['ret_context'].get('robot_msg', {})
+            if info.get('op_mode') != 'Manual':
+                raise RuntimeError('Manual enable/disable requires Manual mode; no automatic mode switch')
+            if enabled:
+                if state.has_error:
+                    raise A10ControllerError('Controller reports a fault')
+                if info.get('motion') != 'Stopped' or state.follower_active is not False:
+                    raise RuntimeError('Enable requires Stopped feedback and inactive follower')
+            self._confirmed_active = False
+            self._connection.request('manual_en' if enabled else 'manual_ds')
+            expected = 'Enabled' if enabled else 'Disabled'
+            deadline = time.monotonic() + self.timeout_s
+            while time.monotonic() < deadline:
+                state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+                info = state.raw['ret_context'].get('robot_msg', {})
+                if info.get('op_mode') != 'Manual':
+                    raise RuntimeError('Controller left Manual mode during enable/disable')
+                if enabled and state.has_error:
+                    raise A10ControllerError('Controller reports a fault')
+                if info.get('activate') == expected:
+                    return state
+                time.sleep(min(.02, max(0., deadline - time.monotonic())))
+            raise TimeoutError(f'{expected} feedback was not confirmed')
 
     def set_tool_coordinate(self):
         """Explicitly select Tool jog coordinates and verify feedback; no target sent."""
@@ -403,6 +447,9 @@ class A10Operator(BaseOperator):
                 raise RuntimeError('Follower is active or its state is unknown; refusing takeover')
             if state.actual_joints_rad is None or state.tcp_pq_raw is None:
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
+            info = state.raw['ret_context'].get('robot_msg', {})
+            if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
+                raise RuntimeError('Follower start requires Enabled and Stopped feedback')
             coordinate = state.raw['ret_context']['motion_msg'].get('jog_coordinate')
             if coordinate not in ('Base', 'Tool', 'Wobj'):
                 raise RuntimeError(

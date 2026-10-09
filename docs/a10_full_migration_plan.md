@@ -304,3 +304,10 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 文档区分 start_follower 与 follower_cart；现有 Python 启动方法沿模板只发送后者，真实启动次序仍待验证。WS 状态未确认夹爪反馈字段，新 operator 尚未合并旧 TCP 夹爪读数。
 - 结论：真实连接／状态读取通过；实际 follower 启停、目标接收执行和夹爪控制未验收。详情与下一步现场验证边界见 `docs/a10_controller_follower_review.md` 新增章节。
 - 本小任务仅更新两份开发文档；功能代码未修改，不需要重复运行离线回归测试。SSH 及业务查询连接均已退出。
+
+
+### 2026-10-09：使能指导纠正——按实际操作模式核对
+
+- 用户发送 en 后仍 Disabled。只读调查确认控制器处于 Manual，日志 ID104（15:49:58）记录“自动使能”，历史同实例有“手动模式指令使能／掉使能”。配置 en 名称为自动模式使能，SystemSema 分开保存手动、自动和虚拟状态。
+- 纠正之前将 en/manual_en 简单等同于真机/虚拟的指导；当前现场下一步应验证 manual_en，并以 Enabled 回读为成功条件，手动掉使能对应 manual_ds。保持现有模式，不改变控制器配置或保护条件。
+- 本次 agent 只查询状态和远端日志（SQLite mode=ro），未执行使能或运动。功能代码未修改，无需重跑离线测试；只更新说明和现场记录。使能结果等待现场用户回传。

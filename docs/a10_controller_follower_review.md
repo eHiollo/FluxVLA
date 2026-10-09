@@ -249,3 +249,19 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 下一步实际运动验收需现场协调独占控制、由现场人员按真机流程使能，再确认 follower 启动顺序，以受控目标核对方向、尺度、回读及停止行为；不自动重启控制器或改 XML。用户此前要求不影响同事的工控机开发，因此本次调查没有扩展成真实运动操作。
 
 完整 A10 六轴＋夹爪观测目前可由旧 TCP 查询得到；新 WS operator 尚未接入该补充通道。后续可选择在控制器 WS 返回实际夹爪字段，或明确配置旧 TCP 只读补充，不能给新 operator 随意填一个不存在的字段路径。
+
+
+## 2026-10-09：en 未使能的调查与操作说明纠正
+
+用户执行真机 `en` 后，回读仍为 Disabled／Stopped／无故障。再次仅查询 get 并 SSH 只读调查，没有重复发送 en 或试发 manual_en，没有修改控制模式、虚拟设置、IO／安全配置或远端文件。
+
+证据：
+
+- 实际 get：op_mode=Manual，activate=Disabled，六轴 driver_err_code 全 0，follower 未运行。
+- A10_new XML 的 en AuthorityRule 名称为“自动模式使能”，en／manual_en／virtual_en 分别路由到 SystemSema。
+- `/home/kaanh/A10_new/build/kaanh_rtc/bin/syslog.db` 通过 SQLite `mode=ro` 读取：ID 104、2026-10-09 15:49:58 记录“自动使能”，说明用户 en 已到达控制器；ID 102、14:51:01 为“手动模式指令使能”，ID 103、15:12:06 为“手动模式指令掉使能”。历史日志不是本次 manual_en 已通过的证明。
+- `/usr/kaanhbot/kaanhbot-2.5.7/include/kaanhbot/robot/system_sema.hpp` 的 SystemSema 分别维护 motion_is_virtual_、auto_on_、manual_on_／manual_en_now_，区分虚拟状态与手动／自动使能逻辑。
+
+据此，此前把 PDF 简化表述直接解释成“真机只能 en，manual_en 只能虚拟”的操作指导不适用于当前部署，应按实时操作模式核对。下一步由现场用户保持 Manual，发送 manual_en 并确认 Enabled；不自动切换 Auto 或修改虚拟配置。对应手动掉使能命令是 manual_ds。命令 ACK 与成功使能分开判断，失败时打印 ACK、故障和当前模式。
+
+本次没有新增运动测试或修改 operator；只是纠正命令选择指导。SSH／状态查询连接均已关闭。尚未收到本轮 manual_en 的实机结果，因此不记使能验收通过。

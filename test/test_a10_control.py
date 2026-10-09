@@ -3,7 +3,10 @@
 import contextlib
 import io
 import json
+from pathlib import Path
 import socket
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +15,21 @@ from test_a10_operator import FakeController
 
 
 class ConsoleTest(unittest.TestCase):
+    def test_script_entrypoint_from_another_directory(self):
+        script = Path(__file__).resolve().parents[1] / 'scripts/a10_control.py'
+        with FakeController() as c:
+            c.activation = 'Disabled'
+            result = subprocess.run([sys.executable, str(script), '--host', '127.0.0.1',
+                '--ws-port', str(c.server.socket.getsockname()[1]),
+                '--udp-port', str(c.udp.getsockname()[1]), '--timeout', '1', 'shell'],
+                input='manual_en\nfollower_cart\nstop_follower\nmanual_ds\nexit\n',
+                text=True, capture_output=True, cwd='/tmp', timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn('操作未完成', result.stdout)
+            self.assertIn('手动使能成功', result.stdout)
+            self.assertEqual([cmd for cmd in c.commands if cmd != 'get'],
+                ['manual_en', 'follower_cart', 'stop_follower', 'manual_ds'])
+
     def run_console(self, controller, commands, extra=()):
         output = []
         lines = iter(commands)
@@ -158,6 +176,7 @@ class ConsoleTest(unittest.TestCase):
 
     def test_parse_exact_controller_spelling(self):
         self.assertEqual(parse_command(['g_move','--pos=12.5']).pos, 12.5)
+        self.assertEqual(parse_command(['pq','-1e-3','0','0','0','0','0','1']).pose[0], -.001)
         with self.assertRaises(CommandError):
             parse_command(['set_jog_coordinate','--to'])
 

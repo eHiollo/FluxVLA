@@ -57,6 +57,10 @@ def parse_command(tokens):
     pose.add_argument('pose', nargs=7, type=float)
     gripper = subs.add_parser('g_move', add_help=False, allow_abbrev=False)
     gripper.add_argument('--pos', type=float, required=True)
+    # pq has only positional numbers. argparse otherwise mistakes -1e-3 for
+    # an option, despite it being a valid small negative Cartesian target.
+    if tokens and tokens[0] == 'pq' and tokens[1:2] != ['--']:
+        tokens = ['pq', '--', *tokens[1:]]
     return parser.parse_args(tokens)
 
 

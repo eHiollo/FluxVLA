@@ -344,3 +344,12 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - exit/Ctrl+D/Ctrl+C 尝试停止本次会话启动的 follower 并回读；预先已运行的 follower 不接管、不自动停止。断线后不重发命令，停止未确认时明确提示现场处理并以非零状态退出；关闭连接不自动掉使能。
 - 修复发送启动指令时 Ctrl+C 的边界：在 send 之前记录待清理状态，避免指令已发出但清理标记尚未写入。新增回环用例模拟该时机并确认停止请求。
 - 本机测试 37/37 PASS（operator 27 项、控制台 10 项）。覆盖完整 WS/UDP 往返、只读、错误输入、EOF/中断、已有 follower、断线、停止超时、单次命令与 help 无网络。git diff --check 通过。所有端点均为 127.0.0.1；没有实机操作。
+
+
+### 2026-10-09：命令行控制台小任务 3——入口验收和现场说明
+
+- 在 docs/a10_onsite_guide.md 顶部加入原生 follower 控制台教程：独立 worktree 启动路径、命令速查、逐条启停验证、单位、只读模式、退出和失败处理。旧相机/VR/录制流程保留在后半部分并明确区分。
+- 新增真实子进程入口测试：从 /tmp 启动本 worktree 的脚本，通过回环服务完成使能、跟随启停和掉使能；验证脚本加载当前分支而不是另一个 editable checkout。补充 pq 负科学计数法输入支持及解析回归，避免 -1e-3 被当作选项。
+- 最终验证：`/home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -q`，**38/38 PASS**（operator 27、控制台 11）；git diff --check 通过。既有 Pydantic 字段警告不影响本次测试，没有修改依赖。
+- 小任务 1 提交 a199c14；小任务 2 提交 6ae09ba。当前分支 kaanh_follower，工作目录 /home/robot/VLA/FluxVLA_follower。原 FluxVLA 目录的 runner 开发内容保持原状。
+- 本阶段软件实现、模拟通信测试、使用说明已完成。没有访问 192.168.110.124 或发送实机控制命令。下一步由用户现场逐条验证 get → Tool → manual_en → follower_cart → get → stop_follower；UDP 目标执行和夹爪实际到位仍未验收。

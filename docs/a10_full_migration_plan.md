@@ -16,6 +16,22 @@ OpenPI 的 `a10_vr_9_21_4_h30/90000` 权重仍在调试。本次先接通原生 
 
 SSH 只读核查补充：工控机安装 KAANH／ARIS 2.5.7，已有编译后的关节与 Cartesian follower；完整目标处理源码及视觉仿真尚未取得。工控机 A10_new 已发展到异步批次协议 v2，平台还未迁入相关能力。下一小任务优先适配新版停稳状态，再分步迁移异步协议；控制器仿真／图像契约继续确认。详见 [工控机核查记录](a10_controller_follower_review.md)。
 
+## 2026-10-09 架构纠正：使用框架扩展接口
+
+用户指出此前把运行实现集中在 `projects/a10`，形成了独立业务流程，不利于新增机器人。这一问题成立：注册 `A10LegacyFollower` 并不能替代对 `BaseOperator`／`BaseInferenceRunner` 的实际继承和调用。下列结构调整优先于新版控制器异步协议迁移。
+
+核查原项目：`engines/operators/base_operator.py` 提供观测和动作接口，已有 Aloha／UR／Franka／Tron2／Oli 子类；`engines/runners/base_inference_runner.py` 提供预处理→推理→后处理→执行模板和远程 ZMQ。没有找到框架级遥操作基类；Oli 的 teleop 消息是控制协议，迁入的 `BaseInputProvider` 则仅是 WebXR 服务内部接口。
+
+本轮小任务（逐项验证、记录和提交）：
+
+1. **机器人接口**：在 `engines/operators` 实现继承 `BaseOperator` 的 `A10Operator`，TCP 编解码放同层 transports，相机作为共享组件；现有 A10 协议保持单六轴＋夹爪，控制器负责轨迹规划。兼容旧导入不保留第二套实现。
+2. **推理接口**：在 `engines/runners` 实现 `A10InferenceRunner(BaseInferenceRunner)`，复用基类远程预测与处理阶段，经 `RUNNERS` 和现有 inference 脚本构建。项目 CLI 只组装配置和调用 runner。
+3. **遥操作接口**：新增 `engines/teleoperators/BaseTeleoperator` 及 `TELEOPERATORS` 注册器，WebXR 输入成为子类；输入采集、动作映射、机器人发送分别负责。遥操作循环进入 runners，支持替换输入方式，基类不写死单臂维度。
+4. **数据与录制归位**：数据转换和在线数据集移入现有 transforms／datasets；录制 writer 进入 datasets，字段和相机由 schema 配置；A10 的具体字段留在 A10 配置／实现中。保留已验证的保存、重录、续录和合成数据隔离。
+5. **验收与说明**：验证注册器构建、基类继承、假服务闭环、VR 服务与录制兼容；新增机器人扩展说明，说明单臂／双臂／人形是各自 operator、动作映射和数据 schema，不代表本轮已实现双臂／人形控制。
+
+依赖方向：项目配置／CLI → runners → operators／teleoperators／datasets。框架实现不得反向导入 `projects/a10`。`projects/a10` 只保留站点检查、配置装配和兼容入口。重构期间不连接工控机或真实运动，不修改控制器团队仓库，不启动正式训练。
+
 ## 实施清单
 
 | 模块 | 交付内容 | 验收 | 状态 |
@@ -248,3 +264,9 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 发现远程 A10_new（Git HEAD `a9b0aaa`，工作区仍在开发）比本机初查版本更新：执行期间刷新反馈，状态协议 v2 区分 `remaining`、`motion_settling` 和 `idle`；批次支持观测年龄、预期批次序号和平滑选择。平台当前只发 actions、等 remaining==0，尚未具备新版异步衔接。
 - 后续优先项：离线适配 `idle`／`motion_settling` 和能力兼容，再单独迁移异步时序／代际；控制器侧继续确认 follower 语义、夹爪和仿真 RGB。控制规划仍留在控制器，不复制到平台。此次未改变平台运行逻辑或切换机器人后端。
 - 更新文件：本文和 `docs/a10_controller_follower_review.md`，后者保留接口证据路径、文件哈希、限制和任务顺序。验证为 SSH 只读取证及文档差异检查；未进行硬件、协议通信或仿真执行测试。
+
+### 2026-10-09：框架结构纠正，小任务 0——核查与计划
+
+- 核查现有 BaseOperator、BaseInferenceRunner、注册器和 inference 脚本；确认没有框架级遥操作基类，现有 VR 内部接口不足以承担跨输入设备的扩展。
+- 修订结构目标和小任务顺序，优先解决用户指出的框架隔离问题；此前离线流程验收保留，但不再把它等同于框架集成完成。
+- 本小任务仅修改计划，后续各项分别验证并提交。

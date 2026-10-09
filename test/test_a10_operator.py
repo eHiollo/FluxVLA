@@ -19,11 +19,13 @@ from fluxvla.engines.operators.base_operator import BaseOperator
 def status_reply(*, active=False, mode='None'):
     return {'ret_code': 0, 'ret_msg': '', 'ret_context': {
         'motion_msg': {'actual_pos': [[0, 90, -90, 180, 0, 45]],
+                       'jog_coordinate': 'Tool',
                        'motor_pos': [[1, 2, 3, 4, 5, 6]],
                        'pq': [[100, 200, 300, 0, 0, 0, 1]]},
         'follower_msg': {'running_state': active, 'follower_mode': mode},
         'driver_msg': {'driver_err_code': [0] * 6},
-        'robot_msg': {'cs_error_code': 0}, 'log_msg': {'has_error': False}}}
+        'robot_msg': {'cs_error_code': 0, 'motion': 'Stopped'},
+        'log_msg': {'has_error': False}}}
 
 
 def wire_reply(reply):
@@ -152,6 +154,12 @@ class FakeController:
         self.actual = True
         self.mode = 'Cart' if initial_active else 'None'
         self.driver_fault = False
+        self.coordinate = 'Tool'
+        self.motion = 'Stopped'
+        self.coordinate_change = True
+        self.start_rejected = False
+        self.active_after_rejection = False
+        self.recovery_fault = None
         self.lock = threading.Lock()
 
     def __enter__(self):
@@ -191,6 +199,8 @@ class FakeController:
                     self.commands.append(command)
                 if command == 'get':
                     reply = status_reply(active=self.active, mode=self.mode)
+                    reply['ret_context']['motion_msg']['jog_coordinate'] = self.coordinate
+                    reply['ret_context']['robot_msg']['motion'] = self.motion
                     if not self.actual:
                         del reply['ret_context']['motion_msg']['actual_pos']
                     if self.driver_fault:
@@ -217,10 +227,20 @@ class FakeController:
                         continue
                     ws.send(frame)
                 elif command in ('follower_cart', 'stop_follower'):
+                    if command == 'follower_cart' and self.start_rejected:
+                        self.active = self.active_after_rejection
+                        self.fault = self.recovery_fault
+                        ws.send(wire_reply({'ret_code': -987313,
+                            'ret_msg': '请切换到笛卡尔坐标系', 'ret_context': ''}))
+                        continue
                     if self.change_mode:
                         self.active = command == 'follower_cart'
                         self.mode = 'Cart' if self.active else 'None'
                     # Delayed empty ACK is intentionally ahead of the get reply.
+                    ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                elif command == 'set_jog_coordinate --tool':
+                    if self.coordinate_change:
+                        self.coordinate = 'Tool'
                     ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                 elif command.startswith('g_move --pos='):
                     float(command.split('=')[1])
@@ -246,6 +266,74 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_coordinate_precheck_and_explicit_selection(self):
+        with FakeController() as controller:
+            controller.coordinate = 'Axis'
+            operator = controller.operator()
+            with self.assertRaisesRegex(RuntimeError, 'set_tool_coordinate'):
+                operator.start_follower()
+            self.assertFalse(operator._started_here)
+            self.assertEqual(controller.commands, ['get'])
+            state = operator.set_tool_coordinate()
+            self.assertEqual(state.raw['ret_context']['motion_msg']['jog_coordinate'], 'Tool')
+            self.assertEqual(controller.commands, ['get', 'get', 'set_jog_coordinate --tool', 'get'])
+            self.assertTrue(operator.start_follower().follower_active)
+            with self.assertRaisesRegex(RuntimeError, 'Stop the follower'):
+                operator.set_tool_coordinate()
+            operator.stop_follower()
+            with self.assertRaises(socket.timeout):
+                controller.udp.recvfrom(65535)
+
+    def test_coordinate_ack_requires_status_confirmation(self):
+        with FakeController() as controller:
+            controller.coordinate = 'Axis'
+            controller.coordinate_change = False
+            operator = controller.operator(timeout_s=.1)
+            with self.assertRaisesRegex(TimeoutError, 'Tool jog coordinate'):
+                operator.set_tool_coordinate()
+            self.assertNotIn('follower_cart', controller.commands)
+
+    def test_coordinate_change_refuses_fault_or_unconfirmed_stop(self):
+        for motion, fault in (('Running', False), (None, False), ('Stopped', True)):
+            with self.subTest(motion=motion, fault=fault), FakeController() as controller:
+                controller.motion, controller.driver_fault = motion, fault
+                operator = controller.operator()
+                with self.assertRaises(RuntimeError):
+                    operator.set_tool_coordinate()
+                self.assertEqual(controller.commands, ['get'])
+
+    def test_rejected_start_uses_fresh_read_only_recovery(self):
+        with FakeController() as controller:
+            controller.start_rejected = True
+            operator = controller.operator()
+            old_socket = operator._connection.ws
+            with self.assertRaisesRegex(A10ControllerError, '-987313'):
+                operator.start_follower()
+            self.assertTrue(operator.is_connected)
+            self.assertIsNot(operator._connection.ws, old_socket)
+            self.assertFalse(operator._started_here)
+            self.assertFalse(operator._confirmed_active)
+            self.assertFalse(operator.get_state().follower_active)
+            self.assertEqual(controller.commands.count('follower_cart'), 1)
+            self.assertNotIn('stop_follower', controller.commands)
+            self.assertTrue(all(c in ('get', 'follower_cart') for c in controller.commands))
+
+    def test_rejection_with_uncertain_or_active_state_keeps_cleanup_pending(self):
+        for active, fault in ((True, None), (False, 'disconnect')):
+            with self.subTest(active=active), FakeController() as controller:
+                controller.start_rejected = True
+                controller.active_after_rejection = active
+                controller.recovery_fault = fault
+                operator = controller.operator()
+                with self.assertRaisesRegex(A10ControllerError, '-987313'):
+                    operator.start_follower()
+                self.assertTrue(operator._started_here)
+                self.assertFalse(operator._confirmed_active)
+                with self.assertRaises((RuntimeError, ConnectionError)):
+                    operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
+                self.assertNotIn('stop_follower', controller.commands)
+                self.assertEqual(controller.commands.count('follower_cart'), 1)
+
     def test_ws_status_start_udp_pose_gripper_and_stop(self):
         with FakeController() as controller:
             operator = controller.operator(feedback_position_unit='mm',
@@ -305,7 +393,7 @@ class NetworkTest(unittest.TestCase):
         with FakeController() as controller:
             operator = controller.operator(allow_motion=False)
             self.assertIsNone(operator.get_frame()['qpos'])
-            for action in (operator.start_follower, operator.stop_follower,
+            for action in (operator.start_follower, operator.stop_follower, operator.set_tool_coordinate,
                            lambda: operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]}),
                            lambda: operator.send_gripper({'right': 40})):
                 with self.assertRaises(PermissionError):

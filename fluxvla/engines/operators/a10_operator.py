@@ -371,6 +371,28 @@ class A10Operator(BaseOperator):
         self._confirmed_active = False
         raise TimeoutError('Follower mode change was not confirmed')
 
+    def set_tool_coordinate(self):
+        """Explicitly select Tool jog coordinates and verify feedback; no target sent."""
+        with self._io_lock:
+            self._require_motion()
+            state = self.get_state()
+            if state.has_error:
+                raise A10ControllerError('Controller reports a fault')
+            if state.follower_active is not False:
+                raise RuntimeError('Stop the follower before changing jog coordinates')
+            if state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped':
+                raise RuntimeError('Coordinate change requires confirmed Stopped feedback')
+            self._connection.request('set_jog_coordinate --tool')
+            deadline = time.monotonic() + self.timeout_s
+            while time.monotonic() < deadline:
+                state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+                if state.has_error or state.follower_active is not False:
+                    raise A10ControllerError('Controller fault or follower state changed during coordinate selection')
+                if state.raw['ret_context']['motion_msg'].get('jog_coordinate') == 'Tool':
+                    return state
+                time.sleep(min(.02, max(0., deadline - time.monotonic())))
+            raise TimeoutError('Tool jog coordinate was not confirmed')
+
     def start_follower(self):
         with self._io_lock:
             self._require_motion()
@@ -381,9 +403,29 @@ class A10Operator(BaseOperator):
                 raise RuntimeError('Follower is active or its state is unknown; refusing takeover')
             if state.actual_joints_rad is None or state.tcp_pq_raw is None:
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
+            coordinate = state.raw['ret_context']['motion_msg'].get('jog_coordinate')
+            if coordinate not in ('Base', 'Tool', 'Wobj'):
+                raise RuntimeError(
+                    f'Cartesian follower requires Cartesian jog coordinates, got {coordinate!r}; '
+                    'explicitly call set_tool_coordinate() before starting')
             self._connection.send_command('follower_cart')
             self._started_here = True
-            return self._wait_mode(True)
+            try:
+                return self._wait_mode(True)
+            except A10ControllerError:
+                # A rejection may precede the outstanding get reply. Never reuse
+                # that queue or retry the start: inspect state on a fresh socket.
+                # Only confirmed inactivity clears this attempt's cleanup flag.
+                if not self.is_connected:
+                    try:
+                        self._connection.connect()
+                        recovered = self.get_state()
+                        if recovered.follower_active is False:
+                            self._started_here = False
+                    except Exception:
+                        self._connection.close()
+                self._confirmed_active = False
+                raise
 
     def stop_follower(self):
         with self._io_lock:

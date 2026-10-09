@@ -181,6 +181,7 @@ operator = build_operator_from_cfg(dict(
 | `connect()` / `close()` | 显式打开／关闭 WS 和 UDP；不登录、使能或自动启动 follower |
 | `get_state()` | 查询 `get`，返回 A10State，保留原始回复、实际／目标关节、TCP 和运行状态 |
 | `get_frame()` | 提供机器人反馈字典；完整实际关节＋实际夹爪齐全才有 qpos，不采集相机 |
+| `set_tool_coordinate()` | 显式发送 set_jog_coordinate --tool 并回读 Tool；要求无故障、Stopped、follower 未运行，不发送运动目标 |
 | `start_follower()` | 要求 allow_motion；拒绝接管已激活／未知 follower；发送命令后查询至 running_state=true 且 mode=Cart |
 | `send_eepose({'right': pose})` | 发送相对启动基准的 xyz 米＋xyzw；只允许本连接已启动并确认的 Cartesian follower；不做 VR／绝对位姿转换 |
 | `send_gripper({'right': 35.5})` | 封装 `g_move --pos=35.5`，范围 0–100 mm；回复不等于实际到位，wait=True 尚不支持 |
@@ -272,3 +273,13 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 2026-10-09，用户在现场执行修正后的单次 manual_en 验证脚本并提供终端截图：回复 ret_code=0、ret_context=""、ret_msg=""；随后 get 回读 op_mode=Manual、activate=Enabled、motion=Stopped、has_error=false。确认此部署下 FluxVLA 经 WS 的手动使能及状态回读链路通过；这不是仅依据 ACK 判定。
 
 脚本结束只关闭连接，未掉使能。该截图不证明 follower 启停或 UDP 位姿执行已通过。下一步由现场用户在同一连接中验证 follower_cart 启动和 stop_follower 退出，不发送 UDP 位姿或夹爪目标；异常时报告实际回读和停止结果，不把断开连接视为停止。本次 agent 未向控制器发送使能或运动命令。
+
+### 2026-10-09：现场启动被坐标系拒绝，补充前置检查与失败恢复
+
+- 用户执行 follower 启停检查，收到 ret_code=-987313、“请切换到笛卡尔坐标系”。旧实现关闭异常事务连接，但保留启动尝试标记，现场脚本随即尝试停止，显示“operator is not connected”。这不是停止成功，也不能仅凭这个异常判断 follower 是否已启动。
+- 本轮只读 get 实测：jog_coordinate=Axis，op_mode=Manual，activate=Disabled，motion=Stopped，status=Error，log_msg.has_error=true；follower running_state=false、mode=Cart。应以 running_state 判断是否运行，不能仅看 Cart。六轴 driver_err_code 全为 0，cs_error_code=0，仍不能忽略日志错误。
+- SSH 只读 SQLite（mode=ro）确认最新日志 ID106、16:00:23、code=987313：“请切换到笛卡尔坐标系”；前一条 ID105、15:57:05 为手动使能。未清错、切换坐标系、使能、启停或发送目标，远端文件未改，连接均已关闭。
+- 对照 robot.7z 的 kaanh_backend.py:set_jog_coordinate 和本机 A10_new/kaanh.xml:SetJogCoordinate，模板使用 `set_jog_coordinate --tool`。此前测试漏掉此准备步骤。新增公开 `set_tool_coordinate()`，由用户显式调用；要求无故障、明确 Stopped、follower 未运行，并回读 Tool 后才返回成功。ACK 不能替代坐标系反馈，超时不宣称设置成功。
+- start_follower 在发送前检查 Cartesian 坐标系，Axis／缺失／未知值均在本地拒绝并给出设置方法，不自动切换。启动收到控制器错误且旧连接被关闭时，仅重建连接查询 get，不重发启动或自动停止；只有确认 running_state=false 才清除本次启动尝试标记。恢复失败／仍运行时保留待处理标记，并禁止此次异常路径直接发送位姿；原始错误继续上报。一般超时／坏包仍按原规则关闭不确定连接。
+- 回环测试新增：Axis 前置拒绝、显式 Tool 命令和反馈、仅 ACK 不算成功、有故障／未确认停止拒绝设置、启动错误后新连接只读恢复、恢复失败或仍运行不误报停止。验证命令见上；当前总计 **22 项测试通过**。所有模拟端点仅为 127.0.0.1，没有用实机测试修改后的控制命令。
+- 下一步现场操作：先在控制器界面核对并清除上述报警，然后显式设置 Tool 并回读；再按 Manual 模式使能、确认 Enabled／Stopped／无错误，最后重新验证 follower 启停。此次尚未确认 Tool 设置、实际启停或 UDP 目标执行通过。选择 Tool 会改变后续手动点动的参考坐标系。

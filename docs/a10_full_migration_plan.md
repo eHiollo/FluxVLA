@@ -318,3 +318,11 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 用户终端截图确认 manual_en 返回 ret_code=0，随后状态为 Manual／Enabled／Stopped／无故障。真实 WS 手动使能和状态确认通过，修正后的命令选择有效。
 - 连接关闭后电机保持使能；尚未进行 follower 启停或 UDP 目标执行验收。下一步为现场同连接的 follower 启动／停止测试，不发送位姿目标。
 - 本小任务只同步现场证据至两份开发文档，没有修改功能代码或远端状态。
+
+### 2026-10-09：修复 follower 启动前坐标系准备与拒绝后的检查
+
+- 现场启动返回 -987313“请切换到笛卡尔坐标系”。只读确认当前 Axis／Disabled／Stopped／日志错误，follower 未运行（mode 字段仍为 Cart）；远端日志 ID106 与截图一致。此前启停指导遗漏模板中的 Tool 坐标系设置，当前不记启停验收通过。
+- a10_operator.py 同文件新增 set_tool_coordinate()：显式选择工具坐标系，检查无故障／Stopped／follower 未运行，并回读确认；start_follower 增加坐标系前置检查，不自动修改坐标系。
+- 启动返回控制器错误后，旧异常事务连接仍关闭，仅新建连接只读查状态。确认未运行才撤销本次待清理标记；否则保留不确定性，原始异常上报，不自动重发启动或发送停止／运动目标。
+- test_a10_operator.py 新增现场问题回归与失败路径检查，本机回环 **22/22 PASS**；git diff --check 通过。说明同步 docs/a10_controller_follower_review.md，仍保持单文件 operator 结构。
+- agent 对工控机仅 get／SSH 只读日志，无设置或运动。下一步由现场用户清除坐标系报警，验证 Tool 设置，再手动使能及验证 follower 启停；本机测试不能代替实机验收。

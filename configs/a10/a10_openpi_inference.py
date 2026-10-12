@@ -35,7 +35,7 @@ inference = dict(
     operator=dict(type='A10Operator', host='127.0.0.1',
                   command_mode='joint', allow_motion=False,
                   gripper_transport='usb',
-                  gripper=dict(port='/dev/serial/by-path/platform-a80aa10000.usb-usb-0:1.1:1.0-port0',
+                  gripper=dict(port='/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0',
                                max_width_mm=85., timeout=0.015),
                   cameras=dict(
                       base_0_rgb=dict(device='/dev/v4l/by-id/usb-SYD_USB_Camera_200901010001-video-index0',

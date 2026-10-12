@@ -362,3 +362,11 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 - 默认 checkpoint/tokenizer 位于本仓库 checkpoints 内，保留 A10_OPENPI_CHECKPOINT/A10_OPENPI_TOKENIZER 覆盖；用本机已有权重的硬链接准备忽略的 13GB 资产，tokenizer 复制进本仓库。运行不导入 OpenPI/A10_new/LeRobot 仓库。
 - 数据集 meta/info.json fps=30，OpenPI data_loader.py 以 t/fps 连续采样；默认 action_dt 改为 1/30 秒，预测 30 步、每轮选 10 步。默认指令 Reach the yellow lemon，夹爪工作上限 85mm。dry_run=True、allow_motion=False 保留。
 - 推理测试 15 项：14 PASS、1 GPU 测试暂未启用。预处理另外与本机原 OpenPI 函数核对通过；模型实际推理留至最终验收。尚未连接 operator 的相机/USB 夹爪和动作块调度，下一小任务补齐。
+
+
+### 2026-10-12：推理迁入 follower 小任务 2——相机/USB 夹爪统一观测
+
+- 上一步提交 d1ca6f6。A10Operator 通过可选 cameras、gripper、gripper_transport 配置复用已提交 CameraOperator/GripperOperator；默认 controller 路由保持已有终端操作兼容，USB 必须显式配置，禁止同时传入 USB 配置和 controller 路由。connect 不使能、不发运动目标；USB 初始化失败释放网络。close 对所有资源逐项清理，错误明确报告。
+- get_frame 返回真实六轴弧度 + USB 夹爪实际毫米的 qpos[7]、两路 HWC uint8 RGB；controller-only get_state 保持不变。保留机器人、夹爪、相机各自的 host monotonic 接收时间；顺序读取不等于硬件同步，坏输入/掉线不伪造零值。
+- send_gripper USB 支持 wait=True 回读实际到位；非等待仅代表写入。USB 默认 85mm 上限，controller 旧通道保持 100mm，未知 controller 到位能力仍明确拒绝 wait=True。推理示例配置显式包含当前两路相机、USB 物理路径，需现场核对设备路径。
+- requirements-a10.txt 增加 pyserial==3.5，已安装到 fluxvla 环境；pip 原代理配置报错后使用隔离环境完成安装，未修改全局代理。模拟回环 67/67 PASS（原 operator/CLI 61 + 新集成 6）；独立夹爪测试 10/10 PASS。没有连接真机或相机/USB 实设备。动作块调度仍待下一小任务。

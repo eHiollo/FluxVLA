@@ -21,6 +21,8 @@ import numpy as np
 
 from ..utils.root import OPERATORS
 from .base_operator import BaseOperator
+from .camera_operator import CameraOperator
+from .gripper_operator import GripperOperator
 
 __all__ = ['A10Operator', 'A10State', 'A10ProtocolError', 'A10ControllerError']
 
@@ -304,7 +306,8 @@ class A10Operator(BaseOperator):
     def __init__(self, host, ws_port=5999, udp_port=9998, timeout_s=2.0,
                  allow_motion=False, arm_name='right', feedback_joint_unit='deg',
                  feedback_position_unit=None, gripper_feedback_path=None,
-                 joint_udp_port=9999, command_mode='cartesian'):
+                 joint_udp_port=9999, command_mode='cartesian',
+                 cameras=None, gripper=None, gripper_transport='controller'):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -328,6 +331,24 @@ class A10Operator(BaseOperator):
                 or not gripper_feedback_path
                 or any(not isinstance(k, str) or not k for k in gripper_feedback_path)):
             raise ValueError('gripper_feedback_path must be a nonempty list of keys')
+        if gripper_transport not in ('controller', 'usb'):
+            raise ValueError('gripper_transport must be controller or usb')
+        if gripper_transport == 'usb' and not isinstance(gripper, Mapping):
+            raise ValueError('USB gripper requires explicit gripper settings')
+        if gripper_transport == 'controller' and gripper is not None:
+            raise ValueError('USB settings require gripper_transport="usb"')
+        reserved = {'qpos', 'joints', 'gripper_mm', 'tcp_pq_m', 'follower_active',
+                    'follower_mode', 'has_error', 'received_monotonic_s',
+                    'gripper_received_monotonic_s', 'camera_received_monotonic_s'}
+        if cameras is not None and (not isinstance(cameras, dict)
+                or any(not isinstance(k, str) or not k or k in reserved for k in cameras)):
+            raise ValueError('Camera names must be nonempty and not overwrite robot fields')
+        self.camera_operator = None if cameras is None else CameraOperator(cameras)
+        self.gripper_transport = gripper_transport
+        self.gripper_operator = (GripperOperator(**dict(gripper))
+                                 if gripper_transport == 'usb' else None)
+        self.gripper_max_width_mm = (self.gripper_operator.max_width_mm
+                                    if self.gripper_operator is not None else 100.)
         self.allow_motion, self.arm_name = allow_motion, arm_name
         self.feedback_joint_unit = feedback_joint_unit
         self.feedback_position_unit = feedback_position_unit
@@ -358,14 +379,32 @@ class A10Operator(BaseOperator):
                 self._confirmed_active = self._started_here = False
                 self._start_confirmed = False
                 self._follower_mode = None
-                self._connection.connect()
+                try:
+                    self._connection.connect()
+                    if self.gripper_operator is not None:
+                        self.gripper_operator.connect()
+                except BaseException:
+                    self.close()
+                    raise
 
     def close(self):
         with self._io_lock:
             self._confirmed_active = self._started_here = False
             self._start_confirmed = False
             self._follower_mode = None
-            self._connection.close()
+            errors = []
+            closers = [self._connection.close]
+            if self.camera_operator is not None:
+                closers.append(self.camera_operator.close)
+            if self.gripper_operator is not None:
+                closers.append(self.gripper_operator.disconnect)
+            for closer in closers:
+                try:
+                    closer()
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                raise RuntimeError(f'A10 resource cleanup failed: {errors}') from errors[0]
 
     def _require_motion(self):
         if not self.allow_motion:
@@ -393,13 +432,34 @@ class A10Operator(BaseOperator):
                 raise
 
     def get_frame(self, slop=0.7):
-        """Return robot feedback only; this operator does not acquire cameras."""
+        """Actual robot + optional USB gripper + RGB frames, with receive times.
+
+        These sequential reads are not synchronized sensor samples. Missing
+        configured hardware raises; targets are never substituted for feedback.
+        get_state() remains the unmodified controller-only status interface.
+        """
         del slop
-        state = self.get_state()
-        return dict(qpos=state.qpos, joints=state.actual_joints_rad,
-                    gripper_mm=state.gripper_mm, tcp_pq_m=state.tcp_pq_m,
-                    follower_active=state.follower_active, follower_mode=state.follower_mode,
-                    has_error=state.has_error, received_monotonic_s=state.received_monotonic_s)
+        with self._io_lock:
+            try:
+                state = self.get_state()
+                width = state.gripper_mm
+                frame = dict(joints=state.actual_joints_rad, tcp_pq_m=state.tcp_pq_m,
+                             follower_active=state.follower_active,
+                             follower_mode=state.follower_mode, has_error=state.has_error,
+                             received_monotonic_s=state.received_monotonic_s)
+                if self.gripper_operator is not None:
+                    grip = self.gripper_operator.read_state()
+                    width = grip.position_mm
+                    frame['gripper_received_monotonic_s'] = grip.timestamp
+                frame['gripper_mm'] = width
+                frame['qpos'] = (None if state.actual_joints_rad is None or width is None
+                                 else np.concatenate((state.actual_joints_rad, [width])))
+                if self.camera_operator is not None:
+                    frame.update(self.camera_operator.get_frame())
+                return frame
+            except BaseException:
+                self.close()
+                raise
 
     def _wait_mode(self, active):
         deadline = time.monotonic() + self.timeout_s
@@ -572,18 +632,23 @@ class A10Operator(BaseOperator):
         # UDP has no application ACK. This return does not mean execution.
 
     def send_gripper(self, gripper_targets, wait=False):
-        """Request g_move in millimetres; ACK does not confirm position reached."""
-        if wait:
-            raise NotImplementedError('Gripper arrival feedback is not yet verified')
+        """Explicit USB or controller route; only USB can wait for actual arrival."""
         if not isinstance(gripper_targets, Mapping) or set(gripper_targets) != {self.arm_name}:
             raise ValueError(f'Expected exactly one gripper: {self.arm_name}')
         position = float(_vector([gripper_targets[self.arm_name]], 1, 'gripper mm')[0])
-        if not 0 <= position <= 100:
-            raise ValueError('Gripper target must be within 0..100 mm')
+        if not 0 <= position <= self.gripper_max_width_mm:
+            raise ValueError(f'Gripper target must be within 0..{self.gripper_max_width_mm} mm')
+        if wait and self.gripper_transport != 'usb':
+            raise NotImplementedError('Controller gripper arrival feedback is not verified')
+        return self._send_gripper_target(position, wait=wait)
+
+    def _send_gripper_target(self, position, *, wait=False, check_state=True):
         with self._io_lock:
             self._require_motion()
-            if self.get_state().has_error:
+            if check_state and self.get_state().has_error:
                 raise A10ControllerError('Controller reports a fault')
+            if self.gripper_operator is not None:
+                return self.gripper_operator.set_position_mm(position, wait=wait)
             return self._connection.request(f'g_move --pos={position:.12g}')
 
     def execute_trajectory(self, *args, **kwargs):

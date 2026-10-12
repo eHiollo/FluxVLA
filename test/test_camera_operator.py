@@ -99,6 +99,14 @@ class CameraOperatorTest(unittest.TestCase):
                                           self.bgr[::-1, ::-1, ::-1])
             self.assertTrue(all(capture.released for capture in captures))
 
+    def test_cleanup_continues_after_one_camera_failure(self):
+        cameras = CameraOperator({'base': dict(device=0), 'wrist': dict(device=2)})
+        with patch.object(cameras.cameras['base'], 'close', side_effect=OSError('release failed')), \
+                patch.object(cameras.cameras['wrist'], 'close') as close_wrist:
+            with self.assertRaisesRegex(RuntimeError, 'cleanup failed'):
+                cameras.close()
+            close_wrist.assert_called_once()
+
     def test_policy_resize_preserves_aspect_and_rejects_bad_frame(self):
         rgb = np.full((2, 4, 3), [11, 22, 33], dtype=np.uint8)
         result = RGBCamera.preprocess_to_policy_chw(rgb, size=4)

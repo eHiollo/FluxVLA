@@ -9,11 +9,11 @@
 工控机的 kaanhbin 需已正常运行；已运行时不要再启动一份。以下命令在运行 FluxVLA 的机器终端执行：
 
 ```bash
-cd /home/robot/VLA/FluxVLA
+cd /home/robot/VLA/FluxVLA_integration
 /home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 shell
 ```
 
-当前 **kaanh_follower** 分支位于 `/home/robot/VLA/FluxVLA`，runner 分支及其未提交修改保留在 `/home/robot/VLA/FluxVLA_runner`。请使用上面的当前目录；早期 `FluxVLA_follower` 目录是旧版本的 detached worktree，不包含后续修复。
+当前 **kaanh_follower** 分支位于 `/home/robot/VLA/FluxVLA_integration`。主目录 `/home/robot/VLA/FluxVLA` 的 `vr` 分支及其未提交修改保留，`FluxVLA_runner` 仍是推理迁移来源；早期 `FluxVLA_follower` 为旧版本 detached worktree。
 
 出现 `a10>` 后输入短指令即可。启动只连接并查询，不会自动使能、启动跟随或发送运动目标。
 
@@ -84,7 +84,7 @@ get 没有实际夹爪字段时显示“暂无反馈”，不填假数据。夹�
 ### 5. 本机模拟测试
 
 ```bash
-cd /home/robot/VLA/FluxVLA
+cd /home/robot/VLA/FluxVLA_integration
 /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -v
 ```
 
@@ -123,6 +123,105 @@ UDP wire 使用 40 字节 ARIS 消息头 + UTF-8 `jp --motor_pos=[六个度数]`
 目前每条目标命令只发送一个 UDP 数据报，无自动重发、持续保持或动作块调度，也没有接收到位确认。若实际响应不明显，保留 get --raw 和现场现象检查，不能据此盲目加大目标。模型动作块按频率逐步下发、序号/过期丢弃、丢包和控制器失联停止属于下一阶段。
 
 ---
+
+## 原生 A10 推理接入（2026-10-12）
+
+这一轮完成的是 **推理 → follower 的软件链路**。相机、夹爪和控制器的真实联动还没有验收；下面先使用只读观测模式。VR 未纳入本轮。
+
+### 1. 进入本轮开发目录
+
+```bash
+cd /home/robot/VLA/FluxVLA_integration
+conda activate fluxvla
+```
+
+本目录是 `kaanh_follower` 分支的独立 worktree。`FluxVLA` 主目录仍是 `vr`，其中的未提交修改保留；`FluxVLA_runner` 是迁移来源分支。这里的脚本强制使用本目录代码，避免 editable 安装指向其他 worktree。
+
+### 2. 配置文件分别负责什么
+
+| 文件 | 用途 |
+| --- | --- |
+| `configs/a10/a10_openpi_inference.py` | 本机加载原来训练好的模型，并连接相机、夹爪、follower |
+| `configs/a10/a10_remote_inference.py` | 本机接设备，通过 FluxVLA ZMQ 服务请求模型动作 |
+
+两种方式都使用 `A10InferenceRunner → A10Operator`，不调用旧 `projects/a10` 推理循环，也不启动原 OpenPI 服务。模型名称有 OpenPI 是因为权重来自那里，运行使用 FluxVLA 原生模型。
+
+本机已准备好忽略的资产：`checkpoints/a10_openpi_90000/`（权重、config.json、assets 内统计文件）和 `checkpoints/tokenizers/paligemma_tokenizer.model`。搬到另一台机器时要一起复制；它们没有提交进 Git。也可以设置 `A10_OPENPI_CHECKPOINT` / `A10_OPENPI_TOKENIZER` 指向准备好的资产，运行不需要旁边的 OpenPI 仓库。
+
+USB 夹爪依赖已在 fluxvla 环境安装；新环境安装：
+
+```bash
+python -m pip install -r requirements-a10.txt
+```
+
+### 3. 可以先只启动模型服务，不接设备
+
+```bash
+python -m fluxvla.engines.runners.serving.serve \
+  --config configs/a10/a10_openpi_inference.py \
+  --from-config --dtype fp32 --host 127.0.0.1 --port 5555
+```
+
+看到 `Server is ready` 说明模型服务已就绪。第一次加载和第一次预测会比较慢。这个入口不构建机器人 operator，不连接或使能机械臂。
+
+### 4. 设备到位后，先运行只读观测和推理
+
+工控机的 kaanhbin 需已运行；先核对示例配置中的两路相机、夹爪串口物理路径。不要同时运行旧夹爪服务占用同一串口。USB 路径位置由接线决定，相机分辨率和腕部旋转应与训练一致。
+
+本机推理：
+
+```bash
+python scripts/inference.py \
+  --config configs/a10/a10_openpi_inference.py \
+  --cfg-options inference.operator.host=192.168.110.124
+```
+
+使用上一步启动的 ZMQ 服务（另开一个终端进入相同目录/环境）：
+
+```bash
+python scripts/inference.py \
+  --config configs/a10/a10_remote_inference.py \
+  --cfg-options inference.operator.host=192.168.110.124
+```
+
+示例保留 `dry_run=True` 和 `allow_motion=False`：读取设备实际反馈、预测并检查动作，但不发关节/夹爪运动目标，不使能、不启动跟随。没有两路相机或 USB 夹爪时会报错，不会拿假图像/零位置代替。仅启动模型服务不要求设备在线。
+
+### 5. 真正执行动作时的参数
+
+先完成上面的只读步骤，确认关节顺序/弧度、夹爪毫米、相机画面和现场控制器设置。执行需要显式设置 `dry_run=False`、`operator.allow_motion=True` 和已现场确认的 `max_joint_step_rad`；不提供未经核对的限值。电机使能仍由现场用户使用控制台单独完成，runner 不自动使能或回零。
+
+| 参数 | 当前默认含义 |
+| --- | --- |
+| `action_chunk=30` | 模型一次预测 30 步，和 checkpoint metadata 对齐 |
+| `execute_horizon=10` | 每轮只发送前 10 步，然后重新拍照、读取状态、预测 |
+| `action_dt=1/30` | 原数据每秒 30 帧，连续训练目标的间隔为约 33.3ms |
+| `max_publish_step=30` | 本次运行累计选择 30 步后结束 |
+| `max_joint_step_rad` | 检查第一步相对实际观测，以及随后各步的关节目标变化 |
+| `gripper_mm_range=(0,85)` | 默认 USB 夹爪工作范围；不越界裁剪，不把毫米当速度 |
+
+`execute_trajectory()` 是把 10 行动作按时间逐行发送：前六个数走关节 UDP 9999，第七个数走本机 USB 夹爪。一个周期发送一次各自目标，机器人内部插补/运动规划由控制器负责；UDP 没有每帧 ACK，返回完成仅代表发送流程结束，不能据此证明实际到位。
+
+动作块开头、每约 0.1 秒和结尾有 WS/USB 状态检查；单通道检查超时默认 15ms，夹爪配置读写超时也为 15ms。开始时隙的容许滞后默认 `dt/2`。这些是软件时间预算，需现场测量网络/USB 延迟后确认，不是硬实时保证。故障、断线、取消、超时中止后不重发、不补发积压行，记录在 operator 的 `last_trajectory`。
+
+Ctrl+C 请求停止当前会话的 follower 并关闭资源；`p` + Enter 在当前动作块完成后结束。停止失败会明确输出未确认日志，需现场处理。关闭串口/网络不代表机械臂/夹爪物理停止，也不自动掉使能。
+
+### 6. 本机测试（不连接真机）
+
+```bash
+python -m unittest discover -s test -p 'test_a10_*.py' -q
+python -m unittest discover -s test/test_runners -p 'test_a10_*.py' -q
+python -m unittest discover -s test -p 'test_camera_operator.py' -q
+python -m unittest discover -s test -p 'test_gripper_operator.py' -q
+```
+
+可选的实际 GPU 权重测试（仍不连接机器人）：
+
+```bash
+A10_TEST_REAL_MODEL=1 python -m unittest discover \
+  -s test/test_runners -p 'test_a10_openpi_inference.py' -q
+```
+
+该项检查本地原生推理与实际 ZMQ 收发一致，输出 `30×7` 且数值有限。不能替代原 JAX 模型的逐数值对照、任务成功率或实机验收。
 
 ## 旧版项目流程现场说明（相机、VR、录制与旧 TCP 接口）
 

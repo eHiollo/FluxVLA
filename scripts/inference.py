@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import argparse
+import sys
+from pathlib import Path
+
+# Launch this checkout even if pip's editable install points to another worktree.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mmengine import Config, DictAction
 

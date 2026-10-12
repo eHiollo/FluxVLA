@@ -195,5 +195,25 @@ class A10RunnerTest(unittest.TestCase):
         self.assertNotIn('start', operator.events)
 
 
+class A10EntrypointTest(unittest.TestCase):
+    def test_script_selects_its_worktree_from_another_directory(self):
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = Path(directory) / 'invalid_operator.py'
+            cfg.write_text("inference=dict(type='A10InferenceRunner', remote_inference={}, "
+                           "operator=dict(type='A10Operator', host=''))\n")
+            result = subprocess.run([sys.executable, str(root / 'scripts/inference.py'),
+                                     '--config', str(cfg)], cwd=directory,
+                                    capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('host must be a controller hostname or IP', result.stderr)
+        self.assertIn(str(root / 'fluxvla/engines/operators/a10_operator.py'), result.stderr)
+        self.assertIn(str(root / 'fluxvla/engines/runners/a10_inference_runner.py'), result.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

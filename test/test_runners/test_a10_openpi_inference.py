@@ -5,6 +5,9 @@ import io
 import logging
 import os
 import tempfile
+import threading
+
+import zmq
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -138,15 +141,46 @@ class A10OpenPITest(unittest.TestCase):
         server = create_server(model, dataset, denorm, task_suite_name='a10',
                                host='127.0.0.1', port=0, device='cuda:0',
                                mixed_precision_dtype=torch.float32)
+        from fluxvla.engines.runners.serving.serializers import MsgSerializer, ObsSerializer
+        context = zmq.Context()
+        client = context.socket(zmq.REQ)
+        client.setsockopt(zmq.RCVTIMEO, 30000)
+        client.setsockopt(zmq.SNDTIMEO, 30000)
+        client.setsockopt(zmq.LINGER, 0)
+        thread = None
         try:
+            # Local native model path, then actual serialized ZMQ request.
             torch.manual_seed(7)
-            result = server._endpoints['predict_action'].handler(_obs_dict=observation())
+            inputs = {k: v.cuda() for k, v in dataset(observation()).items()}
+            with torch.inference_mode():
+                raw = model.predict_action(**inputs).cpu().numpy()
+            local_actions = denorm(dict(action=raw, state=observation()['qpos']))
+            self.assertEqual(local_actions.shape, (30, 7))
+            self.assertTrue(np.isfinite(local_actions).all())
+            client.connect(server.socket.getsockopt_string(zmq.LAST_ENDPOINT))
+            thread = threading.Thread(target=server.run)
+            thread.start()
+            torch.manual_seed(7)
+            client.send(MsgSerializer.to_bytes(dict(endpoint='predict_action', data=dict(
+                obs_data=ObsSerializer.to_bytes(observation(), compress=True), unnorm_key='a10'))))
+            result = MsgSerializer.from_bytes(client.recv())
+            self.assertNotIn('error', result)
             actions = np.load(io.BytesIO(result['action_data']), allow_pickle=False)
             self.assertEqual(actions.shape, (30, 7))
             self.assertTrue(np.isfinite(actions).all())
-            print('REAL A10 FORWARD: 811 parameters, actions=(30,7), finite=True', flush=True)
+            np.testing.assert_allclose(actions, local_actions, rtol=1e-5, atol=1e-5)
+            print('REAL A10: 811 parameters, local + ZMQ=(30,7), finite, parity PASS', flush=True)
         finally:
             server.close()
+            if thread is not None:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+            else:
+                server.socket.close(linger=0)
+                server.context.term()
+            client.close()
+            context.term()
+
 
 
 if __name__ == '__main__':

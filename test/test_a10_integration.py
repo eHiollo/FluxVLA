@@ -106,10 +106,6 @@ class A10PeripheralTest(unittest.TestCase):
         self.assertFalse(self.serial.is_open)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class A10TrajectoryTest(unittest.TestCase):
     setUp = A10PeripheralTest.setUp
     operator = A10PeripheralTest.operator
@@ -282,3 +278,117 @@ class A10TrajectoryTest(unittest.TestCase):
         self.assertEqual(operator.last_trajectory['sent'], 1)
         self.assertFalse(operator.last_trajectory['completed'])
         self.assertFalse(any(p[4] == 0x83 for p in self.serial.writes))
+
+
+class A10RunnerIntegrationTest(unittest.TestCase):
+    setUp = A10PeripheralTest.setUp
+
+    def make_runner(self, *, dry_run=False, policy_failure=False):
+        import queue
+        import threading
+        import torch
+        import zmq
+        from fluxvla.engines import build_runner_from_cfg
+        from fluxvla.engines.runners.serving.zmq_server import create_server
+
+        self.predictions = []
+        observed = self.predictions
+        class Policy(torch.nn.Module):
+            def predict_action(self, states, **kwargs):
+                observed.append(states.numpy().copy())
+                if policy_failure and len(observed) > 1:
+                    raise RuntimeError('simulated inference failure')
+                delta = torch.tensor([.01] * 6 + [.5])
+                return (states + delta).reshape(1, 1, 7).repeat(1, 4, 1)
+        def preprocess(obs):
+            for name in ('base_0_rgb', 'right_wrist_0_rgb'):
+                self.assertEqual(obs[name].shape, (6, 8, 3))
+                self.assertEqual(obs[name].dtype, np.uint8)
+            self.assertEqual(obs['task_description'], 'Reach the yellow lemon')
+            return dict(states=torch.as_tensor(obs['qpos']))
+        ready = queue.Queue()
+        def serve():
+            server = create_server(Policy(), dataset=preprocess,
+                host='127.0.0.1', port=0, device='cpu', mixed_precision_dtype=torch.float32)
+            ready.put(server)
+            server.run()
+        thread = threading.Thread(target=serve)
+        thread.start()
+        server = ready.get(timeout=5)
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.close)
+        endpoint = server.socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        runner = build_runner_from_cfg(dict(type='A10InferenceRunner',
+            operator=dict(type='A10Operator', host='127.0.0.1',
+                ws_port=self.controller.server.socket.getsockname()[1],
+                udp_port=self.controller.udp.getsockname()[1],
+                joint_udp_port=self.controller.joint_udp.getsockname()[1],
+                command_mode='joint', allow_motion=not dry_run,
+                gripper_transport='usb', gripper=dict(port='/fake/gripper', timeout=.015),
+                cameras=dict(base_0_rgb=dict(device='/fake/base'),
+                             right_wrist_0_rgb=dict(device='/fake/wrist'))),
+            remote_inference=dict(server_host='127.0.0.1', server_port=int(endpoint.rsplit(':', 1)[1]),
+                                  timeout_s=2., serializer='msgpack', compress=True),
+            action_chunk=4, execute_horizon=2, action_dt=.04,
+            max_publish_step=5, dry_run=dry_run, max_joint_step_rad=.1,
+            instruction='Reach the yellow lemon', enable_mixed_precision=False))
+        self.addCleanup(runner.cleanup)
+        runner._poll_keyboard_pause = lambda: False
+        return runner
+
+    def test_real_runner_operator_and_zmq_complete_loop(self):
+        runner = self.make_runner()
+        runner.run_setup()  # Actual scripts/inference.py entry sequence.
+        runner.run()
+        self.assertEqual(len(self.predictions), 3)
+        np.testing.assert_allclose([float(p[6]) for p in self.predictions], [40., 40.5, 41.], atol=.1)
+        self.assertEqual(runner.last_cycle['steps'], 5)
+        self.assertEqual(runner.last_cycle['executed'], 1)
+        self.assertEqual(len([p for p in self.serial.writes if p[4] == 0x83]), 5)
+        for _ in range(5):
+            packet = self.controller.joint_udp.recv(1024)
+            self.assertTrue(packet[40:].startswith(b'jp --motor_pos=['))
+        self.assertEqual(self.controller.commands.count('follower_aj'), 1)
+        self.assertEqual(self.controller.commands.count('stop_follower'), 1)
+        self.assertFalse(self.controller.active)
+        self.assertFalse(runner.ros_operator.is_connected)
+        self.assertFalse(self.serial.is_open)
+        self.capture.release.assert_called()
+        self.assertFalse(any(c == 'manual_en' for c in self.controller.commands))
+
+    def test_dry_run_is_read_only_with_real_interfaces(self):
+        runner = self.make_runner(dry_run=True)
+        runner.run()
+        self.assertEqual(runner.last_cycle['executed'], 0)
+        self.assertEqual(len(self.predictions), 3)
+        self.assertTrue(all(p[4] in (1, 2) for p in self.serial.writes))
+        self.assertTrue(all(c == 'get' for c in self.controller.commands))
+        with self.assertRaises(TimeoutError): self.controller.joint_udp.recv(1024)
+
+    def test_policy_failure_stops_owned_follower_and_closes(self):
+        runner = self.make_runner(policy_failure=True)
+        with self.assertRaisesRegex(RuntimeError, 'inference failure'):
+            runner.run()
+        self.assertEqual(self.controller.commands.count('stop_follower'), 1)
+        self.assertFalse(self.controller.active)
+        self.assertFalse(runner.ros_operator.is_connected)
+        self.assertFalse(self.serial.is_open)
+        self.assertEqual(len([p for p in self.serial.writes if p[4] == 0x83]), 2)
+
+    def test_sensor_failure_keeps_control_connection_for_explicit_stop(self):
+        runner = self.make_runner()
+        original = runner.ros_operator.execute_trajectory
+        def fail_after_chunk(**kwargs):
+            original(**kwargs)
+            self.capture.read.return_value = (False, None)
+        with patch.object(runner.ros_operator, 'execute_trajectory', side_effect=fail_after_chunk):
+            with self.assertRaisesRegex(RuntimeError, 'camera read failed'):
+                runner.run()
+        self.assertEqual(self.controller.commands.count('stop_follower'), 1)
+        self.assertFalse(self.controller.active)
+        self.assertFalse(runner.ros_operator.is_connected)
+        self.assertFalse(self.serial.is_open)
+
+
+if __name__ == '__main__':
+    unittest.main()

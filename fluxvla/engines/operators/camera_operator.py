@@ -132,8 +132,14 @@ class CameraOperator:
         return frame
 
     def close(self):
+        errors = []
         for camera in self.cameras.values():
-            camera.close()
+            try:
+                camera.close()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise RuntimeError(f'Camera cleanup failed: {errors}') from errors[0]
 
     def __enter__(self):
         return self

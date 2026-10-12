@@ -1,6 +1,6 @@
 """Inference only: original A10 OpenPI export, no training/site YAML needed.
 
-Local (after operator integration):
+Local inference:
   python scripts/inference.py --config configs/a10/a10_openpi_inference.py
 Model server only (no robot connection):
   python -m fluxvla.engines.runners.serving.serve \

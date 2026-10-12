@@ -475,7 +475,11 @@ class A10Operator(BaseOperator):
                     frame.update(self.camera_operator.get_frame())
                 return frame
             except BaseException:
-                self.close()
+                # Keep a usable control connection for the caller's explicit
+                # stop in finally if a camera/servo read fails mid-run.
+                self._confirmed_active = self._start_confirmed = False
+                if not self._started_here:
+                    self.close()
                 raise
 
     def _wait_mode(self, active):

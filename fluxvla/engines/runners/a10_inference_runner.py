@@ -141,11 +141,22 @@ class A10InferenceRunner(BaseInferenceRunner):
         low, high = self.gripper_mm_range
         if np.any((actions[:, 6] < low) | (actions[:, 6] > high)):
             raise ValueError('Gripper target exceeds configured range')
-        if self.max_joint_step_rad is not None:
-            previous = np.concatenate([
-                self._action_ctx.state[None, :6], actions[:-1, :6]], axis=0)
-            if np.any(np.abs(actions[:, :6] - previous) > self.max_joint_step_rad):
-                raise ValueError('Joint target step exceeds configured limit')
+        previous = np.concatenate([
+            self._action_ctx.state[None, :6], actions[:-1, :6]], axis=0)
+        changes = np.abs(actions[:, :6] - previous)
+        step, joint = np.unravel_index(np.argmax(changes), changes.shape)
+        largest = float(changes[step, joint])
+        if self.dry_run:
+            logger.warning(
+                'A10 dry-run planned largest joint step: %.6f rad (%.2f deg), '
+                'action %d/%d, joint %d; actual/previous %.6f -> target %.6f rad',
+                largest, math.degrees(largest), step + 1, len(actions), joint + 1,
+                float(previous[step, joint]), float(actions[step, joint]))
+        if self.max_joint_step_rad is not None and largest > self.max_joint_step_rad:
+            raise ValueError(
+                f'Joint target step exceeds configured limit: action {step + 1}/{len(actions)}, '
+                f'joint {joint + 1}, {largest:.6f} rad ({math.degrees(largest):.2f} deg) '
+                f'> {self.max_joint_step_rad:.6f} rad; no motion target sent')
         self.last_actions = actions.copy()
         if self.dry_run:
             return

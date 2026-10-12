@@ -80,6 +80,27 @@ class A10RunnerTest(unittest.TestCase):
         self.assertEqual(runner.last_cycle['executed'], 0)
         np.testing.assert_allclose(runner.last_actions[0], [.21] * 6 + [42])
 
+    def test_step_limit_reports_offending_action_without_starting(self):
+        runner, operator = self.make_runner(
+            dry_run=False, max_joint_step_rad=.005,
+            execute_horizon=4, max_publish_step=4)
+        with self.assertRaisesRegex(
+                ValueError, r'action 1/4, joint 1, 0\.010000 rad .* > 0\.005000 rad; '
+                r'no motion target sent'):
+            runner.run()
+        self.assertNotIn('start', operator.events)
+        self.assertNotIn('execute', operator.events)
+
+        runner, operator = self.make_runner(
+            dry_run=True, max_joint_step_rad=None,
+            execute_horizon=4, max_publish_step=4)
+        with self.assertLogs('fluxvla.engines.runners.a10_inference_runner',
+                             level='INFO') as logs:
+            runner.run()
+        self.assertTrue(any('dry-run planned largest joint step: 0.010000 rad' in line
+                            and 'action 1/4, joint 1' in line for line in logs.output))
+        self.assertNotIn('start', operator.events)
+
     def test_joint_gripper_split_partial_final_chunk_and_dt(self):
         runner, operator = self.make_runner(dry_run=False, action_dt=.04)
         runner.run()

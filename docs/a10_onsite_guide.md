@@ -205,7 +205,30 @@ python scripts/inference.py \
 
 Ctrl+C 请求停止当前会话的 follower 并关闭资源；`p` + Enter 在当前动作块完成后结束。停止失败会明确输出未确认日志，需现场处理。关闭串口/网络不代表机械臂/夹爪物理停止，也不自动掉使能。
 
-### 6. 本机测试（不连接真机）
+### 6. 预测关节单步变化超限时
+
+若看到 `Joint target step exceeds configured limit`，该轮在 `start_follower()` 之前结束，没有发送运动目标。这里比较的是第一步相对实际关节角，以及后续每一步相对前一目标的最大变化；单位是弧度。不要仅为消除报错而调大限值。
+
+用现有模型服务执行下面的只读诊断，程序会打印 30 步中最大变化发生在第几步、哪个关节、变化量与前后角度：
+
+```bash
+cd /home/robot/VLA/FluxVLA_integration
+conda activate fluxvla
+python scripts/inference.py \
+  --config configs/a10/a10_remote_inference.py \
+  --cfg-options \
+    inference.operator.host=192.168.110.124 \
+    inference.operator.allow_motion=False \
+    inference.dry_run=True \
+    inference.execute_horizon=30 \
+    inference.max_publish_step=30
+```
+
+`dry_run=True` 不会启动 follower 或发送关节/夹爪目标；设备仍需能读取状态、相机和 USB 夹爪。记录 `A10 dry-run planned largest joint step` 的值与位置，再由现场核对目标角度、训练数据动作语义和允许的控制限值。
+
+首次现场 30 步运行已确认控制器收到 30 条六轴目标，但模型目标全程每轴仅变化约 0.08°～0.26°；实际关节跟随量也很小。`max_joint_step_rad` 是拒绝超限目标的检查，不会放大或缩小模型动作。用户停止后只读 `get` 显示 follower 未运行、Stopped、无故障，电机仍 Enabled。
+
+### 7. 本机测试（不连接真机）
 
 ```bash
 python -m unittest discover -s test -p 'test_a10_*.py' -q

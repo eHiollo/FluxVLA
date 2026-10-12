@@ -194,7 +194,7 @@ class A10TrajectoryTest(unittest.TestCase):
         operator.stop_follower()
 
     def test_feedback_timeout_before_first_target_reports_zero_sends(self):
-        operator = self.started_operator(trajectory_feedback_timeout_s=.05)
+        operator = self.started_operator(timeout_s=.05)
         self.controller.fault = 'timeout'
         with self.assertRaisesRegex(TimeoutError, "'get'.*0.050s"):
             self.execute(operator, dt=1 / 30)
@@ -202,8 +202,33 @@ class A10TrajectoryTest(unittest.TestCase):
         self.assertFalse(operator.last_trajectory['completed'])
         self.assertFalse(operator.is_connected)
         self.assertTrue(operator.follower_stop_pending)
+        self.assertEqual(operator.last_trajectory['phase'], 'preflight')
         with self.assertRaises(TimeoutError):
             self.controller.joint_udp.recv(1024)
+
+    def test_chunk_boundary_uses_normal_command_budget(self):
+        operator = self.started_operator()
+        self.controller.get_reply_delay_s = .15
+        self.execute(operator, count=1, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 1)
+        self.assertTrue(operator.last_trajectory['completed'])
+        self.controller.get_reply_delay_s = 0.
+        operator.stop_follower()
+
+    def test_periodic_feedback_still_enforces_short_budget(self):
+        operator = self.started_operator(trajectory_feedback_interval_s=.02,
+                                         trajectory_feedback_timeout_s=.05)
+        original = operator.send_joints
+        def send(target):
+            original(target)
+            self.controller.get_reply_delay_s = .15
+        with patch.object(operator, 'send_joints', side_effect=send):
+            with self.assertRaisesRegex(TimeoutError, "'get'.*0.050s"):
+                self.execute(operator, count=3, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 1)
+        self.assertEqual(operator.last_trajectory['phase'], 'sending')
+        self.assertFalse(operator.last_trajectory['completed'])
+        self.assertFalse(operator.is_connected)
 
     def test_unowned_cartesian_and_legacy_gripper_are_rejected(self):
         operator = self.operator()

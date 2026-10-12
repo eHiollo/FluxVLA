@@ -749,6 +749,7 @@ class A10Operator(BaseOperator):
         started = None
         wall_started = None
         completed = False
+        phase = 'preflight'
         try:
             with self._io_lock:
                 self._require_motion()
@@ -758,9 +759,12 @@ class A10Operator(BaseOperator):
                 self._trajectory_owner = threading.get_ident()
                 self._traj_stop_event.clear()
                 feedback_timeout = self.trajectory_feedback_timeout_s
-                self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
+                # Between chunks no send deadline is running. Use the normal
+                # command budget, including after a long model inference.
+                self._check_trajectory_feedback(self.timeout_s, check_gripper=widths is not None)
             started = last_feedback = time.monotonic()
             wall_started = started
+            phase = 'sending'
             for index, target in enumerate(joints):
                 deadline = started + index * dt
                 self._traj_stop_event.wait(max(0., deadline - time.monotonic()))
@@ -791,7 +795,8 @@ class A10Operator(BaseOperator):
             with self._io_lock:
                 self._require_target_owner()
                 # A final check also catches faults in shorter-than-monitor chunks.
-                self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
+                phase = 'final_feedback'
+                self._check_trajectory_feedback(self.timeout_s, check_gripper=widths is not None)
             completed = True
         except BaseException:
             with self._io_lock:
@@ -801,7 +806,7 @@ class A10Operator(BaseOperator):
         finally:
             with self._io_lock:
                 self.last_trajectory = dict(selected=len(joints), sent=sent,
-                    completed=completed, physical_arrival_confirmed=False,
+                    completed=completed, phase=phase, physical_arrival_confirmed=False,
                     elapsed_s=None if wall_started is None else time.monotonic() - wall_started)
                 self._trajectory_owner = None
             self._trajectory_lock.release()

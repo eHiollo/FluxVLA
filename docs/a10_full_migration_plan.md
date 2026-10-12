@@ -475,3 +475,11 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 16:07 日志在 run_setup 打开串口时报 FileNotFoundError，旧 by-path 为 USB 1.1，现场实际为 1.3；尚未进入模型控制循环。系统只检测到一个 CH340 串口 /dev/ttyUSB0。
 - 两份原生 A10 推理配置改用 /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0，避免插口变化导致找不到夹爪。多台同型号且无唯一序列号转接器仍需现场明确映射。
 - 已只读验证 ping 和夹爪反馈：servo_id=10，开口约 1.257mm，速度反馈 0；两份配置加载并解析到 /dev/ttyUSB0，当前两路相机配置路径均存在。未使能、启动跟随或发送运动目标；实机推理需重新运行验证。
+
+
+### 2026-10-12：90 步后动作块边界查询超时
+
+- 16:15 日志显示 9 轮 A10 cycle、累计发送 90 个动作，第 10 轮 preflight 查询 get 超过 0.100s，失败块 sent=0，不能理解为整场零发送。该日志不证明目标全部到位。模型每轮约 1.3s、发送 10 步约 0.37～0.41s，运行存在推理间隔。
+- 超时关闭 WS 后，finally 的 stop_follower 因未连接而失败。随后只读检查实际仍为 Enabled、Running、Axis follower active、无故障，已提示用户在工控机 stop_follower；未代为发控制指令。100 次只读 get 中位数 6.78ms，最大 58.49ms，未复现超 100ms；原延迟原因尚未确定。
+- 修复块开始/结束查询误用流内短预算：这两处使用普通 timeout_s（默认 2 秒）；流内仍使用 100ms 并保持超时终止。last_trajectory 增加 phase，便于区分 preflight/sending/final_feedback。没有自动重发或重新接管控制。
+- 新增 150ms 延迟块边界成功、流内慢回复终止测试，保留真正 preflight 超时零发送验证；21 项本机集成测试全部通过。实际运动需现场停止旧跟随后重试；本次命令中的 0.5rad 与先前确认的 0.1rad 不同，不能通过放宽角度限值修复网络超时。

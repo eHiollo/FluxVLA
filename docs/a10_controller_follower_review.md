@@ -183,8 +183,10 @@ operator = build_operator_from_cfg(dict(
 | `get_frame()` | 提供机器人反馈字典；完整实际关节＋实际夹爪齐全才有 qpos，不采集相机 |
 | `enable()` / `disable()` | Manual 模式发送 manual_en/manual_ds，回读 Enabled/Disabled；不自动切换模式 |
 | `set_tool_coordinate()` | 显式发送 set_jog_coordinate --tool 并回读 Tool；要求无故障、Stopped、follower 未运行，不发送运动目标 |
-| `start_follower()` | 要求 allow_motion；拒绝接管已激活／未知 follower；发送命令后查询至 running_state=true 且 mode=Cart |
+| `set_jog_coordinate('Axis'/'Tool')` | 显式选择点动坐标系并回读；不自动切换 follower |
+| `start_follower(mode='joint'/'cartesian')` | 默认构造为 cartesian；无参数时使用当前 command_mode，确认 running_state=true 且 Axis/Cart；拒绝接管或覆盖待清理启动 |
 | `send_eepose({'right': pose})` | 发送相对启动基准的 xyz 米＋xyzw；只允许本连接已启动并确认的 Cartesian follower；不做 VR／绝对位姿转换 |
+| `send_joints({'right': joints_rad})` | 六轴绝对弧度，发送时转度，UDP 9999 的 jp 命令；仅本连接已确认关节模式，不含夹爪 |
 | `send_gripper({'right': 35.5})` | 封装 `g_move --pos=35.5`，范围 0–100 mm；回复不等于实际到位，wait=True 尚不支持 |
 | `stop_follower()` | 请求本连接启动的 follower 退出，并回读 running_state=false；不是物理急停 |
 
@@ -198,7 +200,7 @@ operator = build_operator_from_cfg(dict(
 - `actual_pos` 与 `motor_pos` 分别解析，只接受平铺六值或单组六值；多臂／20 轴数组拒绝。PQ 接受平铺、单组或模板中的 `[TCP, 辅助轴位姿]` 两组形式，取 TCP；不把第二组作为另一条机械臂。
 - 关节可配置 wire 为 deg／rad，平台统一弧度；TCP 可配置 wire 为 m／mm，未配置时仅保留 `tcp_pq_raw`，`tcp_pq_m=None`。UDP 发送接口始终用米；不自动清零小量或修改四元数。
 - 夹爪路径相对 `ret_context`，只接受明确的毫米数字；默认没有路径，因此 `gripper_mm=None`、`qpos=None`。测试的 `test_gripper.actual_mm` **仅是合成字段，不是已验证的控制器字段**。
-- 目前未提供关节 follower、回零、轨迹定时执行、自动登录或电机使能。绝对位姿、逐帧增量与 follower 相对目标不能互换。
+- 初次实现未提供关节 follower 或电机使能，后续补充见开发记录；当前仍未提供回零、动作块定时执行或自动登录。绝对位姿、逐帧增量与 follower 相对目标不能互换。
 - 实机待确认：状态字段／单位、相对坐标语义、夹爪 WS 命令路由和反馈、启动权限、掉包／失联行为；本地协议测试不能替代这些确认。
 
 ### 复现本机测试
@@ -343,3 +345,12 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 - 关节启动/目标仅在 shell 中执行，末端启动显式指定 cartesian，确保两种模式切换不受上次模式影响。已有 reconnect/只读/exit/Ctrl+C 清理规则复用；夹爪命令继续独立。
 - 控制台测试 22/22 PASS（此前 15、新增 7）：独立子进程六轴 UDP 完整字节验证、实际角度查询、Axis 设置、模式互斥、启动前禁止发目标、格式/单位错误、只读、缺实际反馈、退出/EOF/中断停止、断线重连不继承旧关节控制。该子进程也继续验证切回 Cartesian 的启停。
 - help 已显示新命令且不连接设备；git diff --check 通过。当前总计 operator 37 + 控制台 22 = 59 项。本小任务没有发送实机控制指令。
+
+
+### 2026-10-12：关节 follower 小任务 3——最终回归及现场说明
+
+- 小任务 2 提交 3d1964a。补充独立的启动确认标记，将“待清理启动”与“确认可发送目标”分开；启动超时或被拒绝后，即使后续 get 恰好看到 Axis，也不自动恢复发送权限。需明确停止并重新启动。新增延迟模式回读和 UDP 异常/不完整发送禁止继续发送的回归。
+- 最终本机测试命令：`/home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -q`，**61/61 PASS**（operator 39、控制台 22）；git diff --check 通过。测试含独立子进程入口与回环 WS/两路 UDP，不连接真实机器人。
+- docs/a10_onsite_guide.md 第 6 节新增关节现场教程，说明启动/停止、查询实际角度、复制当前六轴目标、单位、模式切换及夹爪独立通道；接口表同步。该文件原有未提交的 OpenPI 附录保留且不计入此次提交。
+- 本阶段完成六轴 joint follower 软件实现与本机验收，仍保持机器人运行逻辑集中在 a10_operator.py。真实启停、运动方向/幅度、控制器接收丢包/失联规则及关节/夹爪同步尚未验收；没有扩展成 batch 定时流、关节回零或自动重发。
+- 工控机仅在协议调查期间 SSH 只读，未发送任何业务控制报文或启动程序。本次已断开；现场运行前确认 kaanhbin 已运行。接下来由现场用户按教程逐项验证并回传结果，再记录实机验收状态。

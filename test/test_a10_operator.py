@@ -380,6 +380,21 @@ class NetworkTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 operator.send_joints({'right':[0]*6})
 
+    def test_later_feedback_cannot_authorize_an_unconfirmed_joint_start(self):
+        for rejected in (False,True):
+            with self.subTest(rejected=rejected), FakeController(change_mode=False) as controller:
+                controller.start_rejected = rejected
+                controller.active_after_rejection = rejected
+                operator = controller.operator(timeout_s=.05)
+                with self.assertRaises(A10ControllerError if rejected else TimeoutError):
+                    operator.start_follower(mode='joint')
+                controller.active, controller.mode = True, 'Axis'
+                self.assertTrue(operator.get_state().follower_active)
+                with self.assertRaises(RuntimeError):
+                    operator.send_joints({'right':[0]*6})
+                controller.change_mode = True
+                operator.stop_follower()
+
     def test_joint_status_changes_revoke_send_and_reconnect_loses_ownership(self):
         for field,value in (('mode','Cart'),('active',False),('driver_fault',True),('activation','Disabled')):
             with self.subTest(field=field), FakeController() as controller:
@@ -398,6 +413,24 @@ class NetworkTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 operator.send_joints({'right':[0]*6})
             with self.assertRaises(RuntimeError):
+                operator.stop_follower()
+
+    def test_joint_udp_send_failure_revokes_further_targets(self):
+        for failed in (True,False):
+            with self.subTest(failed=failed), FakeController() as controller:
+                operator=controller.operator()
+                operator.start_follower(mode='joint')
+                with patch.object(operator._connection, 'joint_udp') as udp:
+                    if failed:
+                        udp.send.side_effect=OSError('UDP unavailable')
+                    else:
+                        udp.send.return_value=1  # Cannot claim a complete send.
+                    with self.assertRaises(OSError):
+                        operator.send_joints({'right':[0]*6})
+                    self.assertFalse(operator._confirmed_active)
+                    with self.assertRaises(RuntimeError):
+                        operator.send_joints({'right':[0]*6})
+                    self.assertEqual(udp.send.call_count,1)
                 operator.stop_follower()
 
     def test_joint_start_conditions_and_readonly_gate(self):

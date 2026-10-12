@@ -23,7 +23,7 @@ cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 get
 ```
 
-只读交互模式：在 shell 前加 `--read-only`。查看帮助用 `--help`，查看指令列表用 `--host 192.168.110.124 help`；帮助不连接设备。默认 WS 5999、UDP 9998、超时 5 秒，可在 shell/get 前用 `--ws-port`、`--udp-port`、`--timeout` 修改。
+只读交互模式：在 shell 前加 `--read-only`。查看帮助用 `--help`，查看指令列表用 `--host 192.168.110.124 help`；帮助不连接设备。默认 WS 5999、Cartesian UDP 9998、关节 UDP 9999、超时 5 秒，可在 shell/get 前用 `--ws-port`、`--udp-port`、`--joint-udp-port`、`--timeout` 修改。两路 UDP 端口不能相同。
 
 ### 2. 首次现场验证：每次输入一条，检查成功后再下一条
 
@@ -57,7 +57,11 @@ stop_follower
 | `manual_en` | 手动使能，等待 Enabled；仅 ACK 不算成功 |
 | `manual_ds` | 手动掉使能，等待 Disabled；不是急停 |
 | `set_jog_coordinate --tool` | 设置工具坐标系，等待 Tool；影响后续手动点动参考系 |
+| `set_jog_coordinate --axis` | 显式设置关节坐标系，等待 Axis |
 | `follower_cart` | 在本连接启动笛卡尔跟随并回读确认，只能在 shell 使用 |
+| `follower_aj` | 在本连接启动六轴关节跟随并回读 Axis，只能在 shell 使用 |
+| `joints` | 只查询实际角度，按关节1到6打印度数及可复制的目标文本 |
+| `joints --deg q1 q2 q3 q4 q5 q6` | 替换为六个绝对角度（度），不含夹爪；仅 shell、仅已确认的关节模式 |
 | `stop_follower` | 停止本连接启动的跟随并确认，只能在 shell 使用 |
 | `pq x y z qx qy qz qw` | 将占位符替换成 7 个实际数字；仅 shell，发送一个 UDP 目标 |
 | `g_move --pos=毫米数` | 替换成 0..100 的数字，发送夹爪目标；回复成功不等于到位 |
@@ -85,6 +89,38 @@ cd /home/robot/VLA/FluxVLA
 ```
 
 测试端点仅为 127.0.0.1 随机端口，不访问工控机。开发记录见 `a10_controller_follower_review.md` 和 `a10_full_migration_plan.md`。
+
+### 6. 六轴关节 follower 的现场验证（2026-10-12）
+
+这是新加的功能，目前通过本机模拟测试，真实关节启停和运动尚待现场验证。SSH 只读检查时未观察到 kaanhbin/9999 监听；测试前由现场确认控制程序已正常运行，其他程序未在控制机械臂。先使用第 1 节命令打开控制台。
+
+第一轮只检查启动/停止，以下指令逐条输入，每步成功后再继续：
+
+```text
+get
+set_jog_coordinate --axis
+manual_en
+joints
+follower_aj
+get
+stop_follower
+```
+
+预期：无故障 → 明确选择 Axis 点动坐标系 → Enabled → 能读取六轴实际角度 → running_state=true、follower_mode=Axis → 再次查询一致 → running_state=false。点动坐标系与 follower_mode 是两个不同字段，单看点动 Axis 不证明已启动关节跟随。当前所读库中未发现关节启动必须点动 Axis 的检查；这里显式选择以方便现场辨认，不自动切换。关节启动不依赖 TCP 位姿反馈。
+
+第二轮验证发送目标：
+
+1. 输入 `follower_aj`，确认启动成功。
+2. 输入 `joints`，打印六个**实际角度**及一条 `joints --deg ...` 指令。
+3. 首次将刚打印的完整指令复制回同一控制台，作为当前实际位置的保持目标；不要用六个零代替当前姿态。程序显示“已发送”仅证明本地发包，不能确认控制器接收或已到位。
+4. 核对现场姿态和 `joints` 反馈；再由现场选一个关节，对完整目标中的那个数作小幅改变，核对关节顺序、方向、幅度。六个数是绝对角度，不是每次增加的偏移量。下一次查询只输出参考文本，不会自动发送。
+5. 输入 `stop_follower`，确认未运行。需要掉使能时再 `manual_ds`，确认 Disabled，最后 `exit`。
+
+UDP wire 使用 40 字节 ARIS 消息头 + UTF-8 `jp --motor_pos=[六个度数]`，发送到 9999。Python 的公开 `send_joints({'right': ...})` 接收六轴**弧度**，终端 `--deg` 输入则是**度**；CLI 和 operator 在边界完成转换，不能把模型弧度直接当 CLI 度数。夹爪通过单独的 `g_move` 路径控制，不加入 motor_pos 作为第七轴；关节与夹爪同步执行尚未验收。
+
+在同一连接切换回末端跟随时，先 stop_follower 并确认，再 set_jog_coordinate --tool、follower_cart。关节模式拒绝 pq，Cartesian 模式拒绝 joints 目标。启动被拒绝、模式确认超时或断线后，只读查询不恢复失败会话的发送资格；先处理停止/重连，再显式启动。reconnect 和退出清理规则同第 4 节。
+
+目前每条目标命令只发送一个 UDP 数据报，无自动重发、持续保持或动作块调度，也没有接收到位确认。若实际响应不明显，保留 get --raw 和现场现象检查，不能据此盲目加大目标。模型动作块按频率逐步下发、序号/过期丢弃、丢包和控制器失联停止属于下一阶段。
 
 ---
 

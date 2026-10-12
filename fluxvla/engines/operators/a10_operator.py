@@ -339,6 +339,7 @@ class A10Operator(BaseOperator):
         self._io_lock = threading.RLock()
         self._confirmed_active = False
         self._started_here = False
+        self._start_confirmed = False
         self._follower_mode = None
 
     @property
@@ -355,12 +356,14 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             if not self.is_connected:
                 self._confirmed_active = self._started_here = False
+                self._start_confirmed = False
                 self._follower_mode = None
                 self._connection.connect()
 
     def close(self):
         with self._io_lock:
             self._confirmed_active = self._started_here = False
+            self._start_confirmed = False
             self._follower_mode = None
             self._connection.close()
 
@@ -378,6 +381,7 @@ class A10Operator(BaseOperator):
                                      position_unit=self.feedback_position_unit,
                                      gripper_feedback_path=self.gripper_feedback_path)
                 self._confirmed_active = (self._started_here
+                                          and self._start_confirmed
                                           and state.follower_active is True
                                           and state.follower_mode == self._follower_mode
                                           and state.raw['ret_context'].get('robot_msg', {}).get('activate') == 'Enabled'
@@ -404,8 +408,10 @@ class A10Operator(BaseOperator):
             if state.follower_active is active and (not active or state.follower_mode == self._follower_mode):
                 if active and state.has_error:
                     raise A10ControllerError('Controller reports a fault')
-                if active and not self._confirmed_active:
+                if active and state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled':
                     raise A10ControllerError('Follower running but motion permission is not confirmed')
+                if active:
+                    self._start_confirmed = self._confirmed_active = True
                 return state
             if state.has_error and active:
                 raise A10ControllerError('Controller reports a fault')
@@ -505,6 +511,7 @@ class A10Operator(BaseOperator):
             # Record the attempt before send: Ctrl+C can arrive after bytes
             # leave the socket but before send() returns to Python.
             self._started_here = True
+            self._start_confirmed = False
             self._confirmed_active = False
             self._follower_mode = feedback_mode
             self.command_mode = mode
@@ -533,6 +540,7 @@ class A10Operator(BaseOperator):
             if not self._started_here:
                 raise RuntimeError('This connection did not start the follower')
             self._confirmed_active = False
+            self._start_confirmed = False
             self._connection.send_command('stop_follower')
             state = self._wait_mode(False)
             self._started_here = False
@@ -579,7 +587,7 @@ class A10Operator(BaseOperator):
             return self._connection.request(f'g_move --pos={position:.12g}')
 
     def execute_trajectory(self, *args, **kwargs):
-        raise NotImplementedError('Use send_eepose; trajectory timing belongs to the controller')
+        raise NotImplementedError('Use send_eepose/send_joints; batch scheduling is not implemented')
 
     def stop_trajectory(self):
         return self.stop_follower()

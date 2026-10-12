@@ -241,7 +241,8 @@ class _FollowerConnection:
             raise
 
     def request(self, command, *, status=False, timeout_s=None):
-        deadline = time.monotonic() + (timeout_s or self.timeout_s)
+        budget = self.timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + budget
         try:
             self.send_command(command)
             for _ in range(32):
@@ -259,9 +260,12 @@ class _FollowerConnection:
                     raise A10ProtocolError('Unexpected response while waiting for status')
                 # Bounded skipping of delayed empty ACKs, or old status replies.
             raise A10ProtocolError('Too many unrelated replies')
-        except Exception:
+        except Exception as exc:
             # An uncertain transaction cannot be reused for a later command.
             self.close()
+            if isinstance(exc, TimeoutError):
+                raise TimeoutError(
+                    f'A10 command {command!r} reply timed out after {budget:.3f}s') from exc
             raise
 
     def close(self):
@@ -310,7 +314,7 @@ class A10Operator(BaseOperator):
                  joint_udp_port=9999, command_mode='cartesian',
                  cameras=None, gripper=None, gripper_transport='controller',
                  trajectory_feedback_interval_s=0.1,
-                 trajectory_feedback_timeout_s=0.015,
+                 trajectory_feedback_timeout_s=0.1,
                  trajectory_max_lateness_s=None):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
@@ -698,8 +702,9 @@ class A10Operator(BaseOperator):
         """Send absolute joint rad / gripper mm rows on a monotonic clock.
 
         Synchronous only. Validate the WHOLE chunk before any target. First
-        send is immediate after bounded preflight checks; return after T*dt
-        seconds means sending ended, not physical arrival or UDP receipt.
+        send is immediate after bounded preflight checks. Feedback queries
+        pause the schedule; sending takes at least T*dt, plus feedback time.
+        Return means sending ended, not physical arrival or UDP receipt.
         Periodic status/servo checks interrupt a faulted stream. Overdue slots
         abort, with no retry, interpolation, catch-up burst or ROS dependency.
         Caller owns follower start/stop (the runner stops in its finally).
@@ -742,6 +747,7 @@ class A10Operator(BaseOperator):
             raise RuntimeError('A trajectory is already running')
         sent = 0
         started = None
+        wall_started = None
         completed = False
         try:
             with self._io_lock:
@@ -751,18 +757,28 @@ class A10Operator(BaseOperator):
                     raise RuntimeError('Confirmed owned joint follower required for trajectory')
                 self._trajectory_owner = threading.get_ident()
                 self._traj_stop_event.clear()
-                feedback_timeout = min(self.trajectory_feedback_timeout_s, dt / 2)
+                feedback_timeout = self.trajectory_feedback_timeout_s
                 self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
             started = last_feedback = time.monotonic()
+            wall_started = started
             for index, target in enumerate(joints):
                 deadline = started + index * dt
                 self._traj_stop_event.wait(max(0., deadline - time.monotonic()))
                 with self._io_lock:
                     self._require_target_owner()
                     now = time.monotonic()
+                    if now - deadline > lateness:
+                        raise TimeoutError(f'Trajectory slot {index} missed; no catch-up sends')
                     if now - last_feedback >= self.trajectory_feedback_interval_s:
+                        feedback_started = time.monotonic()
                         self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
                         last_feedback = time.monotonic()
+                        # WS/USB feedback is not a real-time operation. Hold the
+                        # last target while checking, then resume the schedule
+                        # without skipping or bursting overdue model rows.
+                        started += last_feedback - feedback_started
+                        deadline = started + index * dt
+                        self._require_target_owner()
                     if time.monotonic() - deadline > lateness:
                         raise TimeoutError(f'Trajectory slot {index} missed; no catch-up sends')
                     self.send_joints({self.arm_name: target})
@@ -786,7 +802,7 @@ class A10Operator(BaseOperator):
             with self._io_lock:
                 self.last_trajectory = dict(selected=len(joints), sent=sent,
                     completed=completed, physical_arrival_confirmed=False,
-                    elapsed_s=None if started is None else time.monotonic() - started)
+                    elapsed_s=None if wall_started is None else time.monotonic() - wall_started)
                 self._trajectory_owner = None
             self._trajectory_lock.release()
 

@@ -169,6 +169,7 @@ class FakeController:
         self.start_rejected = False
         self.active_after_rejection = False
         self.recovery_fault = None
+        self.get_reply_delay_s = 0.
         self.lock = threading.Lock()
 
     def __enter__(self):
@@ -252,6 +253,7 @@ class FakeController:
                         for _ in range(33):
                             ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                         continue
+                    time.sleep(self.get_reply_delay_s)
                     ws.send(frame)
                 elif command in ('follower_cart', 'follower_aj', 'stop_follower'):
                     if command != 'stop_follower' and self.start_rejected:

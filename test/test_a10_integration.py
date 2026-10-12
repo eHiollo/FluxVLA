@@ -174,6 +174,37 @@ class A10TrajectoryTest(unittest.TestCase):
             self.controller.joint_udp.recv(1024)
         self.assertEqual(initial_writes, len(self.serial.writes))
 
+    def test_delayed_status_at_30hz_resumes_without_catch_up(self):
+        import time
+        operator = self.started_operator(trajectory_feedback_interval_s=.04)
+        self.controller.get_reply_delay_s = .04
+        times = []
+        original = operator.send_joints
+        def send(target):
+            times.append(time.monotonic())
+            original(target)
+        with patch.object(operator, 'send_joints', side_effect=send):
+            self.execute(operator, count=5, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 5)
+        self.assertTrue(operator.last_trajectory['completed'])
+        gaps = np.diff(times)
+        self.assertTrue(np.all(gaps >= .02), gaps)
+        self.assertGreater(float(gaps.max()), .065)
+        self.assertTrue(operator.is_connected)
+        operator.stop_follower()
+
+    def test_feedback_timeout_before_first_target_reports_zero_sends(self):
+        operator = self.started_operator(trajectory_feedback_timeout_s=.05)
+        self.controller.fault = 'timeout'
+        with self.assertRaisesRegex(TimeoutError, "'get'.*0.050s"):
+            self.execute(operator, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 0)
+        self.assertFalse(operator.last_trajectory['completed'])
+        self.assertFalse(operator.is_connected)
+        self.assertTrue(operator.follower_stop_pending)
+        with self.assertRaises(TimeoutError):
+            self.controller.joint_udp.recv(1024)
+
     def test_unowned_cartesian_and_legacy_gripper_are_rejected(self):
         operator = self.operator()
         with self.assertRaisesRegex(RuntimeError, 'owned joint'):

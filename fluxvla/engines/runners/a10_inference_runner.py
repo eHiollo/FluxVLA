@@ -206,6 +206,9 @@ class A10InferenceRunner(BaseInferenceRunner):
             logger.info('A10 run finished after %d selected steps (dry_run=%s)',
                         steps, self.dry_run)
         except BaseException as exc:
+            trajectory = getattr(self.ros_operator, 'last_trajectory', None)
+            if trajectory is not None:
+                logger.warning('A10 last trajectory send result: %s', trajectory)
             logger.warning('A10 run ended: %s: %s', type(exc).__name__, exc)
             raise
         finally:

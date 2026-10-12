@@ -139,7 +139,7 @@ class CodecTest(unittest.TestCase):
                 operator.start_follower()
             with self.assertRaises(PermissionError):
                 operator.send_gripper({'right': 50})
-            with self.assertRaises(NotImplementedError):
+            with self.assertRaises(PermissionError):
                 operator.send_joints({'right': [0] * 6})
             operator.close()
             operator.close()
@@ -155,6 +155,8 @@ class FakeController:
         self.no_pong = no_pong
         self.commands, self.errors, self.operators = [], [], []
         self.actual = True
+        self.tcp = True
+        self.start_mode_override = None
         self.mode = 'Cart' if initial_active else 'None'
         self.driver_fault = False
         self.coordinate = 'Tool'
@@ -183,6 +185,9 @@ class FakeController:
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.bind(('127.0.0.1', 0))
         self.udp.settimeout(.2)
+        self.joint_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.joint_udp.bind(('127.0.0.1', 0))
+        self.joint_udp.settimeout(.05)
         self.server = serve(self.handle, '127.0.0.1', 0,
                             create_connection=NoPongConnection if self.no_pong else None)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -192,6 +197,7 @@ class FakeController:
     def operator(self, **kwargs):
         options = dict(host='127.0.0.1', ws_port=self.server.socket.getsockname()[1],
                        udp_port=self.udp.getsockname()[1], timeout_s=.3,
+                       joint_udp_port=self.joint_udp.getsockname()[1],
                        allow_motion=True)
         options.update(kwargs)
         operator = A10Operator(**options)
@@ -222,6 +228,8 @@ class FakeController:
                     reply['ret_context']['robot_msg']['activate'] = self.activation
                     if not self.actual:
                         del reply['ret_context']['motion_msg']['actual_pos']
+                    if not self.tcp:
+                        del reply['ret_context']['motion_msg']['pq']
                     if self.driver_fault:
                         reply['ret_context']['driver_msg']['driver_err_code'][0] = 8
                     reply['ret_context']['test_gripper'] = {'actual_mm': 42.5}
@@ -245,21 +253,22 @@ class FakeController:
                             ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                         continue
                     ws.send(frame)
-                elif command in ('follower_cart', 'stop_follower'):
-                    if command == 'follower_cart' and self.start_rejected:
+                elif command in ('follower_cart', 'follower_aj', 'stop_follower'):
+                    if command != 'stop_follower' and self.start_rejected:
                         self.active = self.active_after_rejection
                         self.fault = self.recovery_fault
                         ws.send(wire_reply({'ret_code': -987313,
                             'ret_msg': '请切换到笛卡尔坐标系', 'ret_context': ''}))
                         continue
                     if self.change_mode:
-                        self.active = command == 'follower_cart'
-                        self.mode = 'Cart' if self.active else 'None'
+                        self.active = command != 'stop_follower'
+                        self.mode = (self.start_mode_override or
+                                     ('Axis' if command == 'follower_aj' else 'Cart')) if self.active else 'None'
                     # Delayed empty ACK is intentionally ahead of the get reply.
                     ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
-                elif command == 'set_jog_coordinate --tool':
+                elif command in ('set_jog_coordinate --tool', 'set_jog_coordinate --axis'):
                     if self.coordinate_change:
-                        self.coordinate = 'Tool'
+                        self.coordinate = 'Axis' if command.endswith('--axis') else 'Tool'
                     ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                 elif command in ('manual_en', 'manual_ds'):
                     if self.reject_enable:
@@ -284,6 +293,7 @@ class FakeController:
         self.server.shutdown()
         self.thread.join(timeout=2)
         self.udp.close()
+        self.joint_udp.close()
         if exc is None:
             if self.thread.is_alive():
                 raise AssertionError('Fake server did not terminate')
@@ -292,6 +302,152 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_joint_roundtrip_wire_degrees_and_separate_ports(self):
+        with FakeController() as controller:
+            controller.coordinate = 'Axis'
+            controller.tcp = False  # Joint start doesn't require a TCP pose.
+            operator = controller.operator()
+            self.assertEqual(operator.start_follower(mode='joint').follower_mode, 'Axis')
+            self.assertEqual(operator.command_mode, 'joint')
+            # A complete 6-axis absolute target; no seventh gripper value.
+            operator.send_joints({'right': [0, np.pi/2, -np.pi/2, np.pi, 0, np.pi/4]})
+            packet, _ = controller.joint_udp.recvfrom(65535)
+            self.assertEqual(struct.unpack('<IIQqqq', packet[:40]),
+                             (len(packet)-40, 0, 0, 0, 0, 0))
+            self.assertEqual(packet[40:], b'jp --motor_pos=[0,90,-90,180,0,45]')
+            with self.assertRaises(socket.timeout):
+                controller.udp.recvfrom(65535)
+            self.assertFalse(operator.stop_follower().follower_active)
+            self.assertEqual(controller.commands, ['get','follower_aj','get','stop_follower','get'])
+            operator.close()
+            self.assertIsNone(operator._connection.joint_udp)
+
+    def test_joint_and_cartesian_targets_and_mode_switch_are_exclusive(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            operator.start_follower(mode='joint')
+            with self.assertRaisesRegex(RuntimeError, 'Cart'):
+                operator.send_eepose({'right': [0,0,0,0,0,0,1]})
+            with self.assertRaisesRegex(RuntimeError, 'stop_follower'):
+                operator.start_follower(mode='cartesian')
+            operator.stop_follower()
+            operator.start_follower(mode='cartesian')
+            with self.assertRaisesRegex(RuntimeError, 'Axis'):
+                operator.send_joints({'right': [0]*6})
+            with self.assertRaises(socket.timeout):
+                controller.joint_udp.recvfrom(65535)
+            operator.stop_follower()
+            self.assertEqual(controller.commands.count('follower_aj'), 1)
+            self.assertEqual(controller.commands.count('follower_cart'), 1)
+
+    def test_joint_invalid_targets_never_reach_either_socket(self):
+        with FakeController() as controller:
+            operator = controller.operator(command_mode='joint')
+            operator.start_follower()
+            for value in ([0]*5, [0]*7, [[0]*6], [False]*6, ['0']*6,
+                          [float('nan')]*6, [float('inf')]*6, [1e308]*6):
+                with self.subTest(value=value), self.assertRaises(A10ProtocolError):
+                    operator.send_joints({'right': value})
+            for target in ({'left':[0]*6}, {'right':[0]*6,'left':[0]*6}):
+                with self.assertRaises(ValueError):
+                    operator.send_joints(target)
+            with self.assertRaises(socket.timeout):
+                controller.joint_udp.recvfrom(65535)
+            operator.stop_follower()
+
+    def test_joint_wrong_feedback_or_no_transition_cannot_authorize_udp(self):
+        for override, transition in (('Cart',True), (None,False)):
+            with self.subTest(override=override), FakeController(change_mode=transition) as controller:
+                controller.start_mode_override = override
+                operator = controller.operator(timeout_s=.05)
+                with self.assertRaises(TimeoutError):
+                    operator.start_follower(mode='joint')
+                with self.assertRaises(RuntimeError):
+                    operator.send_joints({'right':[0]*6})
+                self.assertTrue(operator.follower_stop_pending)
+                controller.change_mode = True
+                operator.stop_follower()
+
+    def test_joint_rejection_recovers_only_read_only(self):
+        with FakeController() as controller:
+            controller.start_rejected = True
+            operator = controller.operator()
+            with self.assertRaises(A10ControllerError):
+                operator.start_follower(mode='joint')
+            self.assertFalse(operator.follower_stop_pending)
+            self.assertEqual(controller.commands.count('follower_aj'), 1)
+            self.assertNotIn('stop_follower', controller.commands)
+            with self.assertRaises(RuntimeError):
+                operator.send_joints({'right':[0]*6})
+
+    def test_joint_status_changes_revoke_send_and_reconnect_loses_ownership(self):
+        for field,value in (('mode','Cart'),('active',False),('driver_fault',True),('activation','Disabled')):
+            with self.subTest(field=field), FakeController() as controller:
+                operator = controller.operator()
+                operator.start_follower(mode='joint')
+                setattr(controller,field,value)
+                operator.get_state()
+                with self.assertRaises(RuntimeError):
+                    operator.send_joints({'right':[0]*6})
+        with FakeController() as controller:
+            operator = controller.operator()
+            operator.start_follower(mode='joint')
+            operator.close()
+            operator.connect()
+            self.assertEqual(operator.get_state().follower_mode, 'Axis')
+            with self.assertRaises(RuntimeError):
+                operator.send_joints({'right':[0]*6})
+            with self.assertRaises(RuntimeError):
+                operator.stop_follower()
+
+    def test_joint_start_conditions_and_readonly_gate(self):
+        for field,value in (('actual',False),('active',True),('activation','Disabled'),
+                            ('motion','Running'),('driver_fault',True)):
+            with self.subTest(field=field), FakeController() as controller:
+                setattr(controller,field,value)
+                operator = controller.operator()
+                with self.assertRaises((RuntimeError,A10ProtocolError)):
+                    operator.start_follower(mode='joint')
+                self.assertNotIn('follower_aj', controller.commands)
+        with FakeController() as controller:
+            operator = controller.operator(allow_motion=False)
+            for call in (lambda:operator.start_follower(mode='joint'),
+                         lambda:operator.send_joints({'right':[0]*6}),
+                         lambda:operator.set_jog_coordinate('Axis')):
+                with self.assertRaises(PermissionError):
+                    call()
+            self.assertEqual(controller.commands, [])
+
+    def test_axis_coordinate_selection_is_explicit_and_confirmed(self):
+        with FakeController() as controller:
+            operator = controller.operator()
+            self.assertEqual(operator.set_jog_coordinate('Axis').raw['ret_context']['motion_msg']['jog_coordinate'], 'Axis')
+            self.assertEqual(controller.commands, ['get','set_jog_coordinate --axis','get'])
+            operator.set_tool_coordinate()
+            self.assertEqual(controller.coordinate, 'Tool')
+            with self.assertRaises(ValueError):
+                operator.set_jog_coordinate('Unknown')
+
+    def test_second_udp_socket_setup_failure_releases_all_resources(self):
+        with FakeController() as controller:
+            operator = A10Operator(host='127.0.0.1', ws_port=controller.server.socket.getsockname()[1])
+            real_socket = socket.socket
+            made = []
+            def socket_factory(*args,**kwargs):
+                if args[:2] == (socket.AF_INET,socket.SOCK_DGRAM):
+                    if made:
+                        raise OSError('second UDP socket failed')
+                    sock = real_socket(*args,**kwargs)
+                    made.append(sock)
+                    return sock
+                return real_socket(*args,**kwargs)
+            with patch('socket.socket',socket_factory), self.assertRaises(OSError):
+                operator.connect()
+            self.assertFalse(operator.is_connected)
+            self.assertEqual(made[0].fileno(), -1)
+            self.assertIsNone(operator._connection.ws)
+            self.assertIsNone(operator._connection.joint_udp)
+
     def test_idle_controller_without_pong_still_answers_get(self):
         from websockets.sync.client import connect
         def short_defaults(*args, **kwargs):

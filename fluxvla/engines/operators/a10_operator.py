@@ -26,6 +26,8 @@ __all__ = ['A10Operator', 'A10State', 'A10ProtocolError', 'A10ControllerError']
 
 _HEADER = struct.Struct('<IIQqqq')
 _MAX_PAYLOAD = 1024 * 1024
+_FOLLOWER_MODES = {'cartesian': ('follower_cart', 'Cart'),
+                   'joint': ('follower_aj', 'Axis')}
 
 
 class A10ProtocolError(ValueError):
@@ -201,10 +203,11 @@ def _parse_state(reply, *, joint_unit, position_unit, gripper_feedback_path):
 class _FollowerConnection:
     """Serialized WS transactions plus a separate UDP socket; no robot logic."""
 
-    def __init__(self, host, ws_port, udp_port, timeout_s):
+    def __init__(self, host, ws_port, udp_port, timeout_s, joint_udp_port=9999):
         self.host, self.ws_port, self.udp_port = host, ws_port, udp_port
         self.timeout_s = timeout_s
-        self.ws = self.udp = None
+        self.joint_udp_port = joint_udp_port
+        self.ws = self.udp = self.joint_udp = None
 
     def connect(self):
         from websockets.sync.client import connect
@@ -219,6 +222,9 @@ class _FollowerConnection:
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp.settimeout(self.timeout_s)
             self.udp.connect((self.host, self.udp_port))
+            self.joint_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.joint_udp.settimeout(self.timeout_s)
+            self.joint_udp.connect((self.host, self.joint_udp_port))
         except Exception:
             self.close()
             raise
@@ -257,14 +263,18 @@ class _FollowerConnection:
             raise
 
     def close(self):
-        ws, udp = self.ws, self.udp
-        self.ws = self.udp = None
+        ws, udp, joint_udp = self.ws, self.udp, self.joint_udp
+        self.ws = self.udp = self.joint_udp = None
         try:
             if ws is not None:
                 ws.close()
         finally:
-            if udp is not None:
-                udp.close()
+            try:
+                if udp is not None:
+                    udp.close()
+            finally:
+                if joint_udp is not None:
+                    joint_udp.close()
 
 
 @OPERATORS.register_module()
@@ -272,6 +282,10 @@ class A10Operator(BaseOperator):
     """Six-axis A10 + gripper, using the reference KAANH follower protocol.
 
     ``send_eepose({'right': pose})`` expects origin-relative xyz metres + xyzw.
+    ``send_joints({'right': joints})`` expects six absolute joint angles in
+    radians. They are converted to degrees in UDP ``jp --motor_pos=[...]``;
+    the gripper remains a separate command. Only the selected follower mode
+    may receive targets, after this session's start is confirmed in feedback.
     It does not convert absolute poses or per-frame VR deltas. Joint feedback
     defaults to degrees on the wire per the template; set feedback_joint_unit
     to the verified controller convention. Position units are unknown by
@@ -283,17 +297,24 @@ class A10Operator(BaseOperator):
     exit is not a physical emergency stop. No automatic motor enable or login.
     """
 
-    capabilities = frozenset({'relative_cartesian_follower', 'gripper_position'})
+    capabilities = frozenset({'relative_cartesian_follower', 'absolute_joint_follower',
+                              'gripper_position'})
     command_mode = 'cartesian'
 
     def __init__(self, host, ws_port=5999, udp_port=9998, timeout_s=2.0,
                  allow_motion=False, arm_name='right', feedback_joint_unit='deg',
-                 feedback_position_unit=None, gripper_feedback_path=None):
+                 feedback_position_unit=None, gripper_feedback_path=None,
+                 joint_udp_port=9999, command_mode='cartesian'):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
-        if any(type(p) is not int or not 1 <= p <= 65535 for p in (ws_port, udp_port)):
+        if any(type(p) is not int or not 1 <= p <= 65535
+               for p in (ws_port, udp_port, joint_udp_port)):
             raise ValueError('Ports must be integers within 1..65535')
+        if joint_udp_port == udp_port:
+            raise ValueError('Cartesian and joint UDP ports must differ')
+        if command_mode not in _FOLLOWER_MODES:
+            raise ValueError('command_mode must be cartesian or joint')
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError('timeout_s must be positive and finite')
         if type(allow_motion) is not bool or not isinstance(arm_name, str) or not arm_name:
@@ -312,14 +333,18 @@ class A10Operator(BaseOperator):
         self.feedback_position_unit = feedback_position_unit
         self.gripper_feedback_path = gripper_feedback_path
         self.timeout_s = float(timeout_s)
-        self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s)
+        self.command_mode = command_mode
+        self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s,
+                                               joint_udp_port)
         self._io_lock = threading.RLock()
         self._confirmed_active = False
         self._started_here = False
+        self._follower_mode = None
 
     @property
     def is_connected(self):
-        return self._connection.ws is not None and self._connection.udp is not None
+        return (self._connection.ws is not None and self._connection.udp is not None
+                and self._connection.joint_udp is not None)
 
     @property
     def follower_stop_pending(self):
@@ -330,11 +355,13 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             if not self.is_connected:
                 self._confirmed_active = self._started_here = False
+                self._follower_mode = None
                 self._connection.connect()
 
     def close(self):
         with self._io_lock:
             self._confirmed_active = self._started_here = False
+            self._follower_mode = None
             self._connection.close()
 
     def _require_motion(self):
@@ -350,8 +377,9 @@ class A10Operator(BaseOperator):
                 state = _parse_state(reply, joint_unit=self.feedback_joint_unit,
                                      position_unit=self.feedback_position_unit,
                                      gripper_feedback_path=self.gripper_feedback_path)
-                self._confirmed_active = (state.follower_active is True
-                                          and state.follower_mode == 'Cart'
+                self._confirmed_active = (self._started_here
+                                          and state.follower_active is True
+                                          and state.follower_mode == self._follower_mode
                                           and state.raw['ret_context'].get('robot_msg', {}).get('activate') == 'Enabled'
                                           and not state.has_error)
                 return state
@@ -373,9 +401,11 @@ class A10Operator(BaseOperator):
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
-            if state.follower_active is active and (not active or state.follower_mode == 'Cart'):
+            if state.follower_active is active and (not active or state.follower_mode == self._follower_mode):
                 if active and state.has_error:
                     raise A10ControllerError('Controller reports a fault')
+                if active and not self._confirmed_active:
+                    raise A10ControllerError('Follower running but motion permission is not confirmed')
                 return state
             if state.has_error and active:
                 raise A10ControllerError('Controller reports a fault')
@@ -421,6 +451,12 @@ class A10Operator(BaseOperator):
 
     def set_tool_coordinate(self):
         """Explicitly select Tool jog coordinates and verify feedback; no target sent."""
+        return self.set_jog_coordinate('Tool')
+
+    def set_jog_coordinate(self, coordinate):
+        """Explicitly select Axis or Tool jog coordinates and verify feedback."""
+        if coordinate not in ('Axis', 'Tool'):
+            raise ValueError('coordinate must be Axis or Tool')
         with self._io_lock:
             self._require_motion()
             state = self.get_state()
@@ -430,40 +466,50 @@ class A10Operator(BaseOperator):
                 raise RuntimeError('Stop the follower before changing jog coordinates')
             if state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped':
                 raise RuntimeError('Coordinate change requires confirmed Stopped feedback')
-            self._connection.request('set_jog_coordinate --tool')
+            self._connection.request(f'set_jog_coordinate --{coordinate.lower()}')
             deadline = time.monotonic() + self.timeout_s
             while time.monotonic() < deadline:
                 state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
                 if state.has_error or state.follower_active is not False:
                     raise A10ControllerError('Controller fault or follower state changed during coordinate selection')
-                if state.raw['ret_context']['motion_msg'].get('jog_coordinate') == 'Tool':
+                if state.raw['ret_context']['motion_msg'].get('jog_coordinate') == coordinate:
                     return state
                 time.sleep(min(.02, max(0., deadline - time.monotonic())))
-            raise TimeoutError('Tool jog coordinate was not confirmed')
+            raise TimeoutError(f'{coordinate} jog coordinate was not confirmed')
 
-    def start_follower(self):
+    def start_follower(self, mode=None):
+        """Start cartesian (default) or joint follower; never send an initial target."""
+        mode = self.command_mode if mode is None else mode
+        if mode not in _FOLLOWER_MODES:
+            raise ValueError('mode must be cartesian or joint')
+        command, feedback_mode = _FOLLOWER_MODES[mode]
         with self._io_lock:
             self._require_motion()
+            if self._started_here:
+                raise RuntimeError('This session has a pending follower; stop_follower before switching modes')
             state = self.get_state()
             if state.has_error:
                 raise A10ControllerError('Controller reports a fault')
             if state.follower_active is not False:
                 raise RuntimeError('Follower is active or its state is unknown; refusing takeover')
-            if state.actual_joints_rad is None or state.tcp_pq_raw is None:
+            if state.actual_joints_rad is None or (mode == 'cartesian' and state.tcp_pq_raw is None):
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
             info = state.raw['ret_context'].get('robot_msg', {})
             if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
                 raise RuntimeError('Follower start requires Enabled and Stopped feedback')
             coordinate = state.raw['ret_context']['motion_msg'].get('jog_coordinate')
-            if coordinate not in ('Base', 'Tool', 'Wobj'):
+            if mode == 'cartesian' and coordinate not in ('Base', 'Tool', 'Wobj'):
                 raise RuntimeError(
                     f'Cartesian follower requires Cartesian jog coordinates, got {coordinate!r}; '
                     'explicitly call set_tool_coordinate() before starting')
             # Record the attempt before send: Ctrl+C can arrive after bytes
             # leave the socket but before send() returns to Python.
             self._started_here = True
+            self._confirmed_active = False
+            self._follower_mode = feedback_mode
+            self.command_mode = mode
             try:
-                self._connection.send_command('follower_cart')
+                self._connection.send_command(command)
                 return self._wait_mode(True)
             except A10ControllerError:
                 # A rejection may precede the outstanding get reply. Never reuse
@@ -475,6 +521,7 @@ class A10Operator(BaseOperator):
                         recovered = self.get_state()
                         if recovered.follower_active is False:
                             self._started_here = False
+                            self._follower_mode = None
                     except Exception:
                         self._connection.close()
                 self._confirmed_active = False
@@ -489,6 +536,7 @@ class A10Operator(BaseOperator):
             self._connection.send_command('stop_follower')
             state = self._wait_mode(False)
             self._started_here = False
+            self._follower_mode = None
             return state
 
     def send_eepose(self, arm_targets):
@@ -498,13 +546,17 @@ class A10Operator(BaseOperator):
         pose = _pose(arm_targets[self.arm_name])
         payload = json.dumps({'type': 'pq', 'pq': [pose.tolist()]},
                              separators=(',', ':'), allow_nan=False).encode('utf-8')
+        self._send_follower_target(_pack(payload, command=False), 'Cart')
+
+    def _send_follower_target(self, packet, mode):
         with self._io_lock:
             self._require_motion()
-            if not self._started_here or not self._confirmed_active:
-                raise RuntimeError('Cartesian follower start has not been confirmed')
-            packet = _pack(payload, command=False)
+            if (not self._started_here or not self._confirmed_active
+                    or self._follower_mode != mode):
+                raise RuntimeError(f'{mode} follower start has not been confirmed')
+            udp = self._connection.udp if mode == 'Cart' else self._connection.joint_udp
             try:
-                if self._connection.udp.send(packet) != len(packet):
+                if udp.send(packet) != len(packet):
                     raise ConnectionError('Incomplete UDP datagram send')
             except OSError:
                 self._confirmed_active = False
@@ -536,7 +588,21 @@ class A10Operator(BaseOperator):
         return self.get_state().follower_active
 
     def send_joints(self, arm_targets):
-        raise NotImplementedError('Joint follower protocol is outside this Cartesian adapter')
+        """Send six absolute joint radians via joint follower UDP (wire degrees).
+
+        No gripper, implicit hold, interpolation, retry, or arrival ACK. Client
+        targets must match controller joint order; controller plans motion.
+        """
+        if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
+            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
+        radians = _vector(arm_targets[self.arm_name], 6, 'joint targets in radians')
+        with np.errstate(over='ignore'):
+            degrees = np.rad2deg(radians)
+        if not np.isfinite(degrees).all():
+            raise A10ProtocolError('Joint conversion to degrees must remain finite')
+        values = ','.join(format(float(v), '.17g') for v in degrees)
+        payload = f'jp --motor_pos=[{values}]'.encode('utf-8')
+        self._send_follower_target(_pack(payload, command=False), 'Axis')
 
     def gohome(self):
         raise NotImplementedError('No verified home command for this follower adapter')

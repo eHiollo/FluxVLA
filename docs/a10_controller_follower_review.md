@@ -322,3 +322,15 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 - 新增不回复 Pong 但可回复 get 的独立回环模拟，缩短库默认心跳时限验证空闲后查询；同时验证真实 get 超时仍关闭连接。新增设备离线启动、重复连接失败后恢复、断线保留提示符、失败指令不重发、旧跟随不接管及原连接停止归属测试。
 - 验证：`python -m unittest discover -s test -p 'test_a10_*.py' -q` **43/43 PASS**（operator 28、控制台 15）；git diff --check 通过。仅测试 127.0.0.1，没有连接工控机或发送实机命令；真实控制器的空闲长连接仍需现场复验。
 - 操作说明更新 reconnect、离线处理及保活说明，启动目录纠正为 /home/robot/VLA/FluxVLA（当前 kaanh_follower）；旧 FluxVLA_follower worktree 为 detached 历史版本。工作区同时存在的 projects/a10 等业务修改不纳入本次提交。
+
+
+### 2026-10-12：关节 follower 小任务 1——协议核对及六轴 operator
+
+- 用户授权在 kaanh_follower 执行。本机 /home/robot/VLA/FluxVLA 当前分支已确认；原工作区另有 OpenPI/夹爪开发修改，未纳入本任务。
+- SSH 仅只读核对工控机 /usr/kaanh/kaanh-2.5.7/include/kaanh/follower/udpFollower.hpp、磁盘 XML、release 动态库符号与定向反汇编，没有发送机器人业务命令、启动进程或修改远端。检查结束关闭 SSH。本次 ps/ss 未观察到 kaanhbin 或 UDP 9998/9999 监听，不能确认当前运行程序版本。
+- 动态库 SHA256：fbd638320e3025f5e3c4ec8ec8d9761c5f8499a7c69a96123b05dce039eb52b5。FollowerAjParam 接收回调约 0x28174c 搜索 jp，随后取方括号中的 JSON 数组；约 0x281d3a 对旋转关节乘 0.017453292519943295（度转弧度），约 0x281f32 入关节队列。未命中 jp 的另一路约 0x2823d5 读取 JSON motor_pos，解释旧 client.cpp 格式差异。采用 PDF 明示的 `jp --motor_pos=[...]`，不照搬 14 轴示例的 motor_vel/id。
+- Header 枚举明确 Axis/Cart/None；磁盘 XML follower_aj 映射 FollowerAjAbsolute2，关节 UDP 9999、Cartesian UDP 9998。关节 prepareNrt 在所读代码中未找到必须 Axis 点动坐标系的检查，故不将其作为客户端启动前置条件；新增显式 set_jog_coordinate('Axis'/'Tool') 并回读，set_tool_coordinate 保留为兼容包装。
+- a10_operator.py 继续单文件：两个独立 UDP socket，start_follower(mode='joint'/'cartesian')，send_joints({'right': 六轴绝对弧度})；wire 为六轴度数，不含夹爪。构造 command_mode 默认 cartesian，可配置 joint，启动选定模式后 command_mode 反映该选择。原 udp_port 继续指 Cartesian，joint_udp_port 默认 9999，两端口禁止相同。
+- 启动要求六轴实际反馈、Enabled/Stopped、无故障、follower 未运行；Cartesian 另要求 TCP 和 Cartesian 坐标系。仅本连接确认对应模式可发目标；关节/末端互斥，待停止的启动不能被另一次启动覆盖。重连不继承归属，停止/关闭同时释放两路 UDP。get 状态与启动资格匹配，反馈模式变更/故障/掉使能撤销发送。
+- 本机回环 operator 37/37 PASS（此前 28 项，新增 9 项）：独立检查 UDP 端口、40 字节头、六轴载荷、弧度转度、缺 TCP 的关节启动、互斥切换、坏输入零发送、错误模式/ACK 超时、拒绝后的只读恢复、只读及前置条件、故障/模式改变/重连、第二路 socket 初始化失败清理。没有发实机目标。
+- 本小任务完成协议编码和模式管理；尚无动作块定时发送、关节到位确认或控制器丢包/失联验收。operator 不伪造这些能力。

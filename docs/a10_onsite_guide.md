@@ -226,7 +226,7 @@ python scripts/inference.py \
 
 `dry_run=True` 不会启动 follower 或发送关节/夹爪目标；设备仍需能读取状态、相机和 USB 夹爪。记录 `A10 dry-run planned largest joint step` 的值与位置，再由现场核对目标角度、训练数据动作语义和允许的控制限值。
 
-首次现场 30 步运行已确认控制器收到 30 条六轴目标，但模型目标全程每轴仅变化约 0.08°～0.26°；实际关节跟随量也很小。`max_joint_step_rad` 是拒绝超限目标的检查，不会放大或缩小模型动作。用户停止后只读 `get` 显示 follower 未运行、Stopped、无故障，电机仍 Enabled。
+首次现场 30 步运行已确认控制器收到 30 条六轴目标，但模型目标全程每轴仅变化约 0.08°～0.26°；实际关节跟随量也很小。`max_joint_step_rad` 是拒绝超限目标的检查，不会放大或缩小模型动作。用户停止后只读 `get` 显示 follower 未运行、Stopped、无故障，电机仍 Enabled。 最新现场限值为 `max_joint_step_rad=0.1` 弧度，仍不改变模型实际预测的幅度。后续只读相机检查显示画面中有水瓶、纸箱、金属件，没有黄色柠檬；当前模型默认指令是 `Reach the yellow lemon`，应先核对任务与训练场景是否对应。
 
 ### 7. 本机测试（不连接真机）
 

@@ -410,3 +410,12 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - get_frame 返回真实六轴弧度 + USB 夹爪实际毫米的 qpos[7]、两路 HWC uint8 RGB；controller-only get_state 保持不变。保留机器人、夹爪、相机各自的 host monotonic 接收时间；顺序读取不等于硬件同步，坏输入/掉线不伪造零值。
 - send_gripper USB 支持 wait=True 回读实际到位；非等待仅代表写入。USB 默认 85mm 上限，controller 旧通道保持 100mm，未知 controller 到位能力仍明确拒绝 wait=True。推理示例配置显式包含当前两路相机、USB 物理路径，需现场核对设备路径。
 - requirements-a10.txt 增加 pyserial==3.5，已安装到 fluxvla 环境；pip 原代理配置报错后使用隔离环境完成安装，未修改全局代理。模拟回环 67/67 PASS（原 operator/CLI 61 + 新集成 6）；独立夹爪测试 10/10 PASS。没有连接真机或相机/USB 实设备。动作块调度仍待下一小任务。
+
+
+### 2026-10-12：推理迁入 follower 小任务 3——动作块按时逐帧发送
+
+- 上一步提交 e307c54。execute_trajectory 接收单臂 [T,6] 绝对弧度、可选 [T] USB 夹爪毫米、dt；整个动作块先检查维度、同长度、数值有限/单位转换和工作范围，不合格零目标发送。明确拒绝异步/head/旧 controller 夹爪定时轨迹，不增加 ROS/IK/插值。
+- 要求本连接启动并确认 Axis/Enabled/无故障；preflight 和周期内有截止时间的 WS/USB 反馈检查，完成后再检查一次。默认每 0.1 秒监测、单通道检查最多 0.015 秒（且不超过 dt/2），时间预算可配置；不能保证瞬时检测所有故障或硬实时。
+- monotonic 时钟逐行发送一个 UDP 六轴目标 + USB 夹爪非等待目标，最后等到 T*dt 后返回；同周期不等于硬件同步，到期滞后默认不超过 dt/2。错过时隙/发送超出周期/断线/故障则抛错、撤销目标授权，不重发、不积压补发。last_trajectory 记录 sent/completed，绝不把发送完成标为实际到位。
+- 同步调度期间目标流归属单线程，禁止其他线程插入目标或重叠轨迹；stop_trajectory/stop_follower/close 可打断等待。停止跟随由调用方显式完成；runner 的 finally 按已有规则请求停止并关闭。串口断开不等于停止夹爪，机器人停止需要控制器确认。
+- 本机 74/74 回环测试通过（新增轨迹 7）：实际包格式、发送间隔、USB 校验/位置、坏尾帧零发送、归属/模式检查、运行中故障/掉使能/模式变化/断线/USB 异常、超时无补发、取消和最终短块反馈。仅模拟设备，实机到位、控制器失联规则、丢包验收仍待现场。

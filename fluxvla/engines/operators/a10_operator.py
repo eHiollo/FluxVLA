@@ -291,8 +291,9 @@ class A10Operator(BaseOperator):
     It does not convert absolute poses or per-frame VR deltas. Joint feedback
     defaults to degrees on the wire per the template; set feedback_joint_unit
     to the verified controller convention. Position units are unknown by
-    default. Configure gripper_feedback_path relative to ret_context only
-    after confirming a real numeric millimetre feedback field.
+    default. get_state() remains controller-only. get_frame() can compose
+    cameras and an explicitly selected USB GripperOperator. Configure
+    gripper_feedback_path only for a verified controller millimetre field.
 
     Motion commands require allow_motion=True. close() closes network resources
     only; call stop_follower() explicitly to request and confirm mode exit. Mode
@@ -307,7 +308,10 @@ class A10Operator(BaseOperator):
                  allow_motion=False, arm_name='right', feedback_joint_unit='deg',
                  feedback_position_unit=None, gripper_feedback_path=None,
                  joint_udp_port=9999, command_mode='cartesian',
-                 cameras=None, gripper=None, gripper_transport='controller'):
+                 cameras=None, gripper=None, gripper_transport='controller',
+                 trajectory_feedback_interval_s=0.1,
+                 trajectory_feedback_timeout_s=0.015,
+                 trajectory_max_lateness_s=None):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -349,6 +353,18 @@ class A10Operator(BaseOperator):
                                  if gripper_transport == 'usb' else None)
         self.gripper_max_width_mm = (self.gripper_operator.max_width_mm
                                     if self.gripper_operator is not None else 100.)
+        for name, value in [('trajectory_feedback_interval_s', trajectory_feedback_interval_s),
+                            ('trajectory_feedback_timeout_s', trajectory_feedback_timeout_s),
+                            ('trajectory_max_lateness_s', trajectory_max_lateness_s)]:
+            if value is not None and (isinstance(value, bool)
+                                      or not math.isfinite(value) or value <= 0):
+                raise ValueError(f'{name} must be positive and finite')
+        self.trajectory_feedback_interval_s = float(trajectory_feedback_interval_s)
+        self.trajectory_feedback_timeout_s = float(trajectory_feedback_timeout_s)
+        self.trajectory_max_lateness_s = trajectory_max_lateness_s
+        self._trajectory_lock = threading.Lock()
+        self._trajectory_owner = None
+        self.last_trajectory = None
         self.allow_motion, self.arm_name = allow_motion, arm_name
         self.feedback_joint_unit = feedback_joint_unit
         self.feedback_position_unit = feedback_position_unit
@@ -388,6 +404,7 @@ class A10Operator(BaseOperator):
                     raise
 
     def close(self):
+        self._traj_stop_event.set()
         with self._io_lock:
             self._confirmed_active = self._started_here = False
             self._start_confirmed = False
@@ -595,6 +612,7 @@ class A10Operator(BaseOperator):
                 raise
 
     def stop_follower(self):
+        self._traj_stop_event.set()
         with self._io_lock:
             self._require_motion()
             if not self._started_here:
@@ -618,6 +636,7 @@ class A10Operator(BaseOperator):
 
     def _send_follower_target(self, packet, mode):
         with self._io_lock:
+            self._require_target_owner()
             self._require_motion()
             if (not self._started_here or not self._confirmed_active
                     or self._follower_mode != mode):
@@ -644,6 +663,7 @@ class A10Operator(BaseOperator):
 
     def _send_gripper_target(self, position, *, wait=False, check_state=True):
         with self._io_lock:
+            self._require_target_owner()
             self._require_motion()
             if check_state and self.get_state().has_error:
                 raise A10ControllerError('Controller reports a fault')
@@ -651,14 +671,131 @@ class A10Operator(BaseOperator):
                 return self.gripper_operator.set_position_mm(position, wait=wait)
             return self._connection.request(f'g_move --pos={position:.12g}')
 
-    def execute_trajectory(self, *args, **kwargs):
-        raise NotImplementedError('Use send_eepose/send_joints; batch scheduling is not implemented')
+    def _require_target_owner(self):
+        if self._trajectory_owner is not None:
+            if self._trajectory_owner != threading.get_ident():
+                raise RuntimeError('A trajectory already owns the target stream')
+            if self._traj_stop_event.is_set():
+                raise InterruptedError('A10 trajectory was cancelled')
+
+    def _check_trajectory_feedback(self, timeout_s, *, check_gripper):
+        state = self.get_state(timeout_s=timeout_s)
+        if state.has_error:
+            raise A10ControllerError('Controller fault during trajectory')
+        if not self._confirmed_active or self._follower_mode != 'Axis':
+            raise RuntimeError('Joint follower permission lost during trajectory')
+        if state.actual_joints_rad is None:
+            raise A10ProtocolError('Trajectory requires actual joint feedback')
+        if check_gripper:
+            self.gripper_operator.read_state(timeout=timeout_s)
+
+    def execute_trajectory(self, arm_trajectories, gripper_trajectories=None,
+                           head_trajectory=None, dt=0.1, async_exec=False):
+        """Send absolute joint rad / gripper mm rows on a monotonic clock.
+
+        Synchronous only. Validate the WHOLE chunk before any target. First
+        send is immediate after bounded preflight checks; return after T*dt
+        seconds means sending ended, not physical arrival or UDP receipt.
+        Periodic status/servo checks interrupt a faulted stream. Overdue slots
+        abort, with no retry, interpolation, catch-up burst or ROS dependency.
+        Caller owns follower start/stop (the runner stops in its finally).
+        """
+        if async_exec is not False:
+            raise NotImplementedError('A10 trajectories support async_exec=False only')
+        if head_trajectory is not None:
+            raise ValueError('A10 single arm has no head trajectory')
+        if isinstance(dt, bool) or not math.isfinite(dt) or dt <= 0:
+            raise ValueError('dt must be positive and finite')
+        if not isinstance(arm_trajectories, Mapping) or set(arm_trajectories) != {self.arm_name}:
+            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
+        raw = np.asarray(arm_trajectories[self.arm_name])
+        if raw.ndim != 2 or raw.shape[1] != 6 or not len(raw) or raw.dtype.kind not in 'iuf':
+            raise ValueError('Arm trajectory must be numeric nonempty [T,6] radians')
+        joints = np.array(raw, dtype=np.float64, copy=True)
+        with np.errstate(over='ignore'):
+            if not np.isfinite(joints).all() or not np.isfinite(np.rad2deg(joints)).all():
+                raise ValueError('Arm trajectory must remain finite after degree conversion')
+        if not math.isfinite(len(joints) * dt):
+            raise ValueError('Trajectory duration must be finite')
+        widths = None
+        if gripper_trajectories is not None and not (isinstance(gripper_trajectories, Mapping) and not gripper_trajectories):
+            if (not isinstance(gripper_trajectories, Mapping)
+                    or set(gripper_trajectories) != {self.arm_name}):
+                raise ValueError(f'Expected exactly one gripper: {self.arm_name}')
+            raw = np.asarray(gripper_trajectories[self.arm_name])
+            if raw.shape != (len(joints),) or raw.dtype.kind not in 'iuf':
+                raise ValueError('Gripper trajectory must be numeric [T] matching arm length')
+            widths = np.array(raw, dtype=np.float64, copy=True)
+            if (not np.isfinite(widths).all() or np.any(widths < 0)
+                    or np.any(widths > self.gripper_max_width_mm)):
+                raise ValueError('Gripper trajectory exceeds the configured working range')
+            if self.gripper_transport != 'usb':
+                raise NotImplementedError('Timed gripper trajectories require the USB driver')
+        lateness = dt * .5 if self.trajectory_max_lateness_s is None else self.trajectory_max_lateness_s
+        if lateness >= dt:
+            raise ValueError('trajectory_max_lateness_s must be smaller than dt')
+        if not self._trajectory_lock.acquire(blocking=False):
+            raise RuntimeError('A trajectory is already running')
+        sent = 0
+        started = None
+        completed = False
+        try:
+            with self._io_lock:
+                self._require_motion()
+                if (not self._started_here or not self._start_confirmed
+                        or not self._confirmed_active or self._follower_mode != 'Axis'):
+                    raise RuntimeError('Confirmed owned joint follower required for trajectory')
+                self._trajectory_owner = threading.get_ident()
+                self._traj_stop_event.clear()
+                feedback_timeout = min(self.trajectory_feedback_timeout_s, dt / 2)
+                self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
+            started = last_feedback = time.monotonic()
+            for index, target in enumerate(joints):
+                deadline = started + index * dt
+                self._traj_stop_event.wait(max(0., deadline - time.monotonic()))
+                with self._io_lock:
+                    self._require_target_owner()
+                    now = time.monotonic()
+                    if now - last_feedback >= self.trajectory_feedback_interval_s:
+                        self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
+                        last_feedback = time.monotonic()
+                    if time.monotonic() - deadline > lateness:
+                        raise TimeoutError(f'Trajectory slot {index} missed; no catch-up sends')
+                    self.send_joints({self.arm_name: target})
+                    if widths is not None:
+                        self._send_gripper_target(float(widths[index]), check_state=False)
+                    sent += 1
+                    if time.monotonic() > deadline + dt:
+                        raise TimeoutError(f'Trajectory slot {index} exceeded its time budget')
+            self._traj_stop_event.wait(max(0., started + len(joints) * dt - time.monotonic()))
+            with self._io_lock:
+                self._require_target_owner()
+                # A final check also catches faults in shorter-than-monitor chunks.
+                self._check_trajectory_feedback(feedback_timeout, check_gripper=widths is not None)
+            completed = True
+        except BaseException:
+            with self._io_lock:
+                self._confirmed_active = self._start_confirmed = False
+                self._traj_stop_event.set()
+            raise
+        finally:
+            with self._io_lock:
+                self.last_trajectory = dict(selected=len(joints), sent=sent,
+                    completed=completed, physical_arrival_confirmed=False,
+                    elapsed_s=None if started is None else time.monotonic() - started)
+                self._trajectory_owner = None
+            self._trajectory_lock.release()
 
     def stop_trajectory(self):
-        return self.stop_follower()
+        """Cancel pending sends and explicitly stop this session's follower."""
+        self._traj_stop_event.set()
+        if self.follower_stop_pending:
+            return self.stop_follower()
+        return None
 
     def is_trajectory_running(self):
-        return self.get_state().follower_active
+        """Whether this operator is currently scheduling a chunk, not follower mode."""
+        return self._trajectory_owner is not None
 
     def send_joints(self, arm_targets):
         """Send six absolute joint radians via joint follower UDP (wire degrees).

@@ -108,3 +108,177 @@ class A10PeripheralTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class A10TrajectoryTest(unittest.TestCase):
+    setUp = A10PeripheralTest.setUp
+    operator = A10PeripheralTest.operator
+
+    def started_operator(self, **options):
+        operator = self.operator(**options)
+        operator.start_follower()
+        return operator
+
+    def execute(self, operator, count=3, **overrides):
+        options = dict(arm_trajectories={'right': np.full((count, 6), .1)},
+                       gripper_trajectories={'right': np.arange(count) + 40.}, dt=.04)
+        options.update(overrides)
+        return operator.execute_trajectory(**options)
+
+    def test_paced_loopback_rows_and_usb_packets(self):
+        import json
+        import struct
+        import time
+        operator = self.started_operator()
+        times, packets = [], []
+        original = operator.send_joints
+        def send(target):
+            times.append(time.monotonic())
+            original(target)
+        with patch.object(operator, 'send_joints', side_effect=send):
+            before = time.monotonic()
+            self.execute(operator)
+            elapsed = time.monotonic() - before
+        for _ in range(3):
+            packets.append(self.controller.joint_udp.recv(1024))
+        self.assertGreaterEqual(elapsed, .115)
+        self.assertTrue(all(t >= .02 for t in np.diff(times)))
+        for packet in packets:
+            length, *fields = struct.unpack('<IIQqqq', packet[:40])
+            self.assertEqual(fields, [0, 0, 0, 0, 0])
+            self.assertEqual(length, len(packet) - 40)
+            values = json.loads(packet[40:].decode().split('=', 1)[1])
+            np.testing.assert_allclose(values, np.rad2deg([.1] * 6))
+        targets = [p for p in self.serial.writes if p[4] == 0x83]
+        self.assertEqual(len(targets), 3)
+        self.assertEqual([int.from_bytes(p[8:10], 'little') for p in targets],
+                         [operator.gripper_operator.position_to_raw(x) for x in (40, 41, 42)])
+        self.assertEqual(operator.last_trajectory['sent'], 3)
+        self.assertTrue(operator.last_trajectory['completed'])
+        self.assertFalse(operator.last_trajectory['physical_arrival_confirmed'])
+        self.assertFalse(operator.is_trajectory_running())
+        self.assertTrue(self.controller.active)  # Runner/caller owns stop.
+        operator.stop_follower()
+
+    def test_whole_chunk_validation_sends_nothing(self):
+        operator = self.started_operator()
+        initial_writes = len(self.serial.writes)
+        bad_joint = np.zeros((3, 6)); bad_joint[-1, 2] = np.nan
+        bad_grip = np.array([40., 40., 86.])
+        for options in (dict(arm_trajectories={'right': bad_joint}),
+                        dict(arm_trajectories={'right': np.zeros((3, 7))}),
+                        dict(arm_trajectories={'left': np.zeros((3, 6))}),
+                        dict(gripper_trajectories={'right': bad_grip}),
+                        dict(gripper_trajectories={'right': [40]}),
+                        dict(gripper_trajectories={'right': [40, float('nan'), 40]}),
+                        dict(dt=0), dict(async_exec=True), dict(head_trajectory=[0])):
+            with self.subTest(options=options), self.assertRaises((ValueError, NotImplementedError)):
+                self.execute(operator, **options)
+        with self.assertRaises(TimeoutError):
+            self.controller.joint_udp.recv(1024)
+        self.assertEqual(initial_writes, len(self.serial.writes))
+
+    def test_unowned_cartesian_and_legacy_gripper_are_rejected(self):
+        operator = self.operator()
+        with self.assertRaisesRegex(RuntimeError, 'owned joint'):
+            self.execute(operator)
+        operator.start_follower(mode='cartesian')
+        with self.assertRaisesRegex(RuntimeError, 'owned joint'):
+            self.execute(operator)
+        operator.stop_follower()
+        operator = self.controller.operator(command_mode='joint')
+        operator.start_follower()
+        with self.assertRaisesRegex(NotImplementedError, 'USB'):
+            self.execute(operator)
+        operator.stop_follower()
+
+    def test_feedback_fault_or_mode_loss_stops_future_sends(self):
+        for failure in ('fault', 'mode', 'enabled', 'disconnect', 'usb'):
+            with self.subTest(failure=failure):
+                self.serial.is_open = True
+                self.serial.override = None
+                self.controller.fault = None
+                self.controller.driver_fault = False
+                self.controller.activation = 'Enabled'
+                self.controller.active = False
+                operator = self.started_operator(trajectory_feedback_interval_s=.02)
+                original = operator.send_joints
+                def send(target):
+                    original(target)
+                    if failure == 'fault': self.controller.driver_fault = True
+                    if failure == 'mode': self.controller.mode = 'Cart'
+                    if failure == 'enabled': self.controller.activation = 'Disabled'
+                    if failure == 'disconnect': self.controller.fault = 'disconnect'
+                    if failure == 'usb': self.serial.override = b''
+                with patch.object(operator, 'send_joints', side_effect=send):
+                    with self.assertRaises(Exception):
+                        self.execute(operator)
+                self.assertEqual(operator.last_trajectory['sent'], 1)
+                self.assertFalse(operator.last_trajectory['completed'])
+                self.controller.joint_udp.recv(1024)
+                with self.assertRaises(TimeoutError): self.controller.joint_udp.recv(1024)
+                with self.assertRaises((RuntimeError, ConnectionError)):
+                    operator.send_joints({'right': [0] * 6})
+                operator.close()
+
+    def test_slow_write_aborts_without_burst(self):
+        import time
+        operator = self.started_operator()
+        original = operator.gripper_operator.set_position_mm
+        def slow(*args, **kwargs):
+            result = original(*args, **kwargs)
+            time.sleep(.05)
+            return result
+        with patch.object(operator.gripper_operator, 'set_position_mm', side_effect=slow):
+            with self.assertRaisesRegex(TimeoutError, 'time budget'):
+                self.execute(operator, dt=.02)
+        self.assertEqual(operator.last_trajectory['sent'], 1)
+        self.controller.joint_udp.recv(1024)
+        with self.assertRaises(TimeoutError): self.controller.joint_udp.recv(1024)
+        operator.stop_follower()
+
+    def test_cancel_and_exclusive_target_stream(self):
+        import threading
+        operator = self.started_operator()
+        sent = threading.Event()
+        errors = []
+        original = operator.send_joints
+        def send(target):
+            original(target)
+            sent.set()
+        def run():
+            try: self.execute(operator, count=10, dt=.05)
+            except BaseException as exc: errors.append(exc)
+        with patch.object(operator, 'send_joints', side_effect=send):
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(sent.wait(1))
+                self.assertTrue(operator.is_trajectory_running())
+                with self.assertRaisesRegex(RuntimeError, 'owns'):
+                    operator.send_gripper({'right': 30})
+                with self.assertRaisesRegex(RuntimeError, 'already running'):
+                    self.execute(operator)
+                operator.stop_trajectory()
+            finally:
+                operator._traj_stop_event.set()
+                thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], InterruptedError)
+        self.assertFalse(self.controller.active)
+        self.assertFalse(operator.is_trajectory_running())
+        self.assertLess(operator.last_trajectory['sent'], 10)
+
+    def test_arm_only_and_final_fault_check(self):
+        operator = self.started_operator()
+        original = operator.send_joints
+        def fault(target):
+            original(target)
+            self.controller.driver_fault = True
+        with patch.object(operator, 'send_joints', side_effect=fault):
+            with self.assertRaisesRegex(RuntimeError, 'fault'):
+                self.execute(operator, count=1, gripper_trajectories=None)
+        self.assertEqual(operator.last_trajectory['sent'], 1)
+        self.assertFalse(operator.last_trajectory['completed'])
+        self.assertFalse(any(p[4] == 0x83 for p in self.serial.writes))

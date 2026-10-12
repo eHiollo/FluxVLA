@@ -134,6 +134,15 @@ class A10InferenceRunner(BaseInferenceRunner):
         actions = np.asarray(super()._postprocess_actions(raw), dtype=np.float32)
         if actions.ndim != 2 or actions.shape[1] != 7 or not np.isfinite(actions).all():
             raise ValueError('Processed actions must be finite [T,7] absolute targets')
+        low, high = self.gripper_mm_range
+        outside = (actions[:, 6] < low) | (actions[:, 6] > high)
+        if np.any(outside):
+            logger.warning(
+                'A10 model gripper targets %.3f..%.3f mm: clamping %d rows to %.3f..%.3f mm',
+                float(actions[:, 6].min()), float(actions[:, 6].max()),
+                int(outside.sum()), low, high)
+            actions = actions.copy()
+            actions[:, 6] = np.clip(actions[:, 6], low, high)
         return np.ascontiguousarray(actions)
 
     def _execute_actions(self, actions, rate=None):

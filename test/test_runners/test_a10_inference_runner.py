@@ -115,6 +115,25 @@ class A10RunnerTest(unittest.TestCase):
         runner.cleanup()
         self.assertEqual(operator.events.count('close'), 1)
 
+    def test_model_gripper_overshoot_clamps_without_changing_joints(self):
+        runner, operator = self.make_runner(dry_run=False, max_publish_step=4)
+        predicted = torch.tensor([[.21] * 6 + [width]
+                                  for width in (-.5, 42., 85., 86.)])
+        runner._predict_action = lambda inputs: predicted
+        with self.assertLogs('fluxvla.engines.runners.a10_inference_runner', level='WARNING') as logs:
+            runner.run()
+        widths = np.concatenate([b['gripper_trajectories']['right'] for b in operator.batches])
+        # Both cycles predict the same chunk and select its first two rows.
+        np.testing.assert_allclose(widths, [0., 42., 0., 42.])
+        self.assertTrue(any('clamping 2 rows' in line for line in logs.output))
+        for batch in operator.batches:
+            np.testing.assert_allclose(batch['arm_trajectories']['right'], .21)
+
+        runner, _ = self.make_runner()
+        runner._use_remote = True
+        np.testing.assert_allclose(runner._postprocess_actions(predicted)[:, 6], [0., 42., 85., 85.])
+        runner.cleanup()
+
     def test_invalid_observations_close_without_starting(self):
         for field, value in [('qpos', None), ('has_error', True),
                              ('base_0_rgb', np.zeros((3, 8, 8))),
@@ -130,7 +149,7 @@ class A10RunnerTest(unittest.TestCase):
     def test_bad_actions_never_start_follower(self):
         for value in [torch.zeros(0, 7), torch.zeros(2, 4, 7),
                       torch.full((4, 7), float('nan')),
-                      torch.tensor([[.21] * 6 + [101]]),
+                      torch.tensor([[.21] * 6 + [float('inf')]]),
                       torch.tensor([[1.] * 6 + [40]])]:
             with self.subTest(shape=value.shape):
                 runner, operator = self.make_runner(dry_run=False)

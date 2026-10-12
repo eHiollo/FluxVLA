@@ -99,6 +99,21 @@ class A10PeripheralTest(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 A10Operator(host='127.0.0.1', **options)
 
+    def test_monitor_bootstrap_does_not_query_control_port(self):
+        self.controller.fault = 'timeout'
+        with FakeController() as monitor:
+            operator = self.operator(
+                status_poll_interval_s=.02,
+                status_ws_port=monitor.server.socket.getsockname()[1])
+            try:
+                frame = operator.get_frame()
+                self.assertEqual(frame['qpos'].shape, (7,))
+                self.assertFalse(frame['has_error'])
+                self.assertEqual(self.controller.commands, [])
+                self.assertIn('get', monitor.commands)
+            finally:
+                operator.close()
+
     def test_close_attempts_every_resource_on_error(self):
         operator = self.operator()
         with patch.object(operator.camera_operator, 'close', side_effect=OSError('camera cleanup')):

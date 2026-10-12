@@ -423,13 +423,18 @@ class A10Operator(BaseOperator):
                     if self.gripper_operator is not None:
                         self.gripper_operator.connect()
                     if self.status_poll_interval_s is not None:
-                        # The first observation is real feedback, never a default state.
-                        self._latest_state = self.get_state()
                         self._status_connection = _FollowerConnection(
                             self._connection.host, self.status_ws_port,
                             self._connection.udp_port, self.timeout_s,
                             self._connection.joint_udp_port)
                         self._status_connection.connect()
+                        # Bootstrap on the monitor port too. Control-port GET
+                        # must not prevent the status monitor from starting.
+                        reply = self._status_connection.request('get', status=True)
+                        self._latest_state = _parse_state(
+                            reply, joint_unit=self.feedback_joint_unit,
+                            position_unit=self.feedback_position_unit,
+                            gripper_feedback_path=self.gripper_feedback_path)
                         self._status_stop.clear()
                         self._status_thread = threading.Thread(
                             target=self._poll_status, name='a10-status', daemon=True)

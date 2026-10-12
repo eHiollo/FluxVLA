@@ -21,14 +21,17 @@ class ConsoleTest(unittest.TestCase):
             c.activation = 'Disabled'
             result = subprocess.run([sys.executable, str(script), '--host', '127.0.0.1',
                 '--ws-port', str(c.server.socket.getsockname()[1]),
-                '--udp-port', str(c.udp.getsockname()[1]), '--timeout', '1', 'shell'],
-                input='manual_en\nfollower_cart\nstop_follower\nmanual_ds\nexit\n',
+                '--udp-port', str(c.udp.getsockname()[1]),
+                '--joint-udp-port', str(c.joint_udp.getsockname()[1]), '--timeout', '1', 'shell'],
+                input='manual_en\nfollower_aj\njoints --deg 0 90 -90 180 0 45\nstop_follower\nfollower_cart\nstop_follower\nmanual_ds\nexit\n',
                 text=True, capture_output=True, cwd='/tmp', timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn('操作未完成', result.stdout)
             self.assertIn('手动使能成功', result.stdout)
             self.assertEqual([cmd for cmd in c.commands if cmd != 'get'],
-                ['manual_en', 'follower_cart', 'stop_follower', 'manual_ds'])
+                ['manual_en', 'follower_aj', 'stop_follower', 'follower_cart', 'stop_follower', 'manual_ds'])
+            packet,_ = c.joint_udp.recvfrom(65535)
+            self.assertEqual(packet[40:], b'jp --motor_pos=[0,90,-90,180,0,45]')
 
     def run_console(self, controller, commands, extra=()):
         output = []
@@ -47,9 +50,97 @@ class ConsoleTest(unittest.TestCase):
         result = main(['--host', '127.0.0.1',
                        '--ws-port', str(controller.server.socket.getsockname()[1]),
                        '--udp-port', str(controller.udp.getsockname()[1]),
+                       '--joint-udp-port', str(controller.joint_udp.getsockname()[1]),
                        '--timeout', '.15', *extra, 'shell'],
                       operator_factory=factory, input_fn=read, output=output.append)
         return result, '\n'.join(output)
+
+    def test_joint_session_query_and_absolute_target(self):
+        with FakeController() as c:
+            code, output = self.run_console(c, ['joints','set_jog_coordinate --axis',
+                'follower_aj','joints --deg 0 90 -90 180 0 45','stop_follower','exit'])
+            self.assertEqual(code, 0)
+            self.assertNotIn('操作未完成', output)
+            self.assertIn('六轴实际角度（度', output)
+            self.assertIn('六轴关节跟随已启动', output)
+            self.assertIn('尚未确认运动或到位', output)
+            packet,_ = c.joint_udp.recvfrom(65535)
+            self.assertEqual(packet[4:40],bytes(36))
+            self.assertEqual(int.from_bytes(packet[:4],'little'),len(packet)-40)
+            self.assertEqual(packet[40:],b'jp --motor_pos=[0,90,-90,180,0,45]')
+            self.assertEqual([cmd for cmd in c.commands if cmd!='get'],
+                             ['set_jog_coordinate --axis','follower_aj','stop_follower'])
+            self.assertIsNone(c.operators[0]._connection.joint_udp)
+
+    def test_joint_send_before_start_or_wrong_mode_refused(self):
+        with FakeController() as c:
+            code, output = self.run_console(c, ['joints --deg 0 0 0 0 0 0',
+                'follower_cart','joints --deg 0 0 0 0 0 0','stop_follower',
+                'follower_aj','pq 0 0 0 0 0 0 1','exit'])
+            self.assertEqual(code, 0)
+            self.assertIn('Axis follower start has not been confirmed', output)
+            self.assertIn('Cart follower start has not been confirmed', output)
+            with self.assertRaises(socket.timeout):
+                c.joint_udp.recvfrom(65535)
+            self.assertEqual(c.commands.count('stop_follower'),2)
+
+    def test_joint_bad_command_shapes_do_not_send_targets(self):
+        with FakeController() as c:
+            commands = ['joints --deg','joints --deg 1 2 3 4 5',
+                'joints --deg 1 2 3 4 5 6 7','joints 1 2 3 4 5 6',
+                'joints --deg nan 0 0 0 0 0','joints --deg inf 0 0 0 0 0',
+                'set_jog_coordinate --axis --tool', 'help', 'exit']
+            code,output = self.run_console(c, commands)
+            self.assertEqual(code,0)
+            self.assertIn('操作未完成',output)
+            self.assertTrue(all(cmd=='get' for cmd in c.commands))
+            with self.assertRaises(socket.timeout):
+                c.joint_udp.recvfrom(65535)
+
+    def test_joint_exit_eof_and_interrupt_stop_this_session(self):
+        for end,expected in ((['exit'],0),([],0),([KeyboardInterrupt()],130)):
+            with self.subTest(end=end),FakeController() as c:
+                code,output = self.run_console(c,['follower_aj',*end])
+                self.assertEqual(code,expected)
+                self.assertFalse(c.active)
+                self.assertIn('本次跟随已停止',output)
+
+    def test_joint_query_does_not_substitute_target_feedback(self):
+        with FakeController() as c:
+            c.actual=False
+            code,output=self.run_console(c,['joints','exit'])
+            self.assertEqual(code,0)
+            self.assertIn('没有六轴实际关节反馈',output)
+            self.assertNotIn('joints --deg 1',output)
+            self.assertTrue(all(cmd=='get' for cmd in c.commands))
+
+    def test_joint_reconnect_does_not_inherit_old_start_or_send(self):
+        with FakeController() as c:
+            steps=iter(['follower_aj','get','reconnect','joints --deg 0 0 0 0 0 0','exit'])
+            def read(_):
+                line=next(steps)
+                if line=='get':c.fault='disconnect'
+                if line=='reconnect':c.fault=None
+                return line
+            out=[]
+            code=main(['--host','127.0.0.1','shell'],operator_factory=lambda **_:c.operator(),
+                      input_fn=read,output=out.append)
+            self.assertEqual(code,1)
+            self.assertIn('旧会话的跟随', '\n'.join(out))
+            self.assertEqual(c.commands.count('follower_aj'),1)
+            self.assertNotIn('stop_follower',c.commands)
+            with self.assertRaises(socket.timeout):c.joint_udp.recvfrom(65535)
+
+    def test_one_shot_joint_query_is_readonly_and_target_requires_shell(self):
+        with FakeController() as c:
+            out=[]
+            self.assertEqual(main(['--host','127.0.0.1','joints'],
+                operator_factory=lambda **_:c.operator(), output=out.append),0)
+            self.assertEqual(c.commands,['get'])
+            self.assertIn('可复制为目标','\n'.join(out))
+        with patch('socket.socket',side_effect=AssertionError('unexpected network')):
+            for cmd in (['follower_aj'],['joints','--deg','0','0','0','0','0','0']):
+                self.assertEqual(main(['--host','example',*cmd],output=lambda _:None),2)
 
     def test_full_session_ws_udp_and_explicit_stop(self):
         with FakeController() as c:
@@ -105,7 +196,8 @@ class ConsoleTest(unittest.TestCase):
     def test_read_only_rejects_all_control(self):
         with FakeController() as c:
             code, output = self.run_console(c, ['manual_en','manual_ds',
-                'set_jog_coordinate --tool','follower_cart','stop_follower',
+                'set_jog_coordinate --tool','set_jog_coordinate --axis','follower_cart','follower_aj',
+                'joints','joints --deg 0 0 0 0 0 0','stop_follower',
                 'pq 0 0 0 0 0 0 1','g_move --pos=20','exit'], ['--read-only'])
             self.assertEqual(code, 0)
             self.assertTrue(all(cmd == 'get' for cmd in c.commands))
@@ -116,7 +208,7 @@ class ConsoleTest(unittest.TestCase):
     def test_malformed_commands_keep_shell_usable_and_send_no_controls(self):
         with FakeController() as c:
             code, output = self.run_console(c, ['bogus', '"unterminated',
-                'manual_en --typo', 'set_jog_coordinate --axis',
+                'manual_en --typo', 'set_jog_coordinate --base',
                 'pq 0 0', 'pq nan 0 0 0 0 0 1', 'g_move --pos=101',
                 'get --raw', 'help', 'exit'])
             self.assertEqual(code, 0)
@@ -253,6 +345,7 @@ class ConsoleTest(unittest.TestCase):
     def test_parse_exact_controller_spelling(self):
         self.assertEqual(parse_command(['g_move','--pos=12.5']).pos, 12.5)
         self.assertEqual(parse_command(['pq','-1e-3','0','0','0','0','0','1']).pose[0], -.001)
+        self.assertEqual(parse_command(['joints','--deg','-1e-3','0','0','0','0','0']).targets[0],-.001)
         with self.assertRaises(CommandError):
             parse_command(['set_jog_coordinate','--to'])
 

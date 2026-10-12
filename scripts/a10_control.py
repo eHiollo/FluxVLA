@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import shlex
 import sys
@@ -19,7 +20,11 @@ HELP = """可用指令：
   manual_en                     手动使能，回读 Enabled
   manual_ds                     手动掉使能，回读 Disabled（不是急停）
   set_jog_coordinate --tool     切换工具坐标系并回读
+  set_jog_coordinate --axis     切换关节坐标系并回读
   follower_cart                 启动本连接的笛卡尔跟随（仅 shell）
+  follower_aj                   启动本连接的六轴关节跟随（仅 shell）
+  joints                        查询六轴实际角度（度），只读取不发送目标
+  joints --deg q1 q2 q3 q4 q5 q6 发送六轴绝对角度目标（仅 shell）
   stop_follower                 停止本连接启动的跟随（仅 shell）
   pq x y z qx qy qz qw          发送一个 UDP 目标（仅 shell）
   g_move --pos=毫米数            发送夹爪目标，范围 0..100 mm
@@ -28,12 +33,14 @@ HELP = """可用指令：
 
 pq 的 xyz 单位是米，四元数顺序是 xyzw，须为单位四元数。
 目标相对于跟随启动基准，不是绝对位置，也不是逐次累加的移动量。
+关节目标是六个绝对角度，单位度，顺序为关节1到6；不包含夹爪。
+关节跟随与末端跟随不能混发；切换前先 stop_follower。
 UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场核对。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
 断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
 清错仍使用现场控制器界面，本控制台不透传任意控制器命令。
 """
-SESSION_COMMANDS = {'follower_cart', 'stop_follower', 'pq', 'reconnect'}
+SESSION_COMMANDS = {'follower_cart', 'follower_aj', 'stop_follower', 'pq', 'reconnect'}
 
 
 class CommandError(ValueError):
@@ -51,10 +58,16 @@ def parse_command(tokens):
                                  parser_class=CommandParser)
     get = subs.add_parser('get', add_help=False, allow_abbrev=False)
     get.add_argument('--raw', action='store_true')
-    for name in ('manual_en', 'manual_ds', 'follower_cart', 'stop_follower', 'exit', 'help', 'reconnect'):
+    for name in ('manual_en', 'manual_ds', 'follower_cart', 'follower_aj',
+                 'stop_follower', 'exit', 'help', 'reconnect'):
         subs.add_parser(name, add_help=False, allow_abbrev=False)
     coord = subs.add_parser('set_jog_coordinate', add_help=False, allow_abbrev=False)
-    coord.add_argument('--tool', action='store_true', required=True)
+    coordinates = coord.add_mutually_exclusive_group(required=True)
+    coordinates.add_argument('--tool', action='store_true')
+    coordinates.add_argument('--axis', action='store_true')
+    joints = subs.add_parser('joints', add_help=False, allow_abbrev=False)
+    joints.add_argument('--deg', action='store_true')
+    joints.add_argument('targets', nargs='*', type=float)
     pose = subs.add_parser('pq', add_help=False, allow_abbrev=False)
     pose.add_argument('pose', nargs=7, type=float)
     gripper = subs.add_parser('g_move', add_help=False, allow_abbrev=False)
@@ -63,7 +76,13 @@ def parse_command(tokens):
     # an option, despite it being a valid small negative Cartesian target.
     if tokens and tokens[0] == 'pq' and tokens[1:2] != ['--']:
         tokens = ['pq', '--', *tokens[1:]]
-    return parser.parse_args(tokens)
+    if tokens[:2] == ['joints', '--deg'] and tokens[2:3] != ['--']:
+        tokens = ['joints', '--deg', '--', *tokens[2:]]
+    args = parser.parse_args(tokens)
+    if args.command == 'joints' and (args.targets or args.deg):
+        if not args.deg or len(args.targets) != 6:
+            raise CommandError('发送关节目标请使用 joints --deg 加六个绝对角度；查询只输入 joints。')
+    return args
 
 
 def show_state(state, output=print):
@@ -142,13 +161,29 @@ class A10Console:
                 else '手动掉使能成功（反馈已确认）。')
             show_state(state, out)
         elif cmd == 'set_jog_coordinate':
-            state = self.observe(robot.set_tool_coordinate())
-            out('工具坐标系设置成功（Tool 反馈已确认）。')
+            coordinate = 'Axis' if args.axis else 'Tool'
+            state = self.observe(robot.set_jog_coordinate(coordinate))
+            out(f'坐标系设置成功（{coordinate} 反馈已确认）。')
             show_state(state, out)
-        elif cmd == 'follower_cart':
-            state = self.observe(robot.start_follower())
-            out('笛卡尔跟随已启动（反馈已确认）；尚未发送 UDP 目标。')
+        elif cmd in ('follower_cart', 'follower_aj'):
+            mode = 'joint' if cmd == 'follower_aj' else 'cartesian'
+            state = self.observe(robot.start_follower(mode=mode))
+            out(('六轴关节' if mode == 'joint' else '笛卡尔') +
+                '跟随已启动（反馈已确认）；尚未发送 UDP 目标。')
             show_state(state, out)
+        elif cmd == 'joints':
+            state = self.observe(robot.get_state())
+            if args.targets:
+                robot.send_joints({robot.arm_name: [math.radians(v) for v in args.targets]})
+                out('六轴绝对角度目标已通过 UDP 发送；没有接收确认，尚未确认运动或到位。')
+            else:
+                if state.actual_joints_rad is None:
+                    raise RuntimeError('没有六轴实际关节反馈，不能生成参考目标。')
+                values = ' '.join(format(math.degrees(float(v)), '.17g')
+                                  for v in state.actual_joints_rad)
+                out('六轴实际角度（度，关节1到6）：' + values)
+                out('可复制为目标（这里只显示，未发送）：')
+                out('joints --deg ' + values)
         elif cmd == 'stop_follower':
             state = self.observe(robot.stop_follower())
             out('跟随已停止（反馈已确认）。')
@@ -216,6 +251,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     parser.add_argument('--host', required=True, help='工控机 IP 或主机名')
     parser.add_argument('--ws-port', type=int, default=5999)
     parser.add_argument('--udp-port', type=int, default=9998)
+    parser.add_argument('--joint-udp-port', type=int, default=9999)
     parser.add_argument('--timeout', type=float, default=5.0, help='命令确认超时秒数')
     parser.add_argument('--read-only', action='store_true', help='只读；禁止设置和控制命令')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='shell 或单次指令；默认 shell')
@@ -224,8 +260,9 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     interactive = tokens == ['shell']
     try:
         command = None if interactive else parse_command(tokens)
-        if command and command.command in SESSION_COMMANDS:
-            raise CommandError('跟随启停、pq 和 reconnect 请在 shell 中执行。')
+        if command and (command.command in SESSION_COMMANDS or
+                        (command.command == 'joints' and command.targets)):
+            raise CommandError('跟随启停、目标发送和 reconnect 请在 shell 中执行。')
     except CommandError as exc:
         output(f'指令格式错误：{exc}；使用 --host IP help 查看帮助。')
         return 2
@@ -241,6 +278,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
             from fluxvla.engines.operators.a10_operator import A10Operator
             operator_factory = A10Operator
         robot = operator_factory(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
+                                 joint_udp_port=args.joint_udp_port,
                                  timeout_s=args.timeout, allow_motion=not args.read_only)
         console = A10Console(robot, output)
         if interactive:

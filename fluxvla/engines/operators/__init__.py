@@ -15,6 +15,7 @@
 from .a10_operator import A10Operator  # noqa: F401
 from .aloha_operator import AlohaOperator  # noqa: F401, F403
 from .base_operator import BaseOperator  # noqa: F401, F403
+from .camera_operator import CameraOperator, RGBCamera  # noqa: F401
 from .fluxbisim_aloha_operator import AlohaOperatorSim  # noqa: F401, F403
 from .franka_dual_operator import FrankaDualOperator  # noqa: F401, F403
 from .franka_operator import FrankaOperator  # noqa: F401, F403

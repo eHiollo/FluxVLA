@@ -19,10 +19,10 @@ robot:
   idle_timeout_s: 120
   post_idle_settle_s: 0.05
 cameras:
-  # These are the established recording assignments; confirm device identities
-  # with `doctor` before physical use. Prefer /dev/v4l/by-id paths on site.
-  base_0_rgb: {device: 1, width: 640, height: 480, fps: 30, rotate_180: false, exclusive_per_read: false}
-  right_wrist_0_rgb: {device: 0, width: 640, height: 480, fps: 30, rotate_180: true, exclusive_per_read: false}
+  # Confirmed on this host: SYD is the external view; TSTC is the wrist view.
+  # Use image nodes (index0), not the companion non-image nodes (index1).
+  base_0_rgb: {device: /dev/v4l/by-id/usb-SYD_USB_Camera_200901010001-video-index0, width: 640, height: 480, fps: 30, rotate_180: false, exclusive_per_read: false}
+  right_wrist_0_rgb: {device: /dev/v4l/by-id/usb-TSTC_USB20_WEB_CAMERA_TSTC_USB20_WEB_CAMERA_01.00.00-video-index0, width: 640, height: 480, fps: 30, rotate_180: true, exclusive_per_read: false}
 vr:
   arm: right
   control_fps: 30

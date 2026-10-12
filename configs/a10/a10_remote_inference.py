@@ -20,6 +20,7 @@ inference = dict(
                           timeout_s=30., serializer='msgpack', compress=True),
     operator=dict(type='A10Operator', host='127.0.0.1',
                   command_mode='joint', allow_motion=False,
+                  status_poll_interval_s=0.05, status_max_age_s=0.5,
                   gripper_transport='usb',
                   gripper=dict(port='/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0',
                                max_width_mm=85., timeout=0.015),

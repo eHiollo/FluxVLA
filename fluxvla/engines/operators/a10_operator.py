@@ -315,12 +315,13 @@ class A10Operator(BaseOperator):
                  cameras=None, gripper=None, gripper_transport='controller',
                  trajectory_feedback_interval_s=0.1,
                  trajectory_feedback_timeout_s=0.1,
-                 trajectory_max_lateness_s=None):
+                 trajectory_max_lateness_s=None, status_poll_interval_s=None,
+                 status_max_age_s=0.5, status_ws_port=5888):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
         if any(type(p) is not int or not 1 <= p <= 65535
-               for p in (ws_port, udp_port, joint_udp_port)):
+               for p in (ws_port, udp_port, joint_udp_port, status_ws_port)):
             raise ValueError('Ports must be integers within 1..65535')
         if joint_udp_port == udp_port:
             raise ValueError('Cartesian and joint UDP ports must differ')
@@ -366,6 +367,15 @@ class A10Operator(BaseOperator):
         self.trajectory_feedback_interval_s = float(trajectory_feedback_interval_s)
         self.trajectory_feedback_timeout_s = float(trajectory_feedback_timeout_s)
         self.trajectory_max_lateness_s = trajectory_max_lateness_s
+        if status_poll_interval_s is not None and (
+                isinstance(status_poll_interval_s, bool) or not math.isfinite(status_poll_interval_s)
+                or status_poll_interval_s <= 0):
+            raise ValueError('status_poll_interval_s must be positive and finite')
+        if isinstance(status_max_age_s, bool) or not math.isfinite(status_max_age_s) or status_max_age_s <= 0:
+            raise ValueError('status_max_age_s must be positive and finite')
+        self.status_poll_interval_s = status_poll_interval_s
+        self.status_max_age_s = float(status_max_age_s)
+        self.status_ws_port = status_ws_port
         self._trajectory_lock = threading.Lock()
         self._trajectory_owner = None
         self.last_trajectory = None
@@ -377,6 +387,12 @@ class A10Operator(BaseOperator):
         self.command_mode = command_mode
         self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s,
                                                joint_udp_port)
+        self._status_connection = None
+        self._status_thread = None
+        self._status_stop = threading.Event()
+        self._latest_state = None
+        self._status_error = None
+        self._status_lock = threading.Lock()
         self._io_lock = threading.RLock()
         self._confirmed_active = False
         self._started_here = False
@@ -396,6 +412,9 @@ class A10Operator(BaseOperator):
     def connect(self):
         with self._io_lock:
             if not self.is_connected:
+                with self._status_lock:
+                    self._latest_state = None
+                    self._status_error = None
                 self._confirmed_active = self._started_here = False
                 self._start_confirmed = False
                 self._follower_mode = None
@@ -403,12 +422,30 @@ class A10Operator(BaseOperator):
                     self._connection.connect()
                     if self.gripper_operator is not None:
                         self.gripper_operator.connect()
+                    if self.status_poll_interval_s is not None:
+                        # The first observation is real feedback, never a default state.
+                        self._latest_state = self.get_state()
+                        self._status_connection = _FollowerConnection(
+                            self._connection.host, self.status_ws_port,
+                            self._connection.udp_port, self.timeout_s,
+                            self._connection.joint_udp_port)
+                        self._status_connection.connect()
+                        self._status_stop.clear()
+                        self._status_thread = threading.Thread(
+                            target=self._poll_status, name='a10-status', daemon=True)
+                        self._status_thread.start()
                 except BaseException:
                     self.close()
                     raise
 
     def close(self):
         self._traj_stop_event.set()
+        self._status_stop.set()
+        if self._status_connection is not None:
+            self._status_connection.close()
+        thread, self._status_thread = self._status_thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self.timeout_s + .2)
         with self._io_lock:
             self._confirmed_active = self._started_here = False
             self._start_confirmed = False
@@ -426,6 +463,33 @@ class A10Operator(BaseOperator):
                     errors.append(exc)
             if errors:
                 raise RuntimeError(f'A10 resource cleanup failed: {errors}') from errors[0]
+
+    def _poll_status(self):
+        while not self._status_stop.is_set():
+            try:
+                reply = self._status_connection.request('get', status=True)
+                state = _parse_state(reply, joint_unit=self.feedback_joint_unit,
+                                     position_unit=self.feedback_position_unit,
+                                     gripper_feedback_path=self.gripper_feedback_path)
+                with self._status_lock:
+                    if (self._latest_state is None or state.received_monotonic_s
+                            >= self._latest_state.received_monotonic_s):
+                        self._latest_state = state
+            except Exception as exc:
+                with self._status_lock:
+                    self._status_error = exc
+                self._status_stop.set()
+                return
+            self._status_stop.wait(self.status_poll_interval_s)
+
+    def _recent_state(self):
+        with self._status_lock:
+            state, error = self._latest_state, self._status_error
+        if error is not None:
+            raise ConnectionError(f'A10 status polling failed: {error}') from error
+        if state is None or time.monotonic() - state.received_monotonic_s > self.status_max_age_s:
+            raise TimeoutError(f'A10 status feedback older than {self.status_max_age_s:.3f}s')
+        return state
 
     def _require_motion(self):
         if not self.allow_motion:
@@ -446,6 +510,11 @@ class A10Operator(BaseOperator):
                                           and state.follower_mode == self._follower_mode
                                           and state.raw['ret_context'].get('robot_msg', {}).get('activate') == 'Enabled'
                                           and not state.has_error)
+                if self.status_poll_interval_s is not None:
+                    with self._status_lock:
+                        if (self._latest_state is None or state.received_monotonic_s
+                                >= self._latest_state.received_monotonic_s):
+                            self._latest_state = state
                 return state
             except Exception:
                 self._confirmed_active = False
@@ -462,7 +531,8 @@ class A10Operator(BaseOperator):
         del slop
         with self._io_lock:
             try:
-                state = self.get_state()
+                state = (self._recent_state() if self.status_poll_interval_s is not None
+                         else self.get_state())
                 width = state.gripper_mm
                 frame = dict(joints=state.actual_joints_rad, tcp_pq_m=state.tcp_pq_m,
                              follower_active=state.follower_active,
@@ -687,10 +757,14 @@ class A10Operator(BaseOperator):
                 raise InterruptedError('A10 trajectory was cancelled')
 
     def _check_trajectory_feedback(self, timeout_s, *, check_gripper):
-        state = self.get_state(timeout_s=timeout_s)
+        state = (self._recent_state() if self.status_poll_interval_s is not None
+                 else self.get_state(timeout_s=timeout_s))
         if state.has_error:
             raise A10ControllerError('Controller fault during trajectory')
-        if not self._confirmed_active or self._follower_mode != 'Axis':
+        if (not self._started_here or not self._start_confirmed
+                or state.follower_active is not True or state.follower_mode != 'Axis'
+                or state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled'
+                or not self._confirmed_active or self._follower_mode != 'Axis'):
             raise RuntimeError('Joint follower permission lost during trajectory')
         if state.actual_joints_rad is None:
             raise A10ProtocolError('Trajectory requires actual joint feedback')

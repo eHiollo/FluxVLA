@@ -30,6 +30,8 @@ class A10PeripheralTest(unittest.TestCase):
                        cameras=dict(base_0_rgb=dict(device='/fake/base'),
                                     right_wrist_0_rgb=dict(device='/fake/wrist')))
         options.update(overrides)
+        if options.get('status_poll_interval_s') is not None:
+            options.setdefault('status_ws_port', self.controller.server.socket.getsockname()[1])
         return self.controller.operator(**options)
 
     def test_real_feedback_images_units_and_independent_times(self):
@@ -214,6 +216,45 @@ class A10TrajectoryTest(unittest.TestCase):
         self.assertTrue(operator.last_trajectory['completed'])
         self.controller.get_reply_delay_s = 0.
         operator.stop_follower()
+
+    def test_background_status_keeps_slow_get_out_of_action_stream(self):
+        import time
+        operator = self.started_operator(status_poll_interval_s=.02,
+                                         status_max_age_s=.5)
+        self.controller.get_reply_delay_s = .15
+        before = time.monotonic()
+        self.execute(operator, count=5, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 5)
+        self.assertTrue(operator.last_trajectory['completed'])
+        self.assertLess(time.monotonic() - before, .5)
+        self.controller.get_reply_delay_s = 0.
+        operator.stop_follower()
+
+    def test_background_status_rejects_stale_feedback(self):
+        import time
+        operator = self.started_operator(status_poll_interval_s=.01,
+                                         status_max_age_s=.05)
+        self.controller.get_reply_delay_s = .15
+        time.sleep(.07)
+        with self.assertRaisesRegex(TimeoutError, 'status feedback older'):
+            self.execute(operator, count=1, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 0)
+        self.controller.get_reply_delay_s = 0.
+        operator.stop_follower()
+
+    def test_background_status_disconnect_blocks_targets_but_allows_stop(self):
+        import time
+        operator = self.started_operator(status_poll_interval_s=.01,
+                                         status_max_age_s=.5)
+        operator._status_connection.close()
+        deadline = time.monotonic() + .5
+        while operator._status_error is None and time.monotonic() < deadline:
+            time.sleep(.01)
+        with self.assertRaisesRegex(ConnectionError, 'status polling failed'):
+            self.execute(operator, count=1, dt=1 / 30)
+        self.assertEqual(operator.last_trajectory['sent'], 0)
+        self.assertTrue(operator.is_connected)
+        self.assertFalse(operator.stop_follower().follower_active)
 
     def test_periodic_feedback_still_enforces_short_budget(self):
         operator = self.started_operator(trajectory_feedback_interval_s=.02,

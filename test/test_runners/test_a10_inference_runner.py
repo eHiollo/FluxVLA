@@ -80,6 +80,14 @@ class A10RunnerTest(unittest.TestCase):
         self.assertEqual(runner.last_cycle['executed'], 0)
         np.testing.assert_allclose(runner.last_actions[0], [.21] * 6 + [42])
 
+    def test_unlimited_run_stops_on_user_pause_and_cleans_up(self):
+        runner, operator = self.make_runner(dry_run=False, max_publish_step=None)
+        with patch.object(runner, '_poll_keyboard_pause', side_effect=[False, False, True]):
+            runner.run()
+        self.assertEqual(runner.last_cycle['steps'], 6)
+        self.assertEqual([len(b['arm_trajectories']['right']) for b in operator.batches], [2, 2, 2])
+        self.assertEqual(operator.events[-2:], ['stop', 'close'])
+
     def test_step_limit_reports_offending_action_without_starting(self):
         runner, operator = self.make_runner(
             dry_run=False, max_joint_step_rad=.005,
@@ -107,6 +115,10 @@ class A10RunnerTest(unittest.TestCase):
         self.assertEqual(operator.events, ['connect', 'observe', 'observe', 'start',
                                          'execute', 'observe', 'execute', 'stop', 'close'])
         self.assertEqual([len(x['arm_trajectories']['right']) for x in operator.batches], [2, 1])
+        np.testing.assert_allclose(runner.last_cycle['observed_qpos'], [.2] * 6 + [40])
+        np.testing.assert_allclose(runner.last_cycle['last_action'], [.21] * 6 + [42])
+        np.testing.assert_allclose(runner.last_cycle['tracking_error_at_observation_rad'], [-.01] * 6,
+                                   atol=1e-7)
         for batch in operator.batches:
             self.assertEqual(batch['dt'], .04)
             self.assertFalse(batch['async_exec'])

@@ -357,3 +357,8 @@ python -m fluxvla.projects.a10 validate --root datasets/a10/onsite_trial_001 --e
 2026-10-12 启动修复：后台监视配置下，连接时首次真实状态读取也来自 5888；5999 仍用于跟随启停及其原有确认。若启动报监视端状态超时，尚未执行动作，需检查控制器服务；不会以默认状态继续运动。
 
 模型夹爪输出允许出现有限的边界偏差，runner 将其限制在 gripper_mm_range（默认 0～85mm）；关节目标不因此改变，手动夹爪目标越界仍报错。
+
+
+持续推理：在原运行命令中设置 `inference.max_publish_step=None`，取消总步数上限。输入 p 后回车在当前块结束后停止；Ctrl+C 请求停止 follower。当前没有自动识别抓取成功，完成任务后需现场停止。
+
+来回拉动诊断：A10 cycle 增加 observed_qpos（推理前实际状态）、previous_last_action（上一块发送的末目标）、first_action/last_action（本块首尾）、tracking_error_at_observation_rad（实际六轴减上块末目标）。这些日志用于区分观测时残余跟踪误差与模型目标跳变；同步发送不等于机械臂已到位。

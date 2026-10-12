@@ -38,10 +38,12 @@ class A10InferenceRunner(BaseInferenceRunner):
         kwargs.setdefault('camera_names', ['base_0_rgb', 'right_wrist_0_rgb'])
         horizon = kwargs['action_chunk'] if execute_horizon is None else execute_horizon
         for name, value in [('action_chunk', kwargs['action_chunk']),
-                            ('execute_horizon', horizon),
-                            ('max_publish_step', kwargs.get('max_publish_step', 10000))]:
+                            ('execute_horizon', horizon)]:
             if type(value) is not int or value <= 0:
                 raise ValueError(f'{name} must be a positive integer')
+        maximum = kwargs.get('max_publish_step', 10000)
+        if maximum is not None and (type(maximum) is not int or maximum <= 0):
+            raise ValueError('max_publish_step must be a positive integer or None')
         if horizon > kwargs['action_chunk']:
             raise ValueError('execute_horizon cannot exceed action_chunk')
         if not math.isfinite(action_dt) or action_dt <= 0:
@@ -181,12 +183,13 @@ class A10InferenceRunner(BaseInferenceRunner):
     def run(self, initial_instruction=None):
         instruction = self.instruction if initial_instruction is None else initial_instruction
         steps = 0
+        previous_last_action = None
         try:
             if not isinstance(instruction, str) or not instruction.strip():
                 raise ValueError('Provide a nonempty A10 task instruction')
             self.run_setup()
             with torch.inference_mode():
-                while steps < self.max_publish_step:
+                while self.max_publish_step is None or steps < self.max_publish_step:
                     started = time.monotonic()
                     self._action_ctx = SimpleNamespace(instruction=instruction)
                     inputs = self._preprocess(instruction)
@@ -196,8 +199,9 @@ class A10InferenceRunner(BaseInferenceRunner):
                         raw = self._predict_action(inputs)
                     infer_s = time.monotonic() - infer_started
                     actions = self._postprocess_actions(raw)
-                    count = min(len(actions), self.execute_horizon,
-                                self.max_publish_step - steps)
+                    count = min(len(actions), self.execute_horizon)
+                    if self.max_publish_step is not None:
+                        count = min(count, self.max_publish_step - steps)
                     execution_started = time.monotonic()
                     self._execute_actions(actions[:count])
                     steps += count
@@ -205,10 +209,18 @@ class A10InferenceRunner(BaseInferenceRunner):
                     self.last_cycle = dict(
                         steps=steps, predicted=len(actions), selected=count,
                         executed=0 if self.dry_run else count, infer_s=infer_s,
+                        observed_qpos=self._action_ctx.state.tolist(),
                         first_action=actions[0].tolist(),
+                        last_action=actions[count - 1].tolist(),
+                        previous_last_action=previous_last_action,
+                        tracking_error_at_observation_rad=(None if previous_last_action is None
+                            else (self._action_ctx.state[:6]
+                                  - np.asarray(previous_last_action[:6])).tolist()),
                         execution_s=time.monotonic() - execution_started,
                         elapsed_s=time.monotonic() - started, dry_run=self.dry_run)
                     logger.info('A10 cycle: %s', self.last_cycle)
+                    if not self.dry_run:
+                        previous_last_action = actions[count - 1].tolist()
                     if self._poll_keyboard_pause():
                         logger.info('A10 paused after the current chunk; ending run')
                         break

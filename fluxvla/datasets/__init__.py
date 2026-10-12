@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .a10_openpi_inference import OpenPIA10InferenceDataset  # noqa: F401
 from .arm_dataset import *  # noqa: F401, F403
 from .balanced_dataset_wrapper import *  # noqa: F401, F403
 from .dataset_wrapper import *  # noqa: F401, F403

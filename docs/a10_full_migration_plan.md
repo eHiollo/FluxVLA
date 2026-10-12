@@ -394,3 +394,11 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - docs/a10_onsite_guide.md 第 6 节新增关节现场教程，说明启动/停止、查询实际角度、复制当前六轴目标、单位、模式切换及夹爪独立通道；接口表同步。该文件原有未提交的 OpenPI 附录保留且不计入此次提交。
 - 本阶段完成六轴 joint follower 软件实现与本机验收，仍保持机器人运行逻辑集中在 a10_operator.py。真实启停、运动方向/幅度、控制器接收丢包/失联规则及关节/夹爪同步尚未验收；没有扩展成 batch 定时流、关节回零或自动重发。
 - 工控机仅在协议调查期间 SSH 只读，未发送任何业务控制报文或启动程序。本次已断开；现场运行前确认 kaanhbin 已运行。接下来由现场用户按教程逐项验证并回传结果，再记录实机验收状态。
+
+
+### 2026-10-12：推理迁入 follower 小任务 1——原生推理适配
+
+- 在独立 worktree `/home/robot/VLA/FluxVLA_integration` 的 `kaanh_follower` 实施；主目录 `vr` 未提交修改保留。选择性迁入 `kaanh_a10_runner` 已提交的 a9b2aea：A10InferenceRunner、OpenPIA10Policy、dataset/transform、注册、服务入口和测试。没有迁入 VR 或覆盖最新关节 follower/控制台/设备驱动。
+- 默认 checkpoint/tokenizer 位于本仓库 checkpoints 内，保留 A10_OPENPI_CHECKPOINT/A10_OPENPI_TOKENIZER 覆盖；用本机已有权重的硬链接准备忽略的 13GB 资产，tokenizer 复制进本仓库。运行不导入 OpenPI/A10_new/LeRobot 仓库。
+- 数据集 meta/info.json fps=30，OpenPI data_loader.py 以 t/fps 连续采样；默认 action_dt 改为 1/30 秒，预测 30 步、每轮选 10 步。默认指令 Reach the yellow lemon，夹爪工作上限 85mm。dry_run=True、allow_motion=False 保留。
+- 推理测试 15 项：14 PASS、1 GPU 测试暂未启用。预处理另外与本机原 OpenPI 函数核对通过；模型实际推理留至最终验收。尚未连接 operator 的相机/USB 夹爪和动作块调度，下一小任务补齐。

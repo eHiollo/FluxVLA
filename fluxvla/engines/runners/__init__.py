@@ -14,6 +14,7 @@
 
 from ..utils.heterogeneous_runtime import \
     is_heterogeneous_torch_distributed_error
+from .a10_inference_runner import A10InferenceRunner  # noqa: F401, F403
 from .aloha_inference_runner import AlohaInferenceRunner  # noqa: F401, F403
 from .aloha_rtc_inference_runner import \
     AlohaRTCInferenceRunner  # noqa: F401, F403

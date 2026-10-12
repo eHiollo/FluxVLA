@@ -22,8 +22,10 @@ def parse_args():
         description='Serve a VLA model via ZMQ for remote inference')
     parser.add_argument(
         '--config', required=True, help='Path to mmengine config file')
-    parser.add_argument(
-        '--ckpt-path', required=True, help='Path to model checkpoint')
+    weights = parser.add_mutually_exclusive_group(required=True)
+    weights.add_argument('--ckpt-path', help='Path to native model checkpoint')
+    weights.add_argument('--from-config', action='store_true',
+                         help='Model factory/config loads its own pretrained weights')
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5555)
     parser.add_argument('--device', default='cuda:0')
@@ -57,21 +59,23 @@ def main():
         vla = build_vla_from_cfg(cfg.model)
 
     ckpt_path = args.ckpt_path
-    assert Path(ckpt_path).exists(), f'Checkpoint not found: {ckpt_path}'
-    print(f'[serve] Loading checkpoint: {ckpt_path}')
-    if ckpt_path.endswith('.safetensors'):
-        checkpoint = load_file(ckpt_path, device='cpu')
-    else:
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
-    if isinstance(checkpoint, dict) and 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    else:
-        state_dict = checkpoint
-    vla.load_state_dict(state_dict, strict=True)
+    if ckpt_path:
+        assert Path(ckpt_path).exists(), f'Checkpoint not found: {ckpt_path}'
+        print(f'[serve] Loading checkpoint: {ckpt_path}')
+        if ckpt_path.endswith('.safetensors'):
+            checkpoint = load_file(ckpt_path, device='cpu')
+        else:
+            checkpoint = torch.load(ckpt_path, map_location='cpu')
+        if isinstance(checkpoint, dict) and 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+        vla.load_state_dict(state_dict, strict=True)
+        del checkpoint, state_dict
 
-    data_stat_path = os.path.join(
+    data_stat_path = None if ckpt_path is None else os.path.join(
         Path(ckpt_path).resolve().parent.parent, 'dataset_statistics.json')
-    if os.path.isfile(data_stat_path):
+    if data_stat_path and os.path.isfile(data_stat_path):
         with open(data_stat_path, 'r') as f:
             vla.norm_stats = json.load(f)
         print(f'[serve] Loaded norm_stats from {data_stat_path}')
@@ -91,10 +95,10 @@ def main():
 
     if dataset_key:
         dataset_cfg = dict(getattr(cfg, dataset_key).dataset)
-        if 'norm_stats' not in dataset_cfg:
+        if 'norm_stats' not in dataset_cfg and data_stat_path:
             dataset_cfg['norm_stats'] = data_stat_path
         ds_type = dataset_cfg.get('type', '')
-        if 'model_path' not in dataset_cfg and 'Libero' not in ds_type:
+        if ckpt_path and 'model_path' not in dataset_cfg and 'Libero' not in ds_type:
             dataset_cfg['model_path'] = os.path.dirname(
                 os.path.dirname(ckpt_path))
         if 'task_suite_name' not in dataset_cfg and 'Libero' in ds_type:
@@ -108,7 +112,8 @@ def main():
         eval_cfg = getattr(cfg, dataset_key, None)
         if eval_cfg and hasattr(eval_cfg, 'denormalize_action'):
             denorm_cfg = dict(eval_cfg.denormalize_action)
-            denorm_cfg['norm_stats'] = data_stat_path
+            if data_stat_path:
+                denorm_cfg['norm_stats'] = data_stat_path
             denormalize_action = build_transform_from_cfg(denorm_cfg)
             print('[serve] Denormalize action transform built')
         if eval_cfg and hasattr(eval_cfg, 'task_suite_name'):

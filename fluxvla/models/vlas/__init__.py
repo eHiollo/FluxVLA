@@ -16,6 +16,7 @@ from fluxvla.engines.utils.heterogeneous_runtime import \
     import_heterogeneous_runtime_symbols
 from .llava_vla import LlavaVLA  # noqa: F401, F403
 from .open_vla import OpenVLA  # noqa: F401, F403
+from .openpi_a10 import load_openpi_a10_policy  # noqa: F401
 
 import_heterogeneous_runtime_symbols(
     __name__,

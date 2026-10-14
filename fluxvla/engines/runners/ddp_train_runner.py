@@ -194,6 +194,15 @@ class DDPTrainRunner(BaseTrainRunner):
                 and self.mixed_precision_dtype == torch.bfloat16
                 and not self.keep_params_fp32):
             self.vla = self.vla.to(device=target_device, dtype=torch.bfloat16)
+            # The OpenPI flow path disables autocast around its small
+            # projections. Keep those weights FP32 while the large backbones
+            # stay BF16 so a single 24 GB GPU can train LoRA adapters.
+            base_model = (self.vla.get_base_model() if hasattr(
+                self.vla, 'get_base_model') else self.vla)
+            if getattr(base_model, 'openpi_fp32_flow', False):
+                for name in ('action_in_proj', 'action_out_proj',
+                             'time_mlp_in', 'time_mlp_out'):
+                    getattr(base_model, name).float()
         else:
             self.vla = self.vla.to(target_device)
 
@@ -204,15 +213,49 @@ class DDPTrainRunner(BaseTrainRunner):
         modules_to_save = getattr(self.cfg.model, 'modules_to_save', None)
         target_modules = _resolve_lora_target_modules(
             self.vla, self.cfg.model.lora_target_modules)
+        expert_rank = getattr(self.cfg.model, 'lora_expert_rank', None)
+        rank_pattern = {}
+        alpha_pattern = {}
+        if expert_rank is not None:
+            expert_modules = [
+                name for name, module in self.vla.named_modules()
+                if name.startswith('llm_expert.')
+                and isinstance(module, torch.nn.Linear)
+                and name.rsplit('.', 1)[-1] in {
+                    'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj',
+                    'up_proj', 'down_proj'
+                }
+            ]
+            if not expert_modules:
+                raise ValueError('No action-expert LoRA modules were found.')
+            rank_pattern = {name: int(expert_rank) for name in expert_modules}
+            alpha_pattern = {name: int(expert_rank) for name in expert_modules}
         lora_config = LoraConfig(
             r=self.cfg.model.lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=self.cfg.model.lora_dropout,
             target_modules=target_modules,
             modules_to_save=modules_to_save,
+            rank_pattern=rank_pattern,
+            alpha_pattern=alpha_pattern,
             init_lora_weights='gaussian',
         )
         self.vla = get_peft_model(self.vla, lora_config)
+        if expert_rank is not None:
+            checked = 0
+            for name, module in self.vla.named_modules():
+                if not hasattr(module, 'lora_A') or 'default' not in module.lora_A:
+                    continue
+                actual_rank = module.lora_A['default'].weight.shape[0]
+                expected_rank = (int(expert_rank) if '.llm_expert.' in name
+                                 else int(self.cfg.model.lora_rank))
+                if actual_rank != expected_rank:
+                    raise RuntimeError(
+                        f'LoRA rank mismatch at {name}: '
+                        f'{actual_rank} != {expected_rank}')
+                checked += 1
+            if not checked:
+                raise RuntimeError('No LoRA modules were installed.')
         self.vla.print_trainable_parameters()
 
     def run_setup(self, n_train_examples: int) -> None:

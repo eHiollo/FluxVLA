@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SARM 视频标注</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101724;color:#e8edf6;font:16px system-ui,sans-serif}main{max-width:1200px;margin:auto;padding:24px}h1{font-size:26px;margin:0 0 8px}p{color:#aebbd1;line-height:1.6}.panel{background:#1b2638;border:1px solid #334259;border-radius:12px;padding:18px;margin:16px 0}.row{display:flex;flex-wrap:wrap;align-items:center;gap:12px}button,select,textarea,input{font:inherit}button,select{padding:9px 13px;border-radius:7px;border:1px solid #52617b;background:#29394f;color:white}button{cursor:pointer}button.primary{background:#2866ce}button.danger{background:#74343e}button:disabled{opacity:.4;cursor:default}textarea{width:100%;min-height:160px;padding:12px;color:#edf3ff;background:#101724;border:1px solid #52617b;border-radius:8px}video{display:block;background:black;width:100%;max-height:61vh}#timeline{width:100%;margin:16px 0}.muted{color:#aebbd1}#message{min-height:25px;color:#ffcb77;white-space:pre-wrap}#stages{padding-left:28px}#stages li{padding:8px;border-radius:6px;overflow-wrap:anywhere}#stages li.active{background:#285297}#stages li.done{color:#8ee0b5}[hidden]{display:none!important}.badge{color:#91baff}#editor{margin-top:20px}kbd{background:#334259;border-radius:4px;padding:2px 7px}
+</style>
+<style>
+.video-wrap{position:relative}.review-mode video{max-height:46vh}.overlay{position:absolute;left:16px;top:16px;pointer-events:none;background:rgba(10,19,34,.87);padding:12px 16px;border-radius:10px;min-width:230px;max-width:calc(100% - 32px)}.overlay strong{display:block;font-size:25px;color:#71b9ff}.overlay small{display:block;color:#c3d1e6;margin:5px 0}.meter{height:7px;border-radius:5px;background:#435065;overflow:hidden}.meter span{display:block;height:100%;width:0;background:#58a8ff}.chart-wrap{position:relative;height:270px}.chart-wrap canvas{position:absolute;inset:0;width:100%;height:100%}#curveCursor{pointer-events:none}.legend{font-size:14px;color:#c2cce0}.legend .blue{color:#58a8ff}.legend .green{color:#6dde9f}.stage-bands{display:flex;gap:2px;margin:8px 20px 0 50px}.stage-bands button{min-width:0;padding:7px 4px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#273e5c}.stage-bands button.active{background:#365f94}.review-note{font-size:13px}.review-mode #stages{display:none}#previous{margin-right:4px}#reviewNext{background:#2866ce}
+</style>
+<main>
+<h1>SARM 视频阶段标注</h1>
+<p id="intro">先定义阶段顺序，再播放视频。在阶段结束画面按 <kbd>空格</kbd> 切分。最后阶段自动延伸到视频末尾。</p>
+<div id="setup" class="panel">
+<h2>子片段语言描述</h2>
+<p>每行一个阶段，按发生顺序填写。所有集复用这一顺序。请用清楚、一致的描述。</p>
+<textarea id="names" placeholder="接近目标物体&#10;抓住并抬起物体&#10;搬运到目标位置&#10;放下并松开夹爪"></textarea>
+<div class="row"><button id="start" class="primary">确定阶段并开始</button><button id="cancelSetup" hidden>取消</button></div>
+</div>
+<div id="message" role="status" aria-live="polite"></div>
+<section id="editor" hidden>
+<div class="panel row">
+<label>Episode <select id="episode"></select></label>
+<label>相机 <select id="camera"></select></label>
+<label>倍速 <select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+<button id="editNames">修改阶段描述</button><span id="progress" class="badge"></span>
+</div>
+<div class="video-wrap">
+<video id="video" preload="auto" playsinline></video>
+<div id="predictionOverlay" class="overlay" hidden><strong id="predictedValue">加载预测…</strong><small id="referenceValue"></small><div class="meter"><span id="predictedMeter"></span></div><small id="currentStage"></small></div>
+</div>
+<input id="timeline" type="range" min="0" step="1" value="0" aria-label="定位视频帧">
+<div class="row"><button id="play">播放 / 暂停</button><button id="back">上一帧</button><button id="forward">下一帧</button><button id="cut" class="primary">切分（空格）</button><button id="undo">撤销切分</button><span id="position"></span></div>
+<div id="reviewPanel" class="panel" hidden>
+<div class="row"><span class="legend"><span class="blue">━ 预测 progress</span>　<span class="green">┄ 人工参考 progress</span></span><span id="reviewValues" class="badge"></span></div>
+<div id="chartWrap" class="chart-wrap"><canvas id="curve" aria-label="整集预测与人工参考进度曲线"></canvas><canvas id="curveCursor"></canvas></div>
+<div id="stageBands" class="stage-bands"></div>
+<p class="review-note">点击曲线或阶段可定位画面。曲线使用原始预测值；人工参考由阶段标签与训练集时间占比计算。当前展示为使用前后观测的离线预测。</p>
+<div class="row"><button id="previous">上一集</button><button id="reviewNext">下一集</button></div>
+</div>
+<div class="panel"><div id="task" class="muted"></div><ol id="stages"></ol></div>
+<div class="row"><button id="save">保存本集</button><button id="next" class="primary">下一集</button><button id="skip">跳过本集</button><button id="reset" class="danger">重标这一集</button></div>
+<p id="output" class="muted"></p>
+</section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video');
+let state, episodeId, cuts=[], frame=0, ready=false, busy=false, seeking=false;
+let wantedFrame=null, frameCallback=null, draftTimer=null, requestQueue=Promise.resolve();
+let reviewData=null, reviewRequest=0, chartSize=null;
+function message(text=''){ $('message').textContent=text; }
+function ep(){ return state.episodes.find(e=>e.episode_index===episodeId); }
+function isSkipped(){return (state.skipped||[]).includes(episodeId);}
+function summary(){return `已标注 ${state.annotations.length} 集，已跳过 ${(state.skipped||[]).length} 集，待处理 ${state.episodes.length-state.annotations.length-(state.skipped||[]).length} 集。`;}
+function clampFrame(n){ return Math.max(0,Math.min(ep().length-1,n)); }
+function api(action,data){
+  const operation=requestQueue.then(async()=>{
+    const response=await fetch('/api/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const result=await response.json();
+    if(!response.ok) throw new Error(result.error||'请求失败');
+    state=result; return result;
+  });
+  requestQueue=operation.catch(()=>{}); return operation;
+}
+async function guarded(fn){
+  if(busy) return;
+  busy=true;render();message();
+  try{await fn();}catch(error){message(error.message);}
+  finally{busy=false;render();}
+}
+function draftSnapshot(){return {episode_index:episodeId,cuts:[...cuts],frame};}
+function queueDraft(){
+  if(state.review||isSkipped()) return;
+  clearTimeout(draftTimer);
+  const snapshot=draftSnapshot();
+  draftTimer=setTimeout(()=>{draftTimer=null;api('draft',snapshot).catch(e=>message('进度保存失败：'+e.message));},250);
+}
+async function flushDraft(){
+  clearTimeout(draftTimer);draftTimer=null;
+  if(state.review||isSkipped()) return;
+  await api('draft',draftSnapshot());
+}
+function render(){
+  if(!state||episodeId===undefined||!state.names.length) return;
+  const episode=ep(), last=state.episodes.at(-1).episode_index===episodeId, skipped=isSkipped();
+  $('position').textContent=`帧 ${frame} / ${episode.length-1} · ${(frame/state.fps).toFixed(2)} 秒`;
+  $('timeline').max=episode.length-1;$('timeline').value=frame;
+  if(state.review){renderReview();return;}
+  $('task').textContent=`任务：${(episode.tasks||[]).join('、')} · `+(skipped?'本集已跳过；点击“重标这一集”可恢复标注。':`当前阶段 ${Math.min(cuts.length+1,state.names.length)} / ${state.names.length}`);
+  $('stages').replaceChildren(...state.names.map((name,i)=>{
+    const li=document.createElement('li');
+    const start=i===0?0:(cuts[i-1]===undefined?null:cuts[i-1]+1);
+    const end=cuts[i]===undefined?(i===state.names.length-1&&start!==null?episode.length-1:null):cuts[i];
+    li.textContent=name+(start!==null?`（${start} ～ ${end===null?'待切分':end} 帧）`:'（待开始）');
+    li.className=i<cuts.length?'done':i===cuts.length?'active':'';return li;
+  }));
+  for(const id of ['episode','camera','speed','editNames','reset']) $(id).disabled=busy;
+  for(const id of ['play','back','forward','timeline']) $(id).disabled=busy||!ready||seeking;
+  $('cut').disabled=busy||skipped||!ready||seeking||cuts.length>=state.names.length-1;
+  $('undo').disabled=busy||skipped||cuts.length===0;
+  $('save').disabled=busy||skipped||!ready||seeking||cuts.length!==state.names.length-1;
+  $('next').disabled=skipped?busy:$('save').disabled;
+  $('skip').disabled=busy||skipped;
+  $('next').textContent=skipped?(last?'查看完成情况':'进入下一集'):(last?'保存并完成':'保存并进入下一集');
+  $('progress').textContent=summary();
+  for(const option of $('episode').options){
+    const id=Number(option.value),saved=state.annotations.some(e=>e.episode_index===id);
+    option.textContent=`${id}${(state.skipped||[]).includes(id)?'（已跳过）':saved?' ✓':''}`;
+  }
+  $('output').textContent='输出文件：'+state.output+'；切分草稿自动保存，可关闭后继续。';
+}
+function renderReview(){
+  const index=state.episodes.findIndex(e=>e.episode_index===episodeId);
+  for(const id of ['episode','camera','speed']) $(id).disabled=busy;
+  for(const id of ['play','back','forward','timeline']) $(id).disabled=busy||!ready||seeking;
+  $('previous').disabled=busy||index===0;
+  $('reviewNext').disabled=busy||index===state.episodes.length-1;
+  $('progress').textContent=`验证视频 ${index+1} / ${state.episodes.length} · 原始 episode ${episodeId}`;
+  $('output').textContent='预测来源：'+state.predictions+' · '+(state.legacy_frame_offset?`旧版窗口末帧对齐（偏移 ${state.legacy_frame_offset} 帧 / ${(state.legacy_frame_offset/state.fps).toFixed(1)} 秒）`:'中心帧对齐')+' · 只读查看';
+  if(!reviewData){$('predictedValue').textContent='加载预测…';$('referenceValue').textContent='';$('currentStage').textContent='';$('reviewValues').textContent='';$('task').textContent='';$('predictedMeter').style.width='0%';return;}
+  const predicted=reviewData.predicted[frame],reference=reviewData.reference[frame],stage=reviewData.stage_indices[frame];
+  $('predictedValue').textContent=predicted===null?'暂无预测':`预测 ${(predicted*100).toFixed(1)}%`;
+  $('referenceValue').textContent=`人工参考 ${(reference*100).toFixed(1)}%`;
+  $('predictedMeter').style.width=predicted===null?'0%':`${predicted*100}%`;
+  $('currentStage').textContent=`人工阶段：${reviewData.names[stage]}`;
+  $('task').textContent=`原始 episode ${episodeId} · 验证集编号 ${reviewData.validation_episode_index} · ${ep().length} 帧`;
+  $('reviewValues').textContent=(predicted===null?'暂无预测':`预测 ${(predicted*100).toFixed(1)}%`)+` · 参考 ${(reference*100).toFixed(1)}%`;
+  [...$('stageBands').children].forEach((button,i)=>button.classList.toggle('active',i===stage));
+  drawCursor();
+}
+function prepareCanvas(canvas){
+  const rect=$('chartWrap').getBoundingClientRect(),ratio=window.devicePixelRatio||1;
+  canvas.width=Math.round(rect.width*ratio);canvas.height=Math.round(rect.height*ratio);
+  const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);
+  return {ctx,width:rect.width,height:rect.height};
+}
+function chartX(value){return chartSize.left+value/Math.max(1,ep().length-1)*chartSize.plotWidth;}
+function chartY(value){return chartSize.top+(1-value)*chartSize.plotHeight;}
+function drawChart(){
+  if(!state?.review) return;
+  const {ctx,width,height}=prepareCanvas($('curve'));
+  prepareCanvas($('curveCursor'));
+  chartSize={left:50,top:25,plotWidth:Math.max(1,width-70),plotHeight:height-65,width,height};
+  ctx.clearRect(0,0,width,height);
+  if(!reviewData) return;
+  ctx.font='12px system-ui';ctx.lineWidth=1;
+  for(let i=0;i<reviewData.names.length;i++){
+    const start=chartX(reviewData.start_frames[i]),end=chartX(Math.min(ep().length-1,reviewData.end_frames[i]+1));
+    ctx.fillStyle=i%2?'rgba(91,130,178,.09)':'rgba(91,130,178,.03)';
+    ctx.fillRect(start,chartSize.top,end-start,chartSize.plotHeight);
+    if(i){ctx.strokeStyle='#61718a';ctx.setLineDash([3,5]);ctx.beginPath();ctx.moveTo(start,chartSize.top);ctx.lineTo(start,chartSize.top+chartSize.plotHeight);ctx.stroke();ctx.setLineDash([]);}
+  }
+  for(const value of [0,.25,.5,.75,1]){
+    const y=chartY(value);ctx.strokeStyle='#334259';ctx.beginPath();ctx.moveTo(chartSize.left,y);ctx.lineTo(width-20,y);ctx.stroke();ctx.fillStyle='#acbdd7';ctx.textAlign='right';ctx.fillText(`${Math.round(value*100)}%`,chartSize.left-8,y+4);
+  }
+  for(let i=0;i<=4;i++){
+    const f=Math.round(i*(ep().length-1)/4);ctx.fillStyle='#acbdd7';ctx.textAlign=i===0?'left':i===4?'right':'center';ctx.fillText(`${(f/state.fps).toFixed(1)}s`,chartX(f),height-12);
+  }
+  for(const [values,color,dash] of [[reviewData.reference,'#6dde9f',[5,4]],[reviewData.predicted,'#58a8ff',[]]]){
+    ctx.strokeStyle=color;ctx.lineWidth=2;ctx.setLineDash(dash);ctx.beginPath();
+    let continuous=false;
+    values.forEach((value,i)=>{if(value===null){continuous=false;return;}if(!continuous)ctx.moveTo(chartX(i),chartY(value));else ctx.lineTo(chartX(i),chartY(value));continuous=true;});ctx.stroke();
+  }
+  ctx.setLineDash([]);drawCursor();
+}
+function drawCursor(){
+  if(!chartSize||!reviewData) return;
+  const ctx=$('curveCursor').getContext('2d'),x=chartX(frame);
+  ctx.clearRect(0,0,chartSize.width,chartSize.height);ctx.strokeStyle='#edf3ff';ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.moveTo(x,chartSize.top-5);ctx.lineTo(x,chartSize.top+chartSize.plotHeight+5);ctx.stroke();
+  for(const [value,color] of [[reviewData.predicted[frame],'#58a8ff'],[reviewData.reference[frame],'#6dde9f']]){if(value===null)continue;ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,chartY(value),4,0,Math.PI*2);ctx.fill();}
+}
+async function loadReview(id){
+  const request=++reviewRequest;reviewData=null;$('stageBands').replaceChildren();drawChart();
+  try{
+    const response=await fetch('/api/predictions?episode='+id),data=await response.json();
+    if(!response.ok) throw new Error(data.error||'预测加载失败');
+    if(request!==reviewRequest||episodeId!==id) return;
+    reviewData=data;
+    $('stageBands').replaceChildren(...data.names.map((name,i)=>{
+      const button=document.createElement('button');button.textContent=name;button.title=name;
+      button.style.flex=`${data.end_frames[i]-data.start_frames[i]+1} 1 0`;
+      button.onclick=()=>{if(!busy)seek(data.start_frames[i]);};return button;
+    }));drawChart();render();
+  }catch(error){if(request===reviewRequest)message(error.message);}
+}
+$('curve').onclick=event=>{
+  if(!state?.review||!chartSize||!reviewData||busy||!ready) return;
+  const rect=$('curve').getBoundingClientRect(),ratio=(event.clientX-rect.left-chartSize.left)/chartSize.plotWidth;
+  seek(Math.round(Math.max(0,Math.min(1,ratio))*(ep().length-1)));
+};
+new ResizeObserver(()=>{if(state?.review)drawChart();}).observe($('chartWrap'));
+async function changeReviewEpisode(delta){
+  const index=state.episodes.findIndex(e=>e.episode_index===episodeId),target=state.episodes[index+delta];
+  if(!target) return;video.pause();await api('select',{episode_index:target.episode_index});loadEpisode(target.episode_index);
+}
+$('previous').onclick=()=>guarded(()=>changeReviewEpisode(-1));
+$('reviewNext').onclick=()=>guarded(()=>changeReviewEpisode(1));
+function trackFrames(){
+  if(!video.requestVideoFrameCallback) return;
+  if(frameCallback!==null) video.cancelVideoFrameCallback(frameCallback);
+  const callback=(_,metadata)=>{
+    frame=clampFrame(Math.round(metadata.mediaTime*state.fps));
+    if(wantedFrame!==null&&frame===wantedFrame){seeking=false;wantedFrame=null;queueDraft();}
+    render();frameCallback=video.requestVideoFrameCallback(callback);
+  };
+  frameCallback=video.requestVideoFrameCallback(callback);
+}
+function seek(n){
+  if(!ready) return;
+  video.pause();const target=clampFrame(n);
+  if(target===frame&&!video.seeking){seeking=false;wantedFrame=null;render();return;}
+  seeking=true;wantedFrame=target;
+  video.currentTime=(target+.1)/state.fps;render();
+}
+function loadVideo(target){
+  if(frameCallback!==null&&video.cancelVideoFrameCallback){video.cancelVideoFrameCallback(frameCallback);frameCallback=null;}
+  video.pause();ready=false;seeking=true;wantedFrame=clampFrame(target);
+  video.src='/video?episode='+episodeId+'&camera='+encodeURIComponent($('camera').value);
+  video.load();render();
+}
+function loadEpisode(id){
+  episodeId=id;$('episode').value=id;
+  if(state.review){frame=0;loadReview(id);loadVideo(0);render();return;}
+  const draft=state.drafts[String(id)],saved=state.annotations.find(e=>e.episode_index===id);
+  cuts=draft?[...draft.cuts]:saved?[...saved.dense.end_frames.slice(0,-1)]:[];
+  frame=clampFrame(draft?draft.frame:0);loadVideo(frame);render();
+}
+video.addEventListener('loadedmetadata',()=>{
+  if(Math.abs(video.duration*state.fps-ep().length)>1.1){message('视频时长与数据集帧数不一致，请检查视频元信息。');return;}
+  ready=true;const target=wantedFrame||0;
+  // Seek within the target frame so paused rendering is unambiguous.
+  video.currentTime=(target+.1)/state.fps;
+  video.playbackRate=Number($('speed').value);trackFrames();render();
+});
+video.addEventListener('seeked',()=>{
+  if(!video.requestVideoFrameCallback){frame=clampFrame(Math.floor(video.currentTime*state.fps));seeking=false;wantedFrame=null;queueDraft();render();}
+});
+video.addEventListener('timeupdate',()=>{
+  if(!video.requestVideoFrameCallback&&!seeking){frame=clampFrame(Math.floor(video.currentTime*state.fps));render();}
+});
+video.addEventListener('pause',()=>{if(ready&&!seeking&&!busy) queueDraft();});
+video.addEventListener('ended',()=>{frame=ep().length-1;render();queueDraft();message(state.review?'本集播放完毕，可查看下一集。':cuts.length===state.names.length-1?'视频播放完毕，可保存并进入下一集。':'视频播放完毕，请补全切分点后保存。');});
+video.addEventListener('error',()=>{ready=false;render();message('无法播放视频，请使用支持 H.264 的浏览器并检查视频文件。');});
+$('play').onclick=()=>{if(video.paused)video.play().catch(e=>message(e.message));else video.pause();};
+$('back').onclick=()=>seek(frame-1);$('forward').onclick=()=>seek(frame+1);
+$('timeline').oninput=()=>seek(Number($('timeline').value));
+$('speed').onchange=()=>{video.playbackRate=Number($('speed').value);};
+function cut(){
+  if($('cut').disabled) return;
+  if(frame===ep().length-1){message('末帧不能切分，请退回到下一阶段开始之前。');return;}
+  if(cuts.length&&frame<=cuts.at(-1)){message('切分点必须在上一个切分点之后，可先撤销上一个切分。');return;}
+  cuts.push(frame);message();queueDraft();render();
+}
+$('cut').onclick=cut;
+document.addEventListener('keydown',event=>{
+  if(['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)||event.target.isContentEditable||$('editor').hidden||!$('setup').hidden) return;
+  if(event.code==='Space'){event.preventDefault();if(!event.repeat){if(state.review&&!$('play').disabled)$('play').click();else if(!state.review)cut();}}
+  if(event.code==='ArrowLeft'){event.preventDefault();if(!busy)seek(frame-1);}
+  if(event.code==='ArrowRight'){event.preventDefault();if(!busy)seek(frame+1);}
+});
+$('undo').onclick=()=>{cuts.pop();queueDraft();render();};
+async function save(){
+  video.pause();clearTimeout(draftTimer);draftTimer=null;
+  await api('save',{episode_index:episodeId,cuts:[...cuts]});
+}
+$('save').onclick=()=>guarded(async()=>{await save();message('本集已保存。');});
+async function advance(){
+  const index=state.episodes.findIndex(e=>e.episode_index===episodeId);
+  if(index===state.episodes.length-1){message('已到最后一集。'+summary());return;}
+  const next=state.episodes[index+1].episode_index;await api('select',{episode_index:next});loadEpisode(next);
+}
+$('next').onclick=()=>guarded(async()=>{
+  if(!isSkipped()) await save();await advance();
+});
+$('skip').onclick=()=>guarded(async()=>{
+  video.pause();
+  if((cuts.length||state.annotations.some(e=>e.episode_index===episodeId))&&!confirm('跳过会清除本集已有切分和标签，确定跳过？'))return;
+  clearTimeout(draftTimer);draftTimer=null;
+  await api('skip',{episode_index:episodeId});cuts=[];render();await advance();
+});
+$('episode').onchange=()=>{const target=Number($('episode').value);guarded(async()=>{
+  video.pause();await flushDraft();await api('select',{episode_index:target});loadEpisode(target);
+}).finally(()=>{$('episode').value=episodeId;});};
+$('camera').onchange=()=>guarded(async()=>{video.pause();await flushDraft();loadVideo(frame);});
+$('reset').onclick=()=>guarded(async()=>{
+  video.pause();if(!confirm(isSkipped()?'取消跳过并重新标注这一集？':'清除这一集所有切分和已保存标签，重新标注？'))return;
+  clearTimeout(draftTimer);draftTimer=null;await api('reset',{episode_index:episodeId});loadEpisode(episodeId);
+});
+$('editNames').onclick=()=>guarded(async()=>{video.pause();await flushDraft();$('names').value=state.names.join('\n');$('setup').hidden=false;$('cancelSetup').hidden=false;});
+$('cancelSetup').onclick=()=>{$('setup').hidden=true;};
+$('start').onclick=()=>guarded(async()=>{
+  const names=$('names').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const changed=state.names.length&&JSON.stringify(names)!==JSON.stringify(state.names);
+  if(changed&&!confirm('修改阶段列表会清除全部已保存标签、草稿和跳过记录，确定重置？'))return;
+  clearTimeout(draftTimer);draftTimer=null;
+  await api('setup',{names,reset:!!changed});$('setup').hidden=true;$('editor').hidden=false;loadEpisode(state.current);
+});
+window.addEventListener('beforeunload',()=>{
+  if(state?.names.length&&episodeId!==undefined&&!state.review&&!isSkipped()){
+    clearTimeout(draftTimer);
+    fetch('/api/draft',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draftSnapshot()),keepalive:true}).catch(()=>{});
+  }
+});
+setInterval(()=>{if(ready&&!busy&&!seeking&&!video.paused)queueDraft();},3000);
+(async()=>{
+  try{
+    const response=await fetch('/api/state');state=await response.json();
+    $('episode').replaceChildren(...state.episodes.map(e=>new Option(String(e.episode_index),e.episode_index)));
+    $('camera').replaceChildren(...state.cameras.map(c=>new Option(c,c)));
+    $('camera').value=state.cameras.find(c=>c.includes('base'))||state.cameras[0];
+    if(state.review){
+      document.body.classList.add('review-mode');document.title='SARM 视频与预测进度';
+      document.querySelector('h1').textContent='SARM 视频与预测进度';
+      $('intro').textContent='播放视频对照预测与人工参考。空格播放 / 暂停，左右方向键逐帧定位。此页面只读查看。';
+      for(const id of ['editNames','cut','undo','save','next','skip','reset']) $(id).hidden=true;
+      $('reviewPanel').hidden=false;$('predictionOverlay').hidden=false;
+      [...$('episode').options].forEach(option=>{option.textContent='原始集 '+option.value;});
+    }
+    if(state.names.length){$('setup').hidden=true;$('editor').hidden=false;loadEpisode(state.current);}
+  }catch(error){message('加载失败：'+error.message);}
+})();
+</script>
+</html>

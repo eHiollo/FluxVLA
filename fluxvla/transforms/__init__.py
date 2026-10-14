@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .a10 import PrepareA10OpenPIInputs  # noqa: F401, F403
 from .attach_rabc_weight import AttachRABCWeight  # noqa: F401, F403
 from .fast_tokenizer import FASTTokenizer  # noqa: F401, F403
 from .modality_state_action import *  # noqa: F401, F403

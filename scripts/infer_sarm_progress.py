@@ -20,6 +20,7 @@ import os
 import sys
 import types
 from collections import defaultdict
+from itertools import islice
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Tuple, cast
 
@@ -27,6 +28,7 @@ import numpy as np
 import torch
 from mmengine import Config, DictAction
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 # SARM inference is PyTorch-only; set this before any transitive Hugging Face
 # imports can probe or initialize TensorFlow.
@@ -82,6 +84,8 @@ def _install_lightweight_fluxvla_imports() -> Dict[str, Any]:
         REPO_ROOT / 'fluxvla' / 'models' / 'vlas',
         'fluxvla.tokenizers':
         REPO_ROOT / 'fluxvla' / 'tokenizers',
+        'fluxvla.transforms':
+        REPO_ROOT / 'fluxvla' / 'transforms',
     }
     for name, path in package_paths.items():
         _ensure_namespace_package(name, path)
@@ -286,6 +290,8 @@ def _register_sarm_runtime_modules() -> Dict[str, Any]:
     builders = _install_lightweight_fluxvla_imports()
     _register_sarm_transforms()
     for module_name in [
+            'fluxvla.transforms.normalize',
+            'fluxvla.transforms.transform_inputs',
             'fluxvla.collators.dict_collator',
             'fluxvla.datasets.sarm_dataset',
             'fluxvla.models.backbones.llms.sarm',
@@ -314,6 +320,8 @@ def parse_args():
         choices=['sparse', 'dense', 'both'])
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='Number of parallel video decoding workers.')
     parser.add_argument('--max-batches', type=int, default=None)
     parser.add_argument(
         '--visualize-only',
@@ -371,6 +379,20 @@ def _resolve_head_modes(model: Any, head_mode: str) -> List[str]:
     if head_mode == 'dense' and not uses_dual_heads:
         raise ValueError('Dense SARM head is unavailable for this model.')
     return [head_mode]
+
+
+def _prediction_frame_metadata(dataset, episode_index: int, global_index: int) -> Dict:
+    """Map the center observation to its source episode and local video frame."""
+    dataset_index = int(dataset._get_dataset_index(global_index))
+    start, end = dataset.episode_ranges[(dataset_index, episode_index)]
+    if not start <= global_index < end:
+        raise ValueError('Prediction index lies outside its episode')
+    metadata = dataset.episodes_meta[dataset_index][episode_index]
+    return {
+        'frame_index': global_index - start,
+        'source_episode_index': int(metadata.get('source_episode_index', episode_index)),
+        'frame_alignment': 'center',
+    }
 
 
 def _num_stages(model: Any, head_mode: str) -> int:
@@ -469,6 +491,15 @@ def _render_episode_visualization(records: List[Dict], stage_labels: List[str],
     matplotlib.use('Agg')
     import matplotlib.gridspec as gridspec
     import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+
+    if any(not label.isascii() for label in stage_labels):
+        available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+        for family in ('Noto Sans CJK SC', 'Noto Sans CJK JP',
+                       'Droid Sans Fallback', 'WenQuanYi Micro Hei', 'SimHei'):
+            if family in available_fonts:
+                plt.rcParams['font.family'] = [family, 'DejaVu Sans']
+                break
 
     records = sorted(records, key=lambda item: item['current_index'])
     frame_positions = np.arange(len(records))
@@ -586,6 +617,10 @@ def _write_jsonl(output_path: str, records: List[Dict]) -> None:
 def main():
     """Run SARM progress inference and optional prediction visualizations."""
     args = parse_args()
+    if args.num_workers < 0:
+        raise ValueError('--num-workers must be non-negative')
+    if args.batch_size <= 0 or (args.max_batches is not None and args.max_batches <= 0):
+        raise ValueError('--batch-size and --max-batches must be positive')
     builders = _register_sarm_runtime_modules()
     build_collator_from_cfg = builders['build_collator_from_cfg']
     build_dataset_from_cfg = builders['build_dataset_from_cfg']
@@ -615,7 +650,16 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=collator)
+        collate_fn=collator,
+        num_workers=args.num_workers,
+        prefetch_factor=1 if args.num_workers else None,
+        pin_memory=torch.device(args.device).type == 'cuda')
+
+    total_batches = len(dataloader)
+    if args.max_batches is not None:
+        total_batches = min(total_batches, args.max_batches)
+    print(f'SARM 验证：数据集 {len(dataset)} 帧，本次最多 {total_batches} 个 batch，'
+          f'batch size={args.batch_size}，视频解码进程={args.num_workers}。', flush=True)
 
     results = []
     collect_visuals = args.num_visualizations > 0
@@ -625,11 +669,11 @@ def main():
         head_mode: defaultdict(list)
         for head_mode in head_modes
     }
-    frame_index = int(getattr(model, 'n_obs_steps', 0))
+    # The dataset samples symmetrically around current_index.
+    frame_index = int(getattr(dataset, 'n_obs_steps', 0)) // 2
     with torch.inference_mode():
-        for batch_idx, batch in enumerate(dataloader):
-            if args.max_batches is not None and batch_idx >= args.max_batches:
-                break
+        for batch in tqdm(islice(dataloader, total_batches), total=total_batches,
+                          desc='SARM validation', unit='batch', dynamic_ncols=True):
             progress_by_mode = {}
             stage_probs_by_mode = {}
             for head_mode in head_modes:
@@ -640,6 +684,7 @@ def main():
                     states=batch['states'],
                     lengths=batch['lengths'],
                     head_mode=head_mode,
+                    frame_index=frame_index,
                     return_stage_probs=collect_visuals,
                 )
                 if collect_visuals:
@@ -660,6 +705,7 @@ def main():
                     'episode_index': episode_index,
                     'current_index': current_index,
                     'task_description': task_description,
+                    **_prediction_frame_metadata(dataset, episode_index, current_index),
                 }
                 if len(head_modes) == 1:
                     head_mode = head_modes[0]
@@ -704,13 +750,20 @@ def main():
     if not args.visualize_only:
         assert args.output_path is not None
         _write_jsonl(args.output_path, results)
+        print(f'已保存 {len(results)} 帧预测：{args.output_path}', flush=True)
     if collect_visuals:
+        print(f'正在生成图表：{args.output_dir}', flush=True)
         _visualize_sarm_predictions(
             viz_records_by_mode=viz_records_by_mode,
             model=model,
             output_dir=args.output_dir,
             num_display_frames=args.num_display_frames)
+    print('SARM 验证完成。', flush=True)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\n验证已手动中断，完整结果可能尚未写入。', file=sys.stderr)
+        raise SystemExit(130)

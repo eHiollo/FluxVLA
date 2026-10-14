@@ -55,6 +55,7 @@ out/
 # Ignore work directories
 work_dirs/
 work_dirs
+sarm_runs/
 
 # Ignore checkpoints folder contents but keep the folder
 checkpoints/*

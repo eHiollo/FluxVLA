@@ -73,6 +73,8 @@ def validate_project(config: dict) -> None:
     if (model['joint_action_mode'] != 'delta_from_current_state'
             or model['gripper_action_mode'] != 'absolute'):
         raise ValueError('A10 action convention is joint deltas and absolute gripper')
+    if model.get('checkpoint_format', 'fluxvla') not in {'fluxvla', 'openpi'}:
+        raise ValueError('model.checkpoint_format must be fluxvla or openpi')
     if model['family'] != 'pi05' or model['padded_action_dim'] != 32:
         raise ValueError('This workflow supports PI0.5 with 32 model dimensions')
     if int(model['action_horizon']) <= 0:

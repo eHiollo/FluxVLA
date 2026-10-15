@@ -12,11 +12,15 @@ A10_new 暂时是底层运动控制后端，通过协议适配器连接。未来
 
 ## 当前进度（2026-10-15）
 
+**分支分工**：`kaanh_follower` 保存已验证的推理／控制基线；`kaanh_follower_vr` 从 `efcdb2f` 创建，接入旧 VR 开发成果，后续 VR 开发在该分支进行。统一使用 `/home/robot/VLA/FluxVLA` 工作目录。
+
+**提交约定**：按用户最新要求，每次工作对话完成后统一提交一次，提交标题及内容摘要使用中文；开发文档同步记录，不再按每个小任务单独提交。此约定取代下文历史记录中的逐小任务提交要求。
+
 用户确认集成目录已跑通，现将 `kaanh_follower` 的完整实现迁回 `/home/robot/VLA/FluxVLA`。迁入基准为 `b98edd2`，包含原生 Triton + CUDA Graph 加速推理。正式链路为 `scripts/inference.py → A10InferenceRunner(BaseInferenceRunner) → A10Operator(BaseOperator)`，使用原有注册器、dataset/transform 和 ZMQ 服务；原有相机、USB 夹爪、关节 follower 接口随分支保留。
 
 原目录 VR 开发内容已保存至 `backup/vr-before-consolidation-20261015`（`e9e4b93`），不混入当前推理版本。模型、tokenizer、CUDA 扩展及现场配置已核对保留；迁回后的测试结果和旧工作目录清理结果见本文末尾。默认配置保留 dry_run 和运动开关。用户确认的跑通情况不替代抓取成功率、失联行为和目标跟踪质量的专项验收。
 
-下方历史方案和开发记录保留用于追踪变化，其中旧工作目录路径只代表当时的位置。当前软件接口和操作命令见 [现场说明](a10_onsite_guide.md)。每个小任务分别提交，详细进度在本文末尾。
+下方历史方案和开发记录保留用于追踪变化，其中旧工作目录路径只代表当时的位置。当前软件接口和操作命令见 [现场说明](a10_onsite_guide.md)。后续每次工作对话统一提交一次，详细进度在本文末尾。
 
 ### 2026-10-09 进度快照（历史）
 
@@ -564,3 +568,13 @@ conda activate fluxvla
 PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
   test_a10_openpi_inference.A10OpenPITest.test_real_checkpoint_forward_and_service -q
 ```
+
+
+### 2026-10-15：建立 VR 开发分支并迁入已有实现
+
+- 按用户要求，从最新 `kaanh_follower`（`efcdb2f`）创建 `kaanh_follower_vr`；VR 后续开发统一在新分支，仍使用主目录，不新建独立工作区。本次工作对话统一提交一个中文 commit，此后沿用每次对话一次提交的约定。
+- 来源为 `backup/vr-before-consolidation-20261015`（`e9e4b93`）。选择性迁入 `VROperator`、teleop 组装入口、VR 输入关闭修复、按键说明、VR 专项测试及文档；没有合入来源提交中的旧 OpenPI 服务／回放修改。当前相机、USB 夹爪、后台监视、关节轨迹发送和 Triton/CUDA Graph 推理实现继续使用最新基线。
+- `VROperator` 复用 `A10Operator` 和独立 `GripperOperator`，保留末端局部增量累积、启动锚点相对米／xyzw 转换、握键启动、松手保持、参考重置、输入过期与跟踪误差检查、摇杆控制夹爪。A10Operator 只补充位姿接口注释，没有替换通信或轨迹逻辑。
+- 配置增加 `vr_operator` 分节和站点模板；保留现有本地配置中的 `model.checkpoint_format` 字段及校验，使 VR 入口可加载当前 site.local.yaml。依赖继续使用 follower 已有的 `pyserial==3.5`，未放宽版本或重装环境。本地和示例配置解析、VR-only 构建及 CLI 预览通过。
+- 回归结果：VR/A10/轨迹/相机/夹爪/控制台 124 项通过（其中 VR 专项 22 项）；共享项目 6 项通过，覆盖本机 HTTPS/WSS 模拟浏览器输入、数据写入和假服务闭环；推理 runner/适配 21 项发现、20 项通过、1 项真实 GPU 模型测试按默认跳过。合计 150 项通过、1 项跳过，日志在 `work_dirs/a10/vr_migration/20261015/`。本次没有启动真实头显服务、连接实机或发送运动指令；真实 GPU 路径沿用上一轮迁回时的验证结果。
+- 当前功能迁入完成。入口仍是 `projects/a10/teleop.py`，输入和 mapper 仍在 `projects/a10/vr`；统一遥操作基类／runner 整理、真实 VR→Cartesian follower 与夹爪联调、录制链路接入与验收留待后续开发。使用说明见 `docs/a10_vr_operator.md`。

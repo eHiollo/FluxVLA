@@ -3,7 +3,8 @@
 Wire layout follows the user-supplied robot.7z reference. Controller-side
 planning stays on the controller. This module does not open connections at
 import/construction, automatically enable motors, interpret VR increments, or invent a
-seventh joint. A Cartesian target is an origin-relative pose, not joint state.
+seventh joint. A Cartesian target is relative to the follower startup pose,
+with translation/orientation expressed in that anchor frame, not joint state.
 """
 
 from __future__ import annotations
@@ -287,7 +288,9 @@ class _FollowerConnection:
 class A10Operator(BaseOperator):
     """Six-axis A10 + gripper, using the reference KAANH follower protocol.
 
-    ``send_eepose({'right': pose})`` expects origin-relative xyz metres + xyzw.
+    ``send_eepose({'right': pose})`` expects startup-anchor-relative xyz metres
+    + xyzw: T_relative = inverse(T_start) * T_target. Each follower start
+    refreshes the controller anchor; [0,0,0,0,0,0,1] holds that startup pose.
     ``send_joints({'right': joints})`` expects six absolute joint angles in
     radians. They are converted to degrees in UDP ``jp --motor_pos=[...]``;
     the gripper remains a separate command. Only the selected follower mode
@@ -709,7 +712,7 @@ class A10Operator(BaseOperator):
             return state
 
     def send_eepose(self, arm_targets):
-        """Send one origin-relative pose in metres/xyzw for the configured arm."""
+        """Send one startup-anchor-relative pose in metres/xyzw for the arm."""
         if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
             raise ValueError(f'Expected exactly one arm: {self.arm_name}')
         pose = _pose(arm_targets[self.arm_name])

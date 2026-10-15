@@ -146,7 +146,7 @@ class VRInput:
             f"[XLeVR] Teleoperator 已连接，等待 VR 浏览器...\n"
             f"  打开: https://{host}:{https_port}\n"
             f"  按住右手 squeeze 才控制机械臂，右手摇杆 x 直接控制夹爪\n"
-            f"  左手摇杆：右=下一阶段，左=重录，上=机械臂复位，下=停止录制",
+            f"  左手摇杆：右=下一阶段，左=重录，上=重置请求，下=停止",
             flush=True,
         )
         logger.info("XLeVR ready. Open https://%s:%s in your VR browser.", host, https_port)
@@ -279,11 +279,10 @@ class VRInput:
         pass
 
     def disconnect(self) -> None:
-        if not self._connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
         self._connected = False
         monitor = self._vr_monitor
-        if monitor is not None and monitor._loop is not None:
+        if (monitor is not None and monitor._loop is not None
+                and not monitor._loop.is_closed()):
             monitor._loop.call_soon_threadsafe(setattr, monitor, 'is_running', False)
         if self._vr_thread is not None:
             self._vr_thread.join(timeout=3)

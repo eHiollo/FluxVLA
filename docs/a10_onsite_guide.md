@@ -1,5 +1,10 @@
 # A10 现场接入操作说明
 
+**VR 当前入口**：在 `/home/robot/VLA/FluxVLA_vr` 使用
+`python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py`。
+默认 VR-only；详细配置和新布局见 [VR 说明](a10_vr_operator.md)。
+下文 `projects/a10` 相关命令为历史流程，不作为新 VR 遥操作入口。
+
 VR 开发分支为 `kaanh_follower_vr`，从最新已验证的 `kaanh_follower` 创建；
 VR 使用与迁移进度见 [VR 遥操作说明](a10_vr_operator.md)。工作目录统一为
 `/home/robot/VLA/FluxVLA`。

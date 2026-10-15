@@ -8,11 +8,12 @@ import struct
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from fluxvla.engines.operators.vr_operator import VROperator
-from fluxvla.projects.a10.config import load_project
-from fluxvla.projects.a10.teleop import build_teleop
-from fluxvla.projects.a10.vr.mapper import XLeVRDeltaEEMapper
-from fluxvla.projects.a10.vr.input import VRInput
+from fluxvla.engines.operators.vr.runtime import VRTeleopRuntime
+from fluxvla.engines.operators.vr.runtime import build_runtime
+from mmengine import Config
+from pathlib import Path
+from fluxvla.engines.operators.vr.mapper import XLeVRDeltaEEMapper
+from fluxvla.engines.operators.vr.input import VRInput
 from test_a10_operator import FakeController
 
 
@@ -119,21 +120,22 @@ class FakeGripper:
 
 def make_live(samples, robot=None, **kwargs):
     robot = robot or FakeA10()
-    return VROperator(FakeVR(samples), FakeMapper(), robot, execute=True,
+    return VRTeleopRuntime(FakeVR(samples), FakeMapper(), robot, execute=True,
                       max_position_step_m=.02, max_rotation_step_rad=.2,
                       **kwargs), robot
 
 
-class VROperatorTest(unittest.TestCase):
+class VRTeleopRuntimeTest(unittest.TestCase):
     def test_project_entrypoint_builds_vr_only_and_blocks_unverified_motion(self):
-        cfg = load_project(site_path=None)
-        self.assertIsInstance(build_teleop(cfg, vr_only=True), VROperator)
+        cfg = Config.fromfile(str(Path(__file__).resolve().parents[1] / 'configs/a10/a10_vr_teleop.py')).teleop
+        self.assertIsInstance(build_runtime(cfg), VRTeleopRuntime)
+        cfg.vr_only = False
         with self.assertRaises(ValueError):
-            build_teleop(cfg)
+            build_runtime(cfg)
 
     def test_vr_only_never_connects_robot(self):
         vr = FakeVR([{'mapped': action()}])
-        operator = VROperator(vr, FakeMapper())
+        operator = VRTeleopRuntime(vr, FakeMapper())
         self.assertEqual(operator.run(max_steps=1), 1)
         self.assertFalse(vr.is_connected)
 
@@ -141,11 +143,11 @@ class VROperatorTest(unittest.TestCase):
         robot = FakeA10()
         robot.feedback_position_unit = None
         with self.assertRaisesRegex(ValueError, 'feedback_position_unit'):
-            VROperator(FakeVR([]), FakeMapper(), robot, execute=True,
+            VRTeleopRuntime(FakeVR([]), FakeMapper(), robot, execute=True,
                        max_position_step_m=.02, max_rotation_step_rad=.2)
         robot.feedback_position_unit = 'mm'
         with self.assertRaisesRegex(ValueError, 'max_position_step_m'):
-            VROperator(FakeVR([]), FakeMapper(), robot, execute=True,
+            VRTeleopRuntime(FakeVR([]), FakeMapper(), robot, execute=True,
                        max_rotation_step_rad=.2)
 
     def test_local_delta_composes_with_current_pose_and_stops(self):
@@ -333,7 +335,7 @@ class VROperatorTest(unittest.TestCase):
         with FakeController() as server:
             robot = server.operator(feedback_position_unit='mm')
             mapper = XLeVRDeltaEEMapper(pos_scale=1., pos_deadzone_m=0.)
-            operator = VROperator(FakeVR(samples), mapper, robot, execute=True,
+            operator = VRTeleopRuntime(FakeVR(samples), mapper, robot, execute=True,
                                   max_position_step_m=.02, max_rotation_step_rad=.2)
             operator.run(max_steps=len(samples))
             poses = []

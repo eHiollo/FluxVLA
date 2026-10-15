@@ -68,7 +68,7 @@ setup(
     long_description_content_type='text/markdown',
     url=None,
     packages=find_packages(),
-    package_data={'fluxvla.projects.a10.vr': [
+    package_data={'fluxvla.engines.operators.vr': [
         'web-ui/*.html', 'web-ui/*.js', 'web-ui/*.css', 'web-ui/media/*',
         'LICENSE.*', 'NOTICE.md']},
     classifiers=[

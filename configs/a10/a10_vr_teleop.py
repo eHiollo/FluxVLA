@@ -1,0 +1,51 @@
+"""Native VR-only defaults. Fill verified units/limits before live operation.
+
+python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py
+Override parameters with --cfg-options teleop.input.network.host_ip=YOUR_LAN_IP.
+No site YAML or projects/a10 import is used. No automatic motor enable/homing.
+"""
+from pathlib import Path
+
+_root = Path('{{fileDirname}}').resolve().parents[1]
+teleop = dict(
+    vr_only=True, fps=30, max_steps=None,
+    diagnostics_path=str(_root / 'work_dirs/a10/vr/teleop_diagnostics.jsonl'),
+    input=dict(type='VROperator', arm='right',
+               network=dict(host_ip='127.0.0.1', https_port=8443,
+                            websocket_port=8442,
+                            tls_directory=str(_root / 'work_dirs/a10/vr/tls')),
+               mapping={'pos_scale': 0.9,
+ 'angle_scale': 1.3,
+ 'vr_to_robot_scale': 1.0,
+ 'fine_trigger_threshold': 0.5,
+ 'fine_scale_factor': 0.5,
+ 'position_control_mode': 'safe_frame_delta',
+ 'stale_timeout_s': 0.25,
+ 'max_vr_speed_m_s': 2.0,
+ 'spike_recovery_frames': 2,
+ 'compute_anchor_shadow': True,
+ 'motion_shaping_mode': 'robot_controller',
+ 'position_cutoff_hz': 5.0,
+ 'max_linear_speed_m_s': 0.25,
+ 'max_linear_accel_m_s2': 1.0,
+ 'engage_ramp_s': 0.35,
+ 'pos_deadzone_m': 0.0005,
+ 'angle_deadzone_deg': 0.05,
+ 'max_delta_pos_m': None,
+ 'max_delta_angle_deg': None,
+ 'require_squeeze_to_move': True,
+ 'gripper_thumbstick_axis': 'x',
+ 'gripper_thumbstick_deadzone': 0.05,
+ 'axis_remap': [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]}),
+    operator=dict(type='A10Operator', host='127.0.0.1',
+                  ws_port=5999, udp_port=9998, joint_udp_port=9999,
+                  command_mode='cartesian', allow_motion=False,
+                  feedback_position_unit=None,
+                  # Optional USB gripper: use gripper_transport='usb' and
+                  # gripper=dict(port='YOUR_DEVICE', max_width_mm=85., timeout=.015).
+                  gripper_transport='controller'),
+    max_position_step_m=None, max_rotation_step_rad=None,
+    max_feedback_age_s=.25, gripper_speed_mm_s=30.,
+    max_position_tracking_error_m=.05,
+    max_rotation_tracking_error_rad=.35,
+)

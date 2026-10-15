@@ -145,8 +145,8 @@ class VRInput:
         print(
             f"[XLeVR] Teleoperator 已连接，等待 VR 浏览器...\n"
             f"  打开: https://{host}:{https_port}\n"
-            f"  按住右手 squeeze 才控制机械臂，右手摇杆 x 直接控制夹爪\n"
-            f"  左手摇杆：右=下一阶段，左=重录，上=重置请求，下=停止",
+            f"  右手 squeeze=粗调，前扳机=精调，右手摇杆 x 控制夹爪\n"
+            f"  左手摇杆：上=重置参考，下=停止；右/左的录制事件由录制流程处理",
             flush=True,
         )
         logger.info("XLeVR ready. Open https://%s:%s in your VR browser.", host, https_port)

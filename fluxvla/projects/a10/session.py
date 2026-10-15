@@ -15,8 +15,8 @@ import numpy as np
 from .cameras import build_cameras
 from .follower import build_follower
 from .recording import ACTION_NAMES, EpisodeWriter
-from .vr.diagnostics import XLeVRDiagnosticsWriter
-from .vr.runtime import build_vr
+from fluxvla.engines.operators.vr.diagnostics import XLeVRDiagnosticsWriter
+from fluxvla.engines.operators.vr.runtime import build_vr
 
 
 def send_vr_action(follower, action):

@@ -17,7 +17,7 @@ from fluxvla.datasets.parquet_dataset_v3 import ParquetDatasetV3
 from fluxvla.projects.a10.cameras import RGBCamera
 from fluxvla.projects.a10.config import load_project
 from fluxvla.projects.a10.recording import EpisodeWriter
-from fluxvla.projects.a10.vr.runtime import build_vr
+from fluxvla.engines.operators.vr.runtime import build_vr
 
 
 class NativePlatformTest(unittest.TestCase):

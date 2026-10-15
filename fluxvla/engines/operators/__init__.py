@@ -23,4 +23,4 @@ from .gripper_operator import GripperOperator  # noqa: F401
 from .oli_operator import OliOperator  # noqa: F401, F403
 from .tron2_operator import Tron2Operator  # noqa: F401, F403
 from .ur_operator import UROperator  # noqa: F401, F403
-from .vr_operator import VROperator  # noqa: F401
+from .vr_operator import BaseTeleoperator, VROperator  # noqa: F401

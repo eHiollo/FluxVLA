@@ -12,7 +12,7 @@ A10_new 暂时是底层运动控制后端，通过协议适配器连接。未来
 
 ## 当前进度（2026-10-15）
 
-**分支分工**：`kaanh_follower` 保存已验证的推理／控制基线；`kaanh_follower_vr` 从 `efcdb2f` 创建，接入旧 VR 开发成果，后续 VR 开发在该分支进行。统一使用 `/home/robot/VLA/FluxVLA` 工作目录。
+**分支分工**：`kaanh_follower` 保存已验证的推理／控制基线；`kaanh_follower_vr` 从 `efcdb2f` 创建，接入旧 VR 开发成果，后续 VR 开发在该分支进行。当前为保护主目录未提交修改，VR 使用独立工作区 `/home/robot/VLA/FluxVLA_vr`，主目录保持 `kaanh_follower`。
 
 **提交约定**：按用户最新要求，每次工作对话完成后统一提交一次，提交标题及内容摘要使用中文；开发文档同步记录，不再按每个小任务单独提交。此约定取代下文历史记录中的逐小任务提交要求。
 
@@ -578,3 +578,17 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 配置增加 `vr_operator` 分节和站点模板；保留现有本地配置中的 `model.checkpoint_format` 字段及校验，使 VR 入口可加载当前 site.local.yaml。依赖继续使用 follower 已有的 `pyserial==3.5`，未放宽版本或重装环境。本地和示例配置解析、VR-only 构建及 CLI 预览通过。
 - 回归结果：VR/A10/轨迹/相机/夹爪/控制台 124 项通过（其中 VR 专项 22 项）；共享项目 6 项通过，覆盖本机 HTTPS/WSS 模拟浏览器输入、数据写入和假服务闭环；推理 runner/适配 21 项发现、20 项通过、1 项真实 GPU 模型测试按默认跳过。合计 150 项通过、1 项跳过，日志在 `work_dirs/a10/vr_migration/20261015/`。本次没有启动真实头显服务、连接实机或发送运动指令；真实 GPU 路径沿用上一轮迁回时的验证结果。
 - 当前功能迁入完成。入口仍是 `projects/a10/teleop.py`，输入和 mapper 仍在 `projects/a10/vr`；统一遥操作基类／runner 整理、真实 VR→Cartesian follower 与夹爪联调、录制链路接入与验收留待后续开发。使用说明见 `docs/a10_vr_operator.md`。
+
+
+### 2026-10-15：VR 紧凑布局落地——独立工作区与原生入口
+
+- 用户批准紧凑布局，并明确禁止改动／提交 `kaanh_follower` 中的未提交内容。因此仅新增 `/home/robot/VLA/FluxVLA_vr` 工作区检出 `kaanh_follower_vr`（原基线 `325b074`）。没有切换主目录、暂存其改动、合并或推进 follower 分支。主目录已有现场配置、控制台等内容由用户独立开发，本轮不纳入 VR 提交。
+- 将 `projects/a10/vr` 整体迁到 `engines/operators/vr`，保留网页、样式、图片、来源 NOTICE 和 Apache/MIT 许可证；setup.py 的 package_data 指向新包。mapper 只引用底层 TRANSFORMS 注册器，避免包初始化循环。
+- `vr_operator.py` 提供小型 `BaseTeleoperator` 和注册到 OPERATORS 的 `VROperator`，负责输入、映射、事件与反馈。已测试的 A10 控制状态机迁入 `vr/runtime.py` 的 `VRTeleopRuntime`；保留启动锚点转换、目标累积、松手保持、重置、过期及误差检查、启停和失败清理。未新增 runner 文件，未改 A10Operator、相机或夹爪驱动。
+- 新增 `scripts/teleoperate.py` 和 `configs/a10/a10_vr_teleop.py`，支持 `--cfg-options`、`--preview`，默认 VR-only，不再使用旧项目的 YAML/配置加载器。现场单位、位姿限值和运动开关必须显式确认；不读取主目录 site.local.yaml，不自动使能、回零、重连或抢占 follower。
+- USB 夹爪通过现有 GripperOperator 单独组装，由 runtime 管理连接；机器人实例不重复持有串口。默认未启用 USB 设备，配置后沿用 85mm 范围。这样松开机械臂握键时仍能用摇杆操作夹爪。
+- 诊断 JSONL 已接入循环，记录原始输入、映射动作、反馈、成功写出的相对目标、错误及耗时，关闭时刷盘并释放线程。HUD 模块与 send_feedback 接口保留；完整录制状态机／录制 HUD 留待下一轮。旧 teleop 入口明确报出新命令并退出；旧录制 session 反向引用新 VR 包的轻量适配器，不保留重复实现。
+- 验证：原 VR 专项 22 项通过；VR＋通信／轨迹／相机／夹爪／控制台＋新入口测试合计首次 132 项通过，再增一项原生输入门面到 runtime 的集成测试并通过，新入口专项最终 9 项通过；共享原生／工作流 6 项通过（含本机 HTTPS/WSS）；A10 推理 runner 14 项通过。合计 153 个不同测试通过。导入拦截测试禁止所有 fluxvla.projects 导入，新 CLI 预览仍通过；资源打包模式与网页／许可证存在性通过。未运行真实 GPU 权重，未接真实头显或机器人。
+- 验证产物：VR 工作区 `work_dirs/a10/vr_native/20261015/`。系统已有编译扩展通过本地硬链接复用，不修改 Conda 的 editable 安装；测试与脚本优先导入本工作区代码。
+- 使用：先进入 `/home/robot/VLA/FluxVLA_vr`，激活 `fluxvla`，再运行 `python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview`。实际头显输入去掉 preview，并在配置中指定本机局域网 host_ip。详细说明见 `docs/a10_vr_operator.md`。
+- 本轮仅在 VR 分支统一提交一次中文 commit；下一轮先验收真实 VR 输入及现场位姿方向，再接入分段录制、保存/重录/续录与 HUD。

@@ -77,7 +77,7 @@ def _doctor(cfg: dict) -> int:
     paths = cfg['paths']
     checks = {
         'FluxVLA Python': Path(paths['fluxvla_python']).is_file(),
-        '平台 VR 网页': (PROJECT_ROOT / 'fluxvla/projects/a10/vr/web-ui/index.html').is_file(),
+        '平台 VR 网页': (PROJECT_ROOT / 'fluxvla/engines/operators/vr/web-ui/index.html').is_file(),
         '数据集': (Path(cfg['dataset']['root']) / 'meta/info.json').is_file(),
         'PI0.5 基础权重': bool(cfg['model']['base_checkpoint']) and Path(
             cfg['model']['base_checkpoint']).is_file(),

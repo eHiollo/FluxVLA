@@ -1,53 +1,99 @@
-# A10 XLeVR 遥操作算子
+# A10 VR 遥操作使用与开发说明
 
-## 当前开发分支（2026-10-15）
+## 当前分支和工作目录
 
-VR 后续开发统一在 `kaanh_follower_vr`，工作目录为 `/home/robot/VLA/FluxVLA`。
-本分支从 `kaanh_follower` 的 `efcdb2f` 创建，选择性迁入
-`backup/vr-before-consolidation-20261015`（`e9e4b93`）中的 VR 修改，
-沿用当前 A10 通信、相机、夹爪和加速推理实现。
+VR 开发在 `kaanh_follower_vr`，当前独立工作区为 `/home/robot/VLA/FluxVLA_vr`。
+主目录 `/home/robot/VLA/FluxVLA` 仍属于 `kaanh_follower`，其中的现场修改由用户管理。
+在 IDE 打开 VR 工作区即可查看本轮代码；此工作区沿用现有 `fluxvla` Conda 环境。
 
-```bash
-cd /home/robot/VLA/FluxVLA
-conda activate fluxvla
-python -m fluxvla.projects.a10 teleop --vr-only --execute
+## 文件职责
+
+```text
+fluxvla/engines/operators/
+├── vr_operator.py           # BaseTeleoperator + VROperator：输入、映射、事件和反馈
+├── vr/                      # VR 底层与网页资源集中管理
+│   ├── runtime.py           # VRTeleopRuntime：循环、follower、锚点、保持与清理
+│   ├── input.py / mapper.py # 手柄输入与末端增量映射
+│   ├── monitor.py / ws_server.py / server_config.py
+│   ├── diagnostics.py / hud.py / vr_events.py / quaternion_utils.py
+│   └── web-ui/              # 页面、脚本和样式，连同许可证一起打包
+└── a10_operator.py          # 现有控制器协议与状态接口
+scripts/teleoperate.py        # 配置加载和启动
+configs/a10/a10_vr_teleop.py   # 唯一原生 VR 配置入口
 ```
 
-上述命令仅接收 VR 输入，不连接机械臂；省略 `--execute` 时只预览命令。
-头显通过本机局域网地址访问，地址由 `configs/a10/site.local.yaml` 的
-`vr_server.host_ip` 设置。配置字段示例见 `configs/a10/site.example.yaml`。
+`VROperator` 通过已有 `OPERATORS` 注册器构建，不连接机器人。
+对外接口为 `connect/get_action/get_events/send_feedback/close`；读取动作时同时保存
+`last_raw` 和 `last_action`。`send_feedback` 发送头显 HUD JSON，不表示机器人执行成功。
+`reset_reference` 清空手柄映射参考。
 
-本轮完成旧 VR 功能迁入，遥操作入口仍在 `projects/a10/teleop.py`，
-底层输入与 mapper 仍在 `projects/a10/vr`；通用遥操作基类与 runner 的进一步
-归位、新 follower 下的实机验证及录制联动是后续任务。
+`VRTeleopRuntime` 组合输入与 A10Operator，保留启动锚点相对位姿、局部增量累积、
+握键/精调、松手保持、输入过期、目标及跟踪误差检查。左摇杆上推只重置参考，不回零。
+右摇杆可以独立控制可选 USB 夹爪，沿用共享 GripperOperator 的 0～85mm 工作范围。
+USB 夹爪由 runtime 单独持有并关闭，避免与 A10Operator 重复打开同一串口；
+这样无需启动机械臂 follower 也能使用摇杆夹爪。相机接口仍由 A10Operator 提供。
 
-## 当前实现
+## 1. 检查配置：不启动服务
 
-`fluxvla/engines/operators/vr_operator.py` 组合平台现有的 XLeVR 输入与
-LeRobot 移植过来的 `XLeVRDeltaEEMapper`，由 `A10Operator` 驱动 Cartesian
-follower。手柄产生末端局部坐标增量；算子从实际 TCP 建立参考，并在连续
-目标上累积增量，发送相对 follower 启动锚点的米／xyzw 位姿。右手摇杆可以单独
-控制可选的 USB `GripperOperator`。
-左手摇杆向上只重置 VR 映射参考，不会执行回零。
+```bash
+cd /home/robot/VLA/FluxVLA_vr
+conda activate fluxvla
+python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview
+```
 
-先用 `python -m fluxvla.projects.a10 teleop --vr-only --execute` 检查浏览器输入；
-这一路不连接机器人。普通 `teleop --execute` 需要站点配置中的
-`robot.allow_motion: true`，并在 `vr_operator` 下明确填入以下现场验证值：
+原生入口只加载上述 Python 配置，支持 MMEngine `--cfg-options`；
+不读取 `site.local.yaml`、`project.yaml` 或 `projects/a10/config.py`。
+现有环境已安装 `requirements-a10.txt` 中的依赖，网页证书在首次服务启动时创建。
 
-- `feedback_position_unit`: 控制器 `motion_msg.pq` 的平移单位，`mm` 或 `m`；
-- `max_position_step_m`、`max_rotation_step_rad`: 现场确认的单帧目标限值。
+## 2. 先验证头显输入（VR-only）
 
-`max_position_tracking_error_m`、`max_rotation_tracking_error_rad` 限制累积
-目标相对于实际 TCP 的领先量，默认 0.05 米、0.35 弧度，需结合现场条件调整。
-超过限值时停止本轮遥操作并请求退出 follower，避免机器人卡住时持续积累目标。
+将下面 `YOUR_LAN_IP` 换成运行 FluxVLA 的电脑局域网地址：
 
-这些值缺失时，算子在连接或发送运动前拒绝运行。算子不自动使能电机；
-控制器需先处于 Enabled、Stopped，启动时显式选择 Tool 坐标并确认
-Cartesian follower。退出时请求 `stop_follower` 并关闭连接；这不等同于急停。
-`received_monotonic_s` 是主机收到反馈的时间，不能证明控制器内部采样新鲜度。
-如要用 USB 夹爪，另行验证摇杆方向并配置 `vr_operator.gripper_port`。
-共享项目配置加载还要求开启运动时填写 `robot.max_joint_step_rad` 和
-`robot.gripper_mm_range`；它们不会代替上面的 VR 笛卡尔限值。
+```bash
+python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
+  --cfg-options teleop.input.network.host_ip=YOUR_LAN_IP
+```
+
+配置默认 `teleop.vr_only=True`，不构建机器人或夹爪，不连接相机。
+在头显浏览器打开终端打印的 HTTPS 地址，信任现场证书并进入 VR。
+默认端口为 HTTPS 8443、WSS 8442；`127.0.0.1` 只供本机测试，头显需要电脑的局域网地址。
+手柄映射动作每秒打印一次；Ctrl+C 或左摇杆下推退出。
+需要短时运行可覆盖 `teleop.max_steps=60`；这是循环次数，不代表有效手柄包数。
+
+## 3. 连接机器人前填写现场配置
+
+在 `a10_vr_teleop.py` 中，或通过 `--cfg-options` 设置：
+
+| 参数 | 含义 |
+| --- | --- |
+| `teleop.vr_only=False` | 开启机器人接入 |
+| `teleop.operator.host` | 控制器地址，默认本机占位地址 |
+| `teleop.operator.allow_motion=True` | 允许本会话控制机器人 |
+| `teleop.operator.feedback_position_unit` | 实际 TCP 反馈平移单位 `mm` 或 `m` |
+| `teleop.max_position_step_m` | 现场确认的每帧平移限制 |
+| `teleop.max_rotation_step_rad` | 现场确认的每帧旋转限制 |
+| `teleop.max_position_tracking_error_m` | 目标对反馈最大领先距离，默认 .05m |
+| `teleop.max_rotation_tracking_error_rad` | 最大旋转跟踪误差，默认 .35rad |
+| `teleop.operator.gripper_transport='usb'` | 可选，启用直接 USB 夹爪 |
+| `teleop.operator.gripper` | USB 参数，例如 `dict(port='现场串口', max_width_mm=85., timeout=.015)` |
+
+反馈单位和单帧限值默认未填写；缺失时运行前拒绝接入真机。
+开启工控机 follower 服务，人工确认电机 Enabled、Stopped；程序不会自动使能或回零。
+第一次握键选择 Tool 坐标并启动 Cartesian follower。退出请求 stop_follower，再关闭连接。
+关闭连接、松手保持和退出 follower 不等于物理急停。
+当前 VR 配置默认使用同步状态读取；推理配置的后台监视参数没有被改动。
+
+## 4. 诊断和待办
+
+默认逐帧诊断保存在当前工作区 `work_dirs/a10/vr/teleop_diagnostics.jsonl`，按行追加；
+包含原始手柄输入、映射动作、已读取的机器人反馈、成功写出的相对 UDP 目标、
+耗时与错误。成功写出不代表机器人已经到位；反馈时间也不是精确同步采样时间。
+关闭诊断可设 `teleop.diagnostics_path=None`。
+
+HUD 模块和反馈接口保留；录制分段、保存/重录/续录及录制 HUD 联动为下一轮工作。
+旧录制链路仍在 `projects/a10`，只反向引用新 VR 输入，旧目录不再存放另一套 VR 实现。
+旧 `python -m fluxvla.projects.a10 teleop ...` 入口明确提示新命令并退出。
+本轮未重构其他训练/回放/检查功能，未进行真实头显或机械臂联调。
 
 ## 增量迁移与握键行为
 
@@ -76,7 +122,7 @@ q_relative = inverse(q_start) * q_target   # xyzw
 ```
 
 `A10Operator.send_eepose` 接收上述相对位姿，仅负责校验和协议发送；
-`VROperator` 负责锚点保存和绝对目标转换。启动要求 Stopped，且读取启动
+`vr/runtime.py` 中的 `VRTeleopRuntime` 负责锚点保存和绝对目标转换。启动要求 Stopped，且读取启动
 确认后的 TCP 前不发送 UDP 目标，因此用该反馈保存启动锚点。每轮退出后
 清除本地锚点，重新启动重新采集。松手、再次握住和 VR 参考重置只更新内部
 目标／VR 参考，follower 锚点保持不变。机器人已经移动时，松手后的保持
@@ -90,7 +136,7 @@ follower 使用同样参数。协议迁移完成后，仍需现场比较运动�
 后的停止距离及跟随效果。
 
 录制仍由 `record` 流程负责；本命令用于遥操作，不写演示数据。XLeVR 移植
-来源和许可证见 `fluxvla/projects/a10/vr/NOTICE.md`。
+来源和许可证见 `fluxvla/engines/operators/vr/NOTICE.md`。
 
 ## 与《遥操作使用说明(1).pdf》核对
 
@@ -125,25 +171,9 @@ PDF 中的空数组示例直接用于发送。启动锚点刷新规则与完整 
 旧 `vr_vel` 的速度／加速度参数与新 follower 的点动速度配置不是同一组
 参数，不能由相同的 VR 缩放值推断两者速度或停止距离相同。
 
-## 原分支验证记录（2026-10-12）
+## 本轮验证
 
-操作器回归 76 项通过，其中 VR 22 项、A10 协议 39 项；共享 A10 原生流程
-和工作流回归另有 6 项通过。VR 测试使用真实 mapper 与回环 WS／UDP 控制器，
-检查米／xyzw 目标、40 字节报文头、反馈滞后下的位移累积、局部旋转组合、
-重复／陈旧输入、松手保持、重置参考、跟踪误差限制及启动失败清理。
-新增启动锚点旋转下的相对四元数、移动后的保持目标、锚点不受 VR 重置影响、
-重新启动刷新位置／姿态锚点的验证。
-CLI 预览与 `git diff --check` 通过。未连接实机或发送实机运动命令。
-
-原分支验证时曾缺少 `pyserial`。当前 follower 已在 `requirements-a10.txt`
-固定 `pyserial==3.5`，迁移沿用该依赖；不再需要原验证时的临时依赖路径。
-
-
-## 新分支迁入验证（2026-10-15）
-
-`kaanh_follower_vr` 已完成软件迁入：VR 专项 22 项与 A10／驱动／控制台等
-合计 124 项通过；共享项目 6 项通过（含本机 HTTPS/WSS 模拟输入）；
-推理 runner／适配 20 项通过，真实 GPU 单项默认跳过。合计 150 项通过，
-1 项跳过。日志在 `work_dirs/a10/vr_migration/20261015/`。本地 site.local
-和示例配置均可加载；VR-only 构建和命令预览通过。尚需现场核对头显输入、
-坐标方向、反馈单位、限值、松手保持及夹爪方向，再验收实机与录制联动。
+153 个不同软件测试通过：包含 VR 位姿与生命周期 22 项、新原生接口／入口 9 项、
+共享流程 HTTPS/WSS 等 6 项及既有驱动／通信／推理 runner 回归。测试拦截所有
+`fluxvla.projects` 导入后，新入口预览仍通过。日志在
+`work_dirs/a10/vr_native/20261015/`。未进行实机或真实头显验证。

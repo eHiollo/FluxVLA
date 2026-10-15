@@ -10,13 +10,13 @@ A10_new 暂时是底层运动控制后端，通过协议适配器连接。未来
 
 原 OpenPI 项目仍由团队调试。2026-10-12 已接入其合并 LoRA 的 PyTorch 导出：严格检查 metadata 和 811 个参数映射，确认 horizon=30。FluxVLA 本地与 ZMQ 推理一致；原 JAX 的逐数值对照、任务质量仍未验收。
 
-## 当前进度（2026-10-12）
+## 当前进度（2026-10-15）
 
-`kaanh_follower` 在 `/home/robot/VLA/FluxVLA_integration` 完成已提交的原生推理适配迁入，以及相机/USB 夹爪组合、六轴动作块逐帧发送。正式链路为 `scripts/inference.py → A10InferenceRunner(BaseInferenceRunner) → A10Operator(BaseOperator)`，使用原有注册器、dataset/transform 和 ZMQ 服务；不反向依赖 `projects/a10` 或其他业务仓库。
+用户确认集成目录已跑通，现将 `kaanh_follower` 的完整实现迁回 `/home/robot/VLA/FluxVLA`。迁入基准为 `b98edd2`，包含原生 Triton + CUDA Graph 加速推理。正式链路为 `scripts/inference.py → A10InferenceRunner(BaseInferenceRunner) → A10Operator(BaseOperator)`，使用原有注册器、dataset/transform 和 ZMQ 服务；原有相机、USB 夹爪、关节 follower 接口随分支保留。
 
-已完成软件模拟闭环和真实 GPU 权重的本地/ZMQ 离线推理。默认只读 dry_run，没有操作真机、SSH 或正式训练。下一步是现场核对两路相机/USB 路径、读取观测、验证动作顺序/单位和限制，再分步验收真机运行及失联行为。VR 未迁入本轮，控制器运动规划和双臂/人形仍为后续工作。
+原目录 VR 开发内容已保存至 `backup/vr-before-consolidation-20261015`（`e9e4b93`），不混入当前推理版本。模型、tokenizer、CUDA 扩展及现场配置已核对保留；迁回后的测试结果和旧工作目录清理结果见本文末尾。默认配置保留 dry_run 和运动开关。用户确认的跑通情况不替代抓取成功率、失联行为和目标跟踪质量的专项验收。
 
-下方 2026-10-09 方案和历史开发记录保留用于追踪变化；旧 TCP batch 控制不是本轮原生 follower 的运行入口。当前软件接口和操作命令见 [现场说明](a10_onsite_guide.md)。每个小任务分别提交，详细进度在本文末尾。
+下方历史方案和开发记录保留用于追踪变化，其中旧工作目录路径只代表当时的位置。当前软件接口和操作命令见 [现场说明](a10_onsite_guide.md)。每个小任务分别提交，详细进度在本文末尾。
 
 ### 2026-10-09 进度快照（历史）
 
@@ -536,3 +536,12 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 用户提供完整15轮，每轮20步，发送约0.685秒、推理约1.32秒，正常300步结束。第4轴观测残差在steps=80最高0.436069rad（24.985度）；新旧块边界目标回跳约0.429809rad（24.626度）。steps=60首末目标约 -0.7214→-1.1321rad（23.53度），steps=80观测约-0.6960、新首目标约-0.7023、末目标约-0.7074rad。现象与上一轮一致且更明显。
 - 只读通过5888查询get_speed_limit：关节手动最大速度比例30%，末端手动线速度200、末端线速度上限6000、角速度上限720（单位依回复字段）。未修改速度或发运动。该配置是否作用于Axis follower尚未确认，不能归因或据此自动提速。
 - 0.3rad检查不覆盖相对上块末目标的回跳；同时观测发生在推理前，缺少发送前实际角度，因此观测残差不代表控制器稳态误差。后续需补发送前反馈和验证保持末目标时的实际收敛，再确定块边界保护/到位等待/持续保持的处理。夹爪首目标仍接近85mm，不宣称抓取成功。本次未更改控制算法。
+
+
+### 2026-10-15：主目录迁回——备份与资源归位
+
+- 用户批准将已跑通的 integration 工作区迁回原目录；检查发现最新加速推理修改尚未提交，先备份，待用户确认已提交后以 `b98edd2` 为迁入基准。原目录现已切换到 `kaanh_follower`，完整保留 Git 历史。
+- 原目录 19 个 VR 开发文件保存为 `backup/vr-before-consolidation-20261015` 分支提交 `e9e4b93`；原 `vr` 分支指针保持。附件 `robot.7z`、PDF 和 `configs/a10/site.local.yaml` 保留在原目录。
+- 备份目录为 `/home/robot/VLA/.fluxvla_backups/20261015_consolidation`：含原修改 binary patch、原未跟踪文件压缩包、新推理修改快照、本地配置、资源核对清单及工作区信息。Git 标签 `backup/integration-before-consolidation-20261015` 指向 `cf2fb0b`，`backup/integration-latest-before-consolidation-20261015` 指向 `b98edd2`，`backup/follower-old-20261015` 指向 `f8e2985`，可恢复早期 detached 版本。
+- 已核对约 13.4GB 模型文件及 metadata/统计文件一致、三个本机 CUDA 扩展一致；补齐 tokenizer，使用本地硬链接保留文件，无需重新下载。原数据集和基础权重保留。integration 推理日志归档至 `work_dirs/a10/archive/20261015_consolidation/a10_inference.log`。
+- 现场说明的执行路径统一为 `/home/robot/VLA/FluxVLA`。现有 Conda `fluxvla` 的 editable 安装已经指向该目录，无需重装依赖。后续先进行本机回环和模型推理验证，通过后再清理三个旧工作区。

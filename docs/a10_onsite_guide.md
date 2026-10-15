@@ -9,11 +9,11 @@
 工控机的 kaanhbin 需已正常运行；已运行时不要再启动一份。以下命令在运行 FluxVLA 的机器终端执行：
 
 ```bash
-cd /home/robot/VLA/FluxVLA_integration
+cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 shell
 ```
 
-当前 **kaanh_follower** 分支位于 `/home/robot/VLA/FluxVLA_integration`。主目录 `/home/robot/VLA/FluxVLA` 的 `vr` 分支及其未提交修改保留，`FluxVLA_runner` 仍是推理迁移来源；早期 `FluxVLA_follower` 为旧版本 detached worktree。
+当前 **kaanh_follower** 分支统一在 `/home/robot/VLA/FluxVLA` 开发和运行。原 VR 未提交开发内容保存在 `backup/vr-before-consolidation-20261015` 分支；迁回前的版本和附件备份位置见迁移计划末尾。旧的独立工作目录将在迁回验证通过后移除。
 
 出现 `a10>` 后输入短指令即可。启动只连接并查询，不会自动使能、启动跟随或发送运动目标。
 
@@ -84,7 +84,7 @@ get 没有实际夹爪字段时显示“暂无反馈”，不填假数据。夹�
 ### 5. 本机模拟测试
 
 ```bash
-cd /home/robot/VLA/FluxVLA_integration
+cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -v
 ```
 
@@ -126,16 +126,16 @@ UDP wire 使用 40 字节 ARIS 消息头 + UTF-8 `jp --motor_pos=[六个度数]`
 
 ## 原生 A10 推理接入（2026-10-12）
 
-这一轮完成的是 **推理 → follower 的软件链路**。相机、夹爪和控制器的真实联动还没有验收；下面先使用只读观测模式。VR 未纳入本轮。
+当前已经接入 **相机观测 → 模型推理 → 关节 follower 与 USB 夹爪**。2026-10-15 用户确认集成目录已跑通，现统一迁回主目录；下面从只读观测开始介绍使用方法。默认配置仍为 dry_run，VR 未纳入本轮。
 
 ### 1. 进入本轮开发目录
 
 ```bash
-cd /home/robot/VLA/FluxVLA_integration
+cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 ```
 
-本目录是 `kaanh_follower` 分支的独立 worktree。`FluxVLA` 主目录仍是 `vr`，其中的未提交修改保留；`FluxVLA_runner` 是迁移来源分支。这里的脚本强制使用本目录代码，避免 editable 安装指向其他 worktree。
+本目录已统一为 `kaanh_follower` 的主工作目录，使用 `fluxvla` Conda 环境。模型服务和机器人客户端都从本目录启动；脚本仍强制优先使用本目录代码。旧终端需要先执行上面的 `cd`，避免继续停留在已移除的工作目录中。
 
 ### 2. 配置文件分别负责什么
 
@@ -228,7 +228,7 @@ Ctrl+C 请求停止当前会话的 follower 并关闭资源；`p` + Enter 在当
 用现有模型服务执行下面的只读诊断，程序会打印 30 步中最大变化发生在第几步、哪个关节、变化量与前后角度：
 
 ```bash
-cd /home/robot/VLA/FluxVLA_integration
+cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/inference.py \
   --config configs/a10/a10_remote_inference.py \

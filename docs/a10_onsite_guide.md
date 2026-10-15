@@ -154,6 +154,22 @@ USB 夹爪依赖已在 fluxvla 环境安装；新环境安装：
 python -m pip install -r requirements-a10.txt
 ```
 
+### 默认加速推理（2026-10-15）
+
+`a10_openpi_inference.py` 默认使用 `A10PI05FlowMatchingInference`，基于原生
+Triton + CUDA Graph、BF16 内核，保留 10 次去噪和 30 步预测。本机推理与按此
+配置启动的 ZMQ 服务都使用此路径；机器人端 `a10_remote_inference.py` 无需修改。
+已运行的服务需重启才能加载新配置。
+
+A10 数据预处理仍输出三视角及 `[True, False, True]` mask，模型适配器只移除无效
+左腕占位图，保留 base/right 顺序。它也将所有融合权重移到 CUDA，首次预测完成
+内核准备和图录制，此次耗时不代表稳定推理耗时。服务命令的 `--dtype fp32` 表示
+关闭外层 autocast；融合内核仍使用 BF16。
+
+Thor 上预热后 20 次测试约 100ms/次（约 10Hz，纯模型），不含机器人执行。
+相同噪声的单个样本与 FP32 对照最大关节差约 0.0044rad、夹爪差约 3.14mm；
+该结果不代表任务成功率验证。此变更保留 dry_run/allow_motion 和执行限幅配置。
+
 ### 3. 可以先只启动模型服务，不接设备
 
 ```bash

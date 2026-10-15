@@ -83,6 +83,59 @@ class A10OpenPITest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dataset(bad)
 
+    def test_accelerated_adapter_preserves_valid_views_and_rejects_bad_masks(self):
+        from fluxvla.models.vlas.a10_pi05_inference import A10PI05FlowMatchingInference
+        images = torch.cat([torch.full((1, 3, 224, 224), value)
+                            for value in (1., -1., 2.)], dim=1)
+        masks = torch.tensor([[True, False, True]])
+        tokens = torch.zeros((1, 128), dtype=torch.long)
+        language_mask = torch.zeros((1, 128), dtype=torch.bool)
+        language_mask[:, :4] = True
+        compact = A10PI05FlowMatchingInference.compact_inputs(
+            images, masks, tokens, language_mask)
+        self.assertEqual(tuple(compact.shape), (1, 6, 224, 224))
+        self.assertTrue(torch.all(compact[:, :3] == 1))
+        self.assertTrue(torch.all(compact[:, 3:] == 2))
+        with self.assertRaisesRegex(ValueError, 'base/left/right'):
+            A10PI05FlowMatchingInference.compact_inputs(
+                images, torch.ones_like(masks), tokens, language_mask)
+        language_mask[:, 2] = False
+        with self.assertRaisesRegex(ValueError, 'valid prefix'):
+            A10PI05FlowMatchingInference.compact_inputs(
+                images, masks, tokens, language_mask)
+        with self.assertRaisesRegex(ValueError, 'at most 128'):
+            A10PI05FlowMatchingInference.compact_inputs(
+                images, masks, torch.zeros((1, 129)), None)
+
+    def test_first_graph_prediction_restores_prompt_and_noise_after_capture(self):
+        from fluxvla.models.vlas.pi05_flowmatching_inference import PI05FlowMatchingInference
+        buffers = dict(observation_images_normalized=torch.zeros(2, 1),
+                       encoder_x=torch.zeros(514, 3),
+                       valid_encoder_len=torch.zeros((), dtype=torch.long),
+                       decoder_rope_weights=torch.zeros(1, 2),
+                       diffusion_noise=torch.zeros(2, 3))
+        snapshots = []
+        model = SimpleNamespace(num_views=2, _triton_bufs=buffers,
+                                _cuda_graph_ready=False,
+                                _get_decoder_rope_weights=lambda length: torch.ones(1, 2))
+        def capture():
+            buffers['encoder_x'].fill_(99)
+            buffers['diffusion_noise'].fill_(99)
+            model._cuda_graph_ready = True
+        def replay():
+            snapshots.append((buffers['encoder_x'][512:514].clone(),
+                              buffers['diffusion_noise'].clone()))
+        model._build_cuda_graph = capture
+        model._cuda_graph = SimpleNamespace(replay=replay)
+        prompt = torch.arange(6).reshape(2, 3).float()
+        noise = torch.full((2, 3), 4.)
+        for _ in range(2):
+            PI05FlowMatchingInference._triton_forward(
+                model, torch.ones(2, 1), prompt, 2, noise)
+        for actual_prompt, actual_noise in snapshots:
+            torch.testing.assert_close(actual_prompt, prompt)
+            torch.testing.assert_close(actual_noise, noise)
+
     def test_strict_mapping_rejects_shape_and_unused_weights(self):
         model = torch.nn.Linear(2, 3, bias=False)
         model._mapped_name_candidates = lambda name: [('test', 'source.' + name)]
@@ -138,6 +191,7 @@ class A10OpenPITest(unittest.TestCase):
         denorm = build_transform_from_cfg(cfg.inference.denormalize_action)
         model = build_vla_from_cfg(cfg.inference_model)
         self.assertEqual(len(list(model.parameters())), 811)
+        self.assertEqual(type(model).__name__, 'A10PI05FlowMatchingInference')
         server = create_server(model, dataset, denorm, task_suite_name='a10',
                                host='127.0.0.1', port=0, device='cuda:0',
                                mixed_precision_dtype=torch.float32)

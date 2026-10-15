@@ -22,6 +22,7 @@ import_heterogeneous_runtime_symbols(
     __name__,
     globals(),
     {
+        'a10_pi05_inference': ['A10PI05FlowMatchingInference'],
         'arm_reward_model': ['ARMRewardModel'],
         'dit4dit_vla': ['DiT4DiTVLA'],
         'groot_n17_vla': ['GrootN17VLA'],

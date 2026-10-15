@@ -507,6 +507,12 @@ class PI05FlowMatchingInference(PI05FlowMatching):
 
         if not self._cuda_graph_ready:
             self._build_cuda_graph()
+            # Warmup/capture mutate both buffers in place. The first real
+            # prediction must start from the same prompt and initial noise
+            # as subsequent calls, rather than denoising the warmup result.
+            self._triton_bufs['encoder_x'][start:start +
+                                           prompt_len].copy_(prompt_embeds)
+            self._triton_bufs['diffusion_noise'].copy_(diffusion_noise)
 
         self._cuda_graph.replay()
         return self._triton_bufs['diffusion_noise']

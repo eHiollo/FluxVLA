@@ -545,3 +545,22 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 - 备份目录为 `/home/robot/VLA/.fluxvla_backups/20261015_consolidation`：含原修改 binary patch、原未跟踪文件压缩包、新推理修改快照、本地配置、资源核对清单及工作区信息。Git 标签 `backup/integration-before-consolidation-20261015` 指向 `cf2fb0b`，`backup/integration-latest-before-consolidation-20261015` 指向 `b98edd2`，`backup/follower-old-20261015` 指向 `f8e2985`，可恢复早期 detached 版本。
 - 已核对约 13.4GB 模型文件及 metadata/统计文件一致、三个本机 CUDA 扩展一致；补齐 tokenizer，使用本地硬链接保留文件，无需重新下载。原数据集和基础权重保留。integration 推理日志归档至 `work_dirs/a10/archive/20261015_consolidation/a10_inference.log`。
 - 现场说明的执行路径统一为 `/home/robot/VLA/FluxVLA`。现有 Conda `fluxvla` 的 editable 安装已经指向该目录，无需重装依赖。后续先进行本机回环和模型推理验证，通过后再清理三个旧工作区。
+
+
+### 2026-10-15：主目录迁回——验证通过与旧工作区清理
+
+- 迁回与操作路径说明提交为 `50eccb6`。在 `/home/robot/VLA/FluxVLA` 使用现有 `fluxvla` 环境验证：通信编解码/本机回环 39 项通过，相机/夹爪/控制台/轨迹集成模拟 63 项通过，runner 和 OpenPI 适配共 21 项发现、20 项通过、1 项真实模型测试默认跳过；随后单独启用该真实 GPU 测试并通过，合计 123 个不同测试通过。
+- 真实权重验证加载 811 个参数、成功录制 Triton CUDA Graph；本地推理和实际序列化 ZMQ 收发均得到有限的 `(30,7)` 动作，固定噪声下结果一致。完整验证日志为 `work_dirs/a10/migration/20261015/gpu_zmq.log`，模拟设备测试日志为同目录 `device_tests.log`。GPU 单项用时约 72 秒，包含首次加载和图录制，不是稳定推理耗时。
+- 配置验证确认 `a10_openpi_inference.py`、`a10_remote_inference.py` 解析正常，模型、统计和 tokenizer 路径存在，默认 dry_run=True、allow_motion=False；Python 实际导入 `/home/robot/VLA/FluxVLA/fluxvla/__init__.py`。全部验证为本机测试和合成观测，不连接控制器、相机或夹爪，不发送实机动作。
+- 清理前再次确认三个旧工作区均无未提交代码，非缓存忽略文件全部保留且资源无指向旧目录的符号链接。通过 `git worktree remove` 正常移除 `FluxVLA_integration`、`FluxVLA_follower`、`FluxVLA_runner`，未使用强制删除；现在 `git worktree list` 只保留主目录 `kaanh_follower`。
+- 保留 `kaanh_a10_runner`、`vr`、VR 备份分支和全部备份标签；`lerobot`、`openpi`、`A10_new`、`XLeRobot` 不在此次清理范围。原附件仍保留为未跟踪文件。备份目录内 `cleanup-results.json` 保存三次移除的成功结果。
+- 后续模型服务和机器人客户端先执行 `cd /home/robot/VLA/FluxVLA`，再 `conda activate fluxvla`，其余启动参数沿用已验证的配置。旧目录里的终端需重新 cd，IDE 重新打开主目录；重新启动服务以保证加载当前代码。
+
+复现本次单项真实 GPU/ZMQ 验证（不接设备）：
+
+```bash
+cd /home/robot/VLA/FluxVLA
+conda activate fluxvla
+PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
+  test_a10_openpi_inference.A10OpenPITest.test_real_checkpoint_forward_and_service -q
+```

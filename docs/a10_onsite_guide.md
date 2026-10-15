@@ -13,7 +13,7 @@ cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 shell
 ```
 
-当前 **kaanh_follower** 分支统一在 `/home/robot/VLA/FluxVLA` 开发和运行。原 VR 未提交开发内容保存在 `backup/vr-before-consolidation-20261015` 分支；迁回前的版本和附件备份位置见迁移计划末尾。旧的独立工作目录将在迁回验证通过后移除。
+当前 **kaanh_follower** 分支统一在 `/home/robot/VLA/FluxVLA` 开发和运行。原 VR 未提交开发内容保存在 `backup/vr-before-consolidation-20261015` 分支；迁回前的版本和附件备份位置见迁移计划末尾。迁回验证已通过，三个旧的独立工作目录已移除；后续统一从本目录运行。
 
 出现 `a10>` 后输入短指令即可。启动只连接并查询，不会自动使能、启动跟随或发送运动目标。
 

@@ -601,3 +601,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 对照实际代码确认新 VR 通过 scripts/teleoperate.py + 原生 Python 配置 + operators/vr/runtime.py 运行；推理经 A10InferenceRunner、OpenPI 观测/模型/动作适配和 A10Operator。标明 projects/a10 剩余历史录制及训练配置依赖、新 VR 诊断不等于可训练数据集、仿真 follower 尚需协议确认。
 - README_zh-CN.md 增加入门链接，方便团队从首页找到。所有变更仅在 `/home/robot/VLA/FluxVLA_vr` 的 kaanh_follower_vr 分支完成；不改运行代码、现场配置或主目录开发内容。
 - 验证采用本地文档链接存在性、目录覆盖清单及 git diff --check；本轮为说明文档变更，无需运行设备/GPU或软件功能测试。统一提交一个中文 commit。
+
+
+### 2026-10-16：整理公司技术分享工程部分底稿
+
+- 新增 `docs/a10_engineering_share_brief.md`，面向算法、控制、软件及应用等同事，按约 10～15 分钟、9 页 PPT 组织。每页分投屏要点和讲解参考，覆盖整合动机、目标闭环、平台/控制器分工、模块组织、VR 与模型推理流程、完成度、后续路线和协作边界。
+- 复用已提交基线与既有验证记录，区分软件回归、链路运行和任务效果；历史短训练/数据规模、新 VR 输入日志、实机 300 步和 GPU 推理各注明适用范围。完整新录制、仿真 follower 与稳定抓取未写成已完成；主线正在开发的未提交 RTC/共享连接也未列为已验收成果。
+- 附常见提问、PPT 制作取舍和证据备查，避免正文堆砌路径、命令与通信细节；中文 README 的工程结构入口旁增加分享底稿链接。
+- 验证本地链接和 git diff --check；本轮仅编写文档，无设备连接、训练或推理任务。仅在 kaanh_follower_vr 统一提交一次中文 commit，主目录及其未提交开发内容保持由用户管理。

@@ -25,6 +25,8 @@ FluxVLA Engine是面向具身智能落地应用的全链路一体化工程平台
 
 第一次参与开发，可以先读 [项目结构入门说明](docs/project_structure_guide.md)：用通俗语言介绍目录职责，并串起 A10 的 VR、推理和训练流程。
 
+公司内部技术分享可参考 [A10 工程实现分享底稿](docs/a10_engineering_share_brief.md)，包含架构、流程、已完成工作和后续规划。
+
 ## 真机演示
 
 <p align="center">

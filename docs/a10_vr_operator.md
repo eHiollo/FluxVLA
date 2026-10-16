@@ -13,7 +13,7 @@ fluxvla/engines/operators/
 ├── vr_operator.py           # BaseTeleoperator + VROperator：输入、映射、事件和反馈
 ├── vr/                      # VR 底层与网页资源集中管理
 │   ├── runtime.py           # VRTeleopRuntime：循环、follower、锚点、保持与清理
-│   ├── control.py           # 新增：锚点与参考目标算法；当前仅离线验证
+│   ├── control.py           # 锚点与参考目标算法；由 reference 模式调用
 │   ├── input.py / mapper.py # 手柄输入与末端增量映射
 │   ├── monitor.py / ws_server.py / server_config.py
 │   ├── diagnostics.py / hud.py / vr_events.py / quaternion_utils.py
@@ -29,8 +29,10 @@ scripts/replay_vr_control.py  # 新增：不连接设备的参考目标回放
 `last_raw` 和 `last_action`。`send_feedback` 发送头显 HUD JSON，不表示机器人执行成功。
 `reset_reference` 清空手柄映射参考。
 
-2026-10-16 新增的控制算法尚未替换下述真实发送流程。阶段 1、2 的范围、
-C++ 数值对照、离线命令及 UDP 待确认项见 [VR 参考目标迁移记录](a10_vr_reference_migration.md)。
+2026-10-16 新增 `control_mode=reference`，默认 `delta` 仍为下述旧增量流程。
+`--observe` 可以只读反馈并计算新目标；`--inspect-controller` 不启动 VR，只查询监视端口状态。
+阶段 1～3 的范围、C++ 对照、只读命令、停止确认和 WS 不可用的现场记录见
+[VR 参考目标迁移记录](a10_vr_reference_migration.md)。新模式尚未完成实机运动验收。
 
 `VRTeleopRuntime` 组合输入与 A10Operator，保留启动锚点相对位姿、局部增量累积、
 握键/精调、松手保持、输入过期、目标及跟踪误差检查。左摇杆上推只重置参考，不回零。

@@ -564,6 +564,27 @@ class A10Operator(BaseOperator):
                     self.close()
                 raise
 
+    def wait_stopped(self, *, timeout_s=None):
+        """Confirm reported inactive follower + Stopped via fresh GET replies.
+
+        Does not issue any command or claim a hardware emergency stop. It uses
+        explicit queries rather than the monitor cache. A timeout requires
+        onsite inspection; it must never trigger automatic enable or restart.
+        """
+        budget = self.timeout_s if timeout_s is None else timeout_s
+        if isinstance(budget, bool) or not math.isfinite(budget) or budget <= 0:
+            raise ValueError('timeout_s must be positive and finite')
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+            if state.has_error:
+                raise A10ControllerError('Controller reports a fault while confirming stop')
+            info = state.raw['ret_context'].get('robot_msg', {})
+            if state.follower_active is False and info.get('motion') == 'Stopped':
+                return state
+            time.sleep(min(.02, max(0., deadline - time.monotonic())))
+        raise TimeoutError('Inactive follower and Stopped feedback were not both confirmed')
+
     def _wait_mode(self, active):
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:

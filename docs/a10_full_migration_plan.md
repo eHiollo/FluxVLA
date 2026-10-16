@@ -647,3 +647,27 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
   492 tracking、3,883 inactive，无故障，其中 2,370 帧使用名义时间；不作为实机验收。
   产物集中于 `work_dirs/a10/vr/reference_migration/`，不修改源日志或提交运行产物。
 - 本轮只完成阶段 1 的接口梳理与阶段 2 的离线实现；阶段 3 UDP 实机对照、阶段 4 录制联动待后续。
+
+### 2026-10-16：阶段 3 前端接入、只读观察和模拟 UDP 验证
+
+- 用户明确控制器只读、所有代码写在 FluxVLA，保持前后端分离。本轮在 `kaanh_follower_vr`
+  接入新参考目标路径，没有修改 0.125 的文件、配置或运行进程，没有向实机发送运动/启停指令。
+- `VRTeleopRuntime` 新增显式 `control_mode=reference` 和 `reference_options`，保留默认 delta
+  作为基线；启动前校验锚点包与输入年龄，启动后丢弃旧样本，新目标经过参考控制和逐帧变化检查后
+  使用原 A10Operator 发 UDP。mapper 原整形必须绕过，避免前端重复处理；不新增低通滤波。
+- 松手/异常时请求一次 stop_follower，新增 `A10Operator.wait_stopped()` 读取新 get 回复确认
+  follower inactive 与控制器 motion=Stopped；停止失败保留错误，不自动重试/使能/回零。
+  活动中更换锚点要求先松手再接管，不能清零命令速度后继续。Stopped 仍只是控制器报告。
+- 新增 `--observe`：强制只读，经监视端口读取真实反馈，计算候选目标，不启停 follower、不发
+  UDP/夹爪目标，不打开相机或夹爪。新增 `--inspect-controller`：不启动 VR，只向监视口请求 get，
+  成功或失败均可保存结构化报告。日志区分候选目标、实际写出目标、观察模式和停止确认。
+- 只读实查 192.168.0.125：SSH 正常，仓库 kaanh_rtc/97feb31，kaanhbin PID 2120884；
+  UDP 9998/9999、TCP 8080 在监听，WS 5888/5999 均未监听。监视连接返回 ConnectionRefusedError，
+  实际未发送 get 业务请求。没有尝试启动/重启或改配置；检查报告与 SSH 证据集中保存在
+  `work_dirs/a10/vr/reference_migration/controller_readonly.json`。
+- 新增 16 项阶段 3 集成测试，覆盖本机 WS/UDP 完整链、只读无运动、握键/释放/换锚点、
+  半启动失败、输入断开、慢反馈、停止超时及 CLI 观察预览。VR 测试合计 59 项，A10 operator
+  既有 39 项；均使用本机回环或模拟设备，不是实机验收。
+- 更新 [VR 迁移记录](a10_vr_reference_migration.md)、VR 使用说明、控制器审查文档和结构指南。
+  阶段 3 的前端与模拟验证已完成；真实反馈、UDP 内部动态与实机运动对照仍待控制器 WS 可用后确认。
+  未进入阶段 4 录制联动；本轮统一一次中文提交，用户 PDF 与 kaanh_follower 的修改保留原样。

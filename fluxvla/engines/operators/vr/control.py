@@ -3,7 +3,7 @@
 Anchor composition and the speed-only governor follow A10_new 97feb31,
 ``a10_anchor_protocol.cpp``. Velocity clamp/slew follow ``a10_vr_vel_plan.cpp``.
 The optional acceleration stage is a frontend reference experiment, not the
-controller's 500 Hz feedback/IK loop. Live runtime integration is stage 3.
+controller's 500 Hz feedback/IK loop. Hardware IO stays in vr.runtime (stage 3).
 All poses: base-frame xyz metres + quaternion xyzw; offsets: tool xyz + rotvec.
 """
 
@@ -187,7 +187,7 @@ class ReferenceGovernor:
 
 
 class VRPoseController:
-    """Offline frontend adapter consuming mapper's _xlevr.anchor_command.
+    """Pure frontend generator consuming mapper's _xlevr.anchor_command.
 
     Additional acceleration limits act on reference velocities, not servo
     feedback. Gains shape command/reference separation, not a motor feedback
@@ -207,7 +207,7 @@ class VRPoseController:
         self.fault_reason = None
 
     def start(self, startup_anchor):
-        """Offline reset representing an explicitly confirmed follower start."""
+        """Reset after confirmed follower start (or an explicitly labeled shadow anchor)."""
         self.__init__(self.config)
         self.startup_anchor = pose(startup_anchor)
         self.command_pose = self.startup_anchor.copy()

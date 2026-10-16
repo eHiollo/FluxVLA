@@ -9,6 +9,9 @@ from pathlib import Path
 _root = Path('{{fileDirname}}').resolve().parents[1]
 teleop = dict(
     vr_only=True, fps=30, max_steps=None,
+    # delta: existing baseline. reference: migrated frontend target generation.
+    # --observe reads controller feedback but never starts/sends/stops motion.
+    control_mode='delta', observe_only=False,
     diagnostics_path=str(_root / 'work_dirs/a10/vr/teleop_diagnostics.jsonl'),
     input=dict(type='VROperator', arm='right',
                network=dict(host_ip='127.0.0.1', https_port=8443,

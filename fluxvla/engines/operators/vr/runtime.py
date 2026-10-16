@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import time
 
 import numpy as np
@@ -22,9 +23,20 @@ class VRTeleopRuntime:
                  max_position_step_m=None, max_rotation_step_rad=None,
                  max_feedback_age_s=0.25, gripper_speed_mm_s=30.0,
                  max_position_tracking_error_m=0.05,
-                 max_rotation_tracking_error_rad=0.35):
+                 max_rotation_tracking_error_rad=0.35,
+                 control_mode='delta', reference_options=None, observe_only=False):
         if type(execute) is not bool:
             raise ValueError('execute must be bool')
+        if control_mode not in ('delta', 'reference'):
+            raise ValueError('control_mode must be delta or reference')
+        if type(observe_only) is not bool:
+            raise ValueError('observe_only must be bool')
+        if observe_only and (execute or control_mode != 'reference' or robot is None or gripper is not None):
+            raise ValueError('observe_only requires reference mode, a read-only robot and no gripper')
+        if observe_only and getattr(robot, 'allow_motion', False):
+            raise ValueError('observe_only requires allow_motion=false')
+        if (execute or observe_only) and getattr(robot, 'feedback_position_unit', None) not in ('mm', 'm'):
+            raise ValueError('Confirm A10 feedback_position_unit as mm or m')
         if execute:
             if robot is None or not getattr(robot, 'allow_motion', False):
                 raise ValueError('Live VR requires an A10Operator with allow_motion=true')
@@ -48,6 +60,17 @@ class VRTeleopRuntime:
         if self.teleoperator is not None:
             vr, mapper = self.teleoperator.input, self.teleoperator.mapper
         self.vr, self.mapper, self.robot, self.gripper = vr, mapper, robot, gripper
+        self.control_mode, self.observe_only = control_mode, observe_only
+        self.reference_control = None
+        if control_mode == 'reference':
+            from .control import ReferenceConfig, VRPoseController
+            if (getattr(mapper, 'position_control_mode', None) != 'safe_frame_delta'
+                    or getattr(mapper, 'motion_shaping_mode', None) != 'robot_controller'
+                    or not getattr(mapper, 'compute_anchor_shadow', False)):
+                raise ValueError('reference mode requires safe_frame_delta, anchor output, and mapper shaping bypass')
+            self.reference_control = VRPoseController(ReferenceConfig(**dict(reference_options or {})))
+        elif reference_options:
+            raise ValueError('reference_options requires control_mode=reference')
         self.diagnostics_path = diagnostics_path
         self._diagnostics = None
         self.last_frame = self.last_relative_target = None
@@ -65,6 +88,12 @@ class VRTeleopRuntime:
         self._started_follower = False
         self._connected = False
         self._last_gripper_time = None
+        self.last_reference_result = None
+        self.last_stop_status = None
+        self._reference_time = None
+        self._input_read_time = None
+        self._reference_stop_attempted = False
+        self._require_release = False
 
     def connect(self):
         """Start VR input and read-only robot connection; defer follower start."""
@@ -79,7 +108,7 @@ class VRTeleopRuntime:
                 self.teleoperator.connect()
             else:
                 self.vr.connect()
-            if self.execute:
+            if self.execute or self.observe_only:
                 self.robot.connect()
                 self._checked_frame(require_active=False)
                 if self.gripper is not None:
@@ -169,21 +198,31 @@ class VRTeleopRuntime:
         self.gripper.set_position_mm(target)
 
     def step(self):
-        if not self._connected or not self.vr.is_connected:
-            raise ConnectionError('VR input is not connected')
         self.last_relative_target = None
-        if self.teleoperator is not None:
-            action = self.teleoperator.get_action()
-            raw = self.teleoperator.last_raw
-        else:
-            raw = self.vr.get_action()
-            action = self.mapper(raw)
+        self.last_reference_result = None
         started = time.monotonic()
+        raw, action = {}, {}
         error = None
         try:
+            if not self._connected or not self.vr.is_connected:
+                raise ConnectionError('VR input is not connected')
+            if self.teleoperator is not None:
+                action = self.teleoperator.get_action()
+                raw = self.teleoperator.last_raw
+            else:
+                raw = self.vr.get_action()
+                action = self.mapper(raw)
+            self._input_read_time = time.monotonic()
             return self._step(raw, action)
         except BaseException as exc:
             error = f'{type(exc).__name__}: {exc}'
+            if self.control_mode == 'reference' and self.execute:
+                self._require_release = True
+                try:
+                    self._stop_reference()
+                except Exception as stop_error:
+                    error += f'; stop unconfirmed: {stop_error}'
+                    raise RuntimeError(error) from exc
             raise
         finally:
             if self._diagnostics is not None:
@@ -194,7 +233,10 @@ class VRTeleopRuntime:
                               feedback=self.last_frame,
                               sent_relative_target=self.last_relative_target,
                               step_elapsed_s=time.monotonic() - started,
-                              error=error, execute=self.execute)
+                              error=error, execute=self.execute,
+                              control_mode=self.control_mode, observe_only=self.observe_only,
+                              reference_control=self.last_reference_result,
+                              stop_status=self.last_stop_status)
                 self._diagnostics.write(record)
             self._frame_index += 1
 
@@ -202,6 +244,8 @@ class VRTeleopRuntime:
         """Accumulate tool deltas; release/reset/stale input replaces motion with hold."""
         if not self._connected or not self.vr.is_connected:
             raise ConnectionError('VR input is not connected')
+        if self.control_mode == 'reference':
+            return self._step_reference(raw, action)
         if raw.get('xlevr.reset_arm'):
             # LeRobot's reset/home command has no verified A10Operator equivalent.
             self.mapper.reset()
@@ -248,6 +292,159 @@ class VRTeleopRuntime:
         self._send_gripper(action)
         return action
 
+    def _stop_reference(self):
+        """Stop this session once, then confirm reported Stopped separately."""
+        if self.observe_only or not self.execute:
+            return
+        pending = self._started_follower or self.robot.follower_stop_pending
+        if not pending or self._reference_stop_attempted:
+            return
+        self._reference_stop_attempted = True
+        self.last_stop_status = dict(requested=True, mode_inactive=False, reported_stopped=False)
+        try:
+            self.robot.stop_follower()
+            self._started_follower = False
+            self.last_stop_status['mode_inactive'] = True
+            self.robot.wait_stopped()
+            self.last_stop_status['reported_stopped'] = True
+            logging.getLogger(__name__).info('参考跟随停止确认：inactive + Stopped')
+        except BaseException as exc:
+            self.last_stop_status['error'] = f'{type(exc).__name__}: {exc}'
+            raise
+        finally:
+            self._reference_time = None
+            self._target_pose = self._follower_anchor_pose = None
+            self._engaged = False
+            self._last_gripper_time = None
+
+    def _step_reference(self, raw, action):
+        """Read-only shadow or the explicitly selected new UDP control path."""
+        if not self.execute and not self.observe_only:
+            return action  # VR-only still has no fabricated robot feedback.
+        command = action.get('_xlevr.anchor_command')
+        if not isinstance(command, dict):
+            raise ValueError('reference mode requires mapper _xlevr.anchor_command')
+        active = command.get('active') is True
+        if raw.get('xlevr.reset_arm') or action.get('_xlevr.reset_arm'):
+            self._stop_reference()
+            self.mapper.reset()
+            self._require_release = True
+            self.last_reference_result = dict(state='release_required', relative_target=None)
+            return action
+        if self._require_release:
+            age = raw.get('xlevr.sample_age_s')
+            fresh = (age is not None and math.isfinite(age) and 0 <= age
+                     <= min(self.mapper.stale_timeout_s, self.reference_control.config.max_input_age_s))
+            if fresh and not active and not raw.get('xlevr.enabled', False):
+                self._require_release = False
+            self.last_reference_result = dict(state='release_required', relative_target=None)
+            return action
+        pose = self._checked_frame(require_active=self.execute and self._started_follower)
+        raw_age = raw.get('xlevr.sample_age_s')
+        input_bad = (raw_age is None or not math.isfinite(raw_age) or raw_age < 0
+                     or raw_age + max(0., time.monotonic() - self._input_read_time)
+                     > min(self.mapper.stale_timeout_s, self.reference_control.config.max_input_age_s))
+        # Mapper deactivation due to stale/invalid input is not a fresh operator
+        # release. Otherwise its inactive anchor packet could hide a fault and
+        # allow an automatic restart while the hand is still squeezing.
+        if self._reference_time is not None and (input_bad or
+                (not active and raw.get('xlevr.enabled', False))):
+            reason = ('control_gap' if time.monotonic() - self._reference_time > self.reference_control.config.max_dt_s
+                      else 'input_stale' if input_bad else 'mapper_input_rejected')
+            self.last_reference_result = dict(state='fault', fault_reason=reason,
+                                             relative_target=None, transmitted=False)
+            raise RuntimeError(f'VR reference fault: {reason}')
+        if self._reference_time is None:
+            if not active or not action.get('ee.enabled', False):
+                self.last_reference_result = dict(state='idle', relative_target=None)
+                if self.execute:
+                    self._send_fresh_gripper(raw, action)
+                return action
+            age = raw.get('xlevr.sample_age_s')
+            if age is None or not math.isfinite(age) or age < 0:
+                raise ValueError('Active VR reference requires a valid input age')
+            age += max(0., time.monotonic() - self._input_read_time)
+            if age > min(self.mapper.stale_timeout_s, self.reference_control.config.max_input_age_s):
+                raise RuntimeError('VR reference input_stale before follower start')
+            # Validate all command fields before changing any controller state.
+            from .control import AnchorState
+            AnchorState().update(command, pose)
+            if self.execute:
+                self.robot.set_tool_coordinate()
+                self._reference_stop_attempted = False
+                self.last_stop_status = None
+                self.robot.start_follower('cartesian')
+                self._started_follower = True
+                pose = self._checked_frame(require_active=True)
+            self._follower_anchor_pose = pose.copy()
+            self.reference_control.start(pose)
+            self.mapper.reset()  # Never replay a sample captured before blocking WS setup.
+            self._reference_time = time.monotonic()
+            self._target_pose = pose.copy()
+            self.last_reference_result = dict(state='await_fresh_sample',
+                                             relative_target=None if self.observe_only else [0., 0., 0., 0., 0., 0., 1.],
+                                             transmitted=False,
+                                             startup_anchor_assumed=self.observe_only)
+            if self.execute:
+                self._send_absolute_target(pose)
+                self.last_reference_result['transmitted'] = True
+            return action
+        # A fresh VR anchor appearing during a movement is not permission to
+        # reset command velocity or jump the target to measured feedback.
+        key = (command.get('session_id'), command.get('anchor_id'))
+        previous = self.reference_control.anchor.key
+        if active and previous is not None and key != previous:
+            self._stop_reference()
+            self._reference_time = None
+            self.mapper.reset()
+            self._require_release = True
+            self.last_reference_result = dict(state='release_required', relative_target=None,
+                                             reason='anchor_changed_while_engaged')
+            return action
+        now = time.monotonic()
+        age = raw.get('xlevr.sample_age_s')
+        if active and (age is None or not math.isfinite(age) or age < 0):
+            raise ValueError('Active VR reference requires a valid input age')
+        age = 0. if age is None or not math.isfinite(age) or age < 0 else age
+        age += max(0., now - self._input_read_time)
+        result = self.reference_control.step(
+            command, pose, now - self._reference_time,
+            sample_age_s=age, feedback_age_s=now - self.last_frame['received_monotonic_s'],
+            has_error=self.last_frame['has_error'])
+        result.update(observe_only=self.observe_only, transmitted=False,
+                      feedback_clock='client_receive', startup_anchor_assumed=self.observe_only)
+        self.last_reference_result = result
+        self._reference_time = now
+        if result['stop_requested']:
+            self._stop_reference()
+            self._reference_time = None
+            self.mapper.reset()
+            if result['state'] == 'fault':
+                raise RuntimeError(f"VR reference fault: {result['fault_reason']}")
+            return action
+        target = np.asarray(result['command_pose'])
+        self._check_tracking(pose, target)
+        previous_target = self._target_pose
+        if self.execute:
+            distance = np.linalg.norm(target[:3] - previous_target[:3])
+            angle = (Rotation.from_quat(previous_target[3:]).inv() * Rotation.from_quat(target[3:])).magnitude()
+            if distance > self.max_position_step_m or angle > self.max_rotation_step_rad:
+                raise ValueError('Reference command exceeds the configured step limit')
+            self.robot.send_eepose({self.robot.arm_name: result['relative_target']})
+            self.last_relative_target = np.array(result['relative_target'])
+            result['transmitted'] = True
+            self._send_fresh_gripper(raw, action)
+        self._target_pose = target.copy()
+        self._engaged = True
+        return action
+
+    def _send_fresh_gripper(self, raw, action):
+        age = raw.get('xlevr.sample_age_s')
+        if age is not None and math.isfinite(age) and 0 <= age <= self.mapper.stale_timeout_s:
+            self._send_gripper(action)
+        else:
+            self._last_gripper_time = None
+
     def run(self, *, fps=30, max_steps=None):
         """Poll until left-stick stop, Ctrl+C, or an optional test step limit."""
         if type(fps) is not int or fps <= 0:
@@ -282,7 +479,10 @@ class VRTeleopRuntime:
         try:
             if self.execute and self.robot is not None and (
                     self._started_follower or self.robot.follower_stop_pending):
-                self.robot.stop_follower()
+                if self.control_mode == 'reference':
+                    self._stop_reference()
+                else:
+                    self.robot.stop_follower()
         finally:
             self._started_follower = False
             self._connected = False
@@ -290,6 +490,7 @@ class VRTeleopRuntime:
             self._target_pose = None
             self._follower_anchor_pose = None
             self._engaged = False
+            self._reference_time = None
             try:
                 if self.gripper is not None:
                     self.gripper.disconnect()
@@ -322,15 +523,24 @@ def build_runtime(cfg):
     settings.pop('max_steps', None)
     gripper = None
     robot = None
+    observe_only = settings.get('observe_only', False)
+    if observe_only and vr_only:
+        raise ValueError('observe_only requires vr_only=false to read real controller feedback')
     if not vr_only:
         # Use the current A10 lifecycle/feedback and the shared USB gripper driver.
         # A separate gripper instance permits joystick operation before arm engagement.
-        if robot_cfg.get('gripper_transport') == 'usb':
+        if observe_only:
+            if robot_cfg.get('cameras') or robot_cfg.get('gripper') or robot_cfg.get('gripper_transport') == 'usb':
+                raise ValueError('observe_only does not open cameras or gripper devices')
+            robot_cfg['allow_motion'] = False
+            robot_cfg['ws_port'] = robot_cfg.get('status_ws_port', 5888)
+            robot_cfg['status_poll_interval_s'] = None
+        elif robot_cfg.get('gripper_transport') == 'usb':
             from ..gripper_operator import GripperOperator
             gripper = GripperOperator(**dict(robot_cfg.pop('gripper')))
             robot_cfg['gripper_transport'] = 'controller'
         robot = build_operator_from_cfg(robot_cfg)
-    return VRTeleopRuntime(vr, robot=robot, execute=not vr_only,
+    return VRTeleopRuntime(vr, robot=robot, execute=not vr_only and not observe_only,
                           gripper=gripper, **settings)
 
 
@@ -347,3 +557,59 @@ def build_vr(cfg):
                           enable_left_events=options['enable_left_events'],
                           thumbstick_event_threshold=options['thumbstick_event_threshold'])
     return operator.input, operator.mapper
+
+
+def inspect_controller(operator_cfg, *, samples=10, interval_s=.1):
+    """Read GET only, using the monitor endpoint; never create input/accessories.
+
+    This characterizes replies and client latency, not hidden follower dynamics
+    or the controller's actual sampling age. Unknown capabilities stay unknown.
+    """
+    from ..a10_operator import A10Operator
+    if type(samples) is not int or not 1 <= samples <= 100:
+        raise ValueError('samples must be an integer within 1..100')
+    if not math.isfinite(interval_s) or interval_s <= 0:
+        raise ValueError('interval_s must be positive and finite')
+    # Only transport/decoding fields enter this instance. Camera/gripper/motion
+    # options in another workflow must never leak into a read-only inspection.
+    allowed = ('host', 'timeout_s', 'udp_port', 'joint_udp_port',
+               'feedback_joint_unit', 'feedback_position_unit')
+    options = {key: operator_cfg[key] for key in allowed if key in operator_cfg}
+    options.update(ws_port=operator_cfg.get('status_ws_port', 5888), allow_motion=False)
+    robot = A10Operator(**options)
+    rows = []
+    error = None
+    attempts = 0
+    try:
+        robot.connect()
+        for index in range(samples):
+            started = time.monotonic()
+            attempts += 1
+            state = robot.get_state()
+            elapsed = time.monotonic() - started
+            context = state.raw['ret_context']
+            rows.append(dict(index=index, query_elapsed_s=elapsed,
+                             received_monotonic_s=state.received_monotonic_s,
+                             has_error=state.has_error, follower_active=state.follower_active,
+                             follower_mode=state.follower_mode,
+                             motion=context.get('robot_msg', {}).get('motion'),
+                             activation=context.get('robot_msg', {}).get('activate'),
+                             jog_coordinate=context.get('motion_msg', {}).get('jog_coordinate'),
+                             actual_joints_rad=None if state.actual_joints_rad is None else state.actual_joints_rad.tolist(),
+                             tcp_pq_raw=None if state.tcp_pq_raw is None else state.tcp_pq_raw.tolist(),
+                             tcp_pq_m=None if state.tcp_pq_m is None else state.tcp_pq_m.tolist()))
+            if index + 1 < samples:
+                time.sleep(interval_s)
+    except Exception as exc:
+        error = f'{type(exc).__name__}: {exc}'
+    finally:
+        robot.close()
+    return dict(read_only=True, query_success=error is None and len(rows) == samples,
+                error=error, get_attempts=attempts, completed_queries=len(rows),
+                commands=['get'] if attempts else [], udp_targets_sent=0,
+                host=options['host'], monitor_port=options['ws_port'],
+                feedback_position_unit=options.get('feedback_position_unit'),
+                controller_sample_age_verified=False,
+                unknown_capabilities=['cartesian_smoothing', 'target_queue',
+                                      'packet_ordering', 'stream_timeout_behavior'],
+                max_query_elapsed_s=max((row['query_elapsed_s'] for row in rows), default=None), samples=rows)

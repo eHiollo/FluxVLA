@@ -209,7 +209,7 @@ class XLeVRDeltaEEMapper:
             "position_control_mode": self.position_control_mode,
             "motion_shaping_mode": self.motion_shaping_mode,
             "motion_shaping_owner": (
-                "a10_vr_vel"
+                "downstream_controller_unverified"
                 if self.motion_shaping_mode == "robot_controller"
                 else "lerobot_a1"
             ),
@@ -765,9 +765,8 @@ class XLeVRDeltaEEMapper:
             self._command_velocity += limited_velocity_change
             delta_pos = self._command_velocity * sample_dt_s
         else:
-            # The validated A10 ``vr_vel`` loop owns low-pass/speed/acceleration
-            # shaping at 500 Hz. Keep LeRobot as a guarded coordinate mapper so
-            # the command is shaped exactly once.
+            # Bypass mapper shaping. The selected runtime/backend owns motion
+            # generation; this flag alone does not prove native UDP filtering.
             filtered_velocity = unfiltered_velocity.copy()
             speed_limited_velocity = unfiltered_velocity.copy()
             speed_limited = False

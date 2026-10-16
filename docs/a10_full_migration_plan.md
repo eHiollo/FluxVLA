@@ -592,3 +592,12 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 验证产物：VR 工作区 `work_dirs/a10/vr_native/20261015/`。系统已有编译扩展通过本地硬链接复用，不修改 Conda 的 editable 安装；测试与脚本优先导入本工作区代码。
 - 使用：先进入 `/home/robot/VLA/FluxVLA_vr`，激活 `fluxvla`，再运行 `python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview`。实际头显输入去掉 preview，并在配置中指定本机局域网 host_ip。详细说明见 `docs/a10_vr_operator.md`。
 - 本轮仅在 VR 分支统一提交一次中文 commit；下一轮先验收真实 VR 输入及现场位姿方向，再接入分段录制、保存/重录/续录与 HUD。
+
+
+### 2026-10-16：新增面向新手的工程结构说明
+
+- 按用户审核通过的方案新增 `docs/project_structure_guide.md`，按“角色和流程 → 根目录 → 核心子目录 → 配置/工具/测试 → A10实例 → 修改速查”组织，使用中文说明、目录表和文字流程图。
+- 说明覆盖框架自有目录及主要子目录，第三方模型深层实现按模型归组；区分根目录数据/权重文件与 Python 数据/模型代码，解释注册器、base 模板和运行产物，避免把目录名称误解为已经接通的功能。
+- 对照实际代码确认新 VR 通过 scripts/teleoperate.py + 原生 Python 配置 + operators/vr/runtime.py 运行；推理经 A10InferenceRunner、OpenPI 观测/模型/动作适配和 A10Operator。标明 projects/a10 剩余历史录制及训练配置依赖、新 VR 诊断不等于可训练数据集、仿真 follower 尚需协议确认。
+- README_zh-CN.md 增加入门链接，方便团队从首页找到。所有变更仅在 `/home/robot/VLA/FluxVLA_vr` 的 kaanh_follower_vr 分支完成；不改运行代码、现场配置或主目录开发内容。
+- 验证采用本地文档链接存在性、目录覆盖清单及 git diff --check；本轮为说明文档变更，无需运行设备/GPU或软件功能测试。统一提交一个中文 commit。

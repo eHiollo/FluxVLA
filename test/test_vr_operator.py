@@ -319,6 +319,22 @@ class VRTeleopRuntimeTest(unittest.TestCase):
         vr.disconnect()
         vr.disconnect()
 
+    def test_anchor_release_carries_current_input_sequence(self):
+        mapper = XLeVRDeltaEEMapper()
+        def sample(sequence, grip):
+            # VRInput already folds squeeze state into xlevr.enabled.
+            return {'xlevr.enabled': grip, 'xlevr.grip_active': grip,
+                    'xlevr.target_position': [0., 0., 0.],
+                    'xlevr.orientation_quat': [0., 0., 0., 1.],
+                    'xlevr.sample_sequence': sequence,
+                    'xlevr.sample_receive_time_s': 10. + sequence / 30.,
+                    'xlevr.sample_age_s': 0.}
+        mapper(sample(10, True))
+        mapper(sample(11, True))
+        release = mapper(sample(12, False))['_xlevr.anchor_command']
+        self.assertFalse(release['active'])
+        self.assertEqual(release['sample_sequence'], 12)
+
     def test_real_mapper_and_operator_send_accumulated_udp_pose(self):
         # A fixed actual pose deliberately simulates controller tracking lag.
         # Browser Y maps to tool X. Include a duplicate and a stale sample.

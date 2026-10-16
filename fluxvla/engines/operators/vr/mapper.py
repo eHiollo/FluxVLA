@@ -474,6 +474,13 @@ class XLeVRDeltaEEMapper:
     def action(self, action: RobotAction) -> RobotAction:
         reset_arm = bool(action.pop("xlevr.reset_arm", False))
         self._begin_diagnostics(action)
+        # Release/idle packets need the current source sequence too. Previously
+        # only the active path advanced this, leaving release at the last move.
+        sequence = action.get("xlevr.sample_sequence")
+        if type(sequence) is int and sequence >= 0:
+            self._anchor_shadow_last_transport_sequence = max(
+                self._anchor_shadow_last_transport_sequence, sequence
+            )
         if self.position_control_mode == "legacy_frame_delta":
             output = self._legacy_action(action)
         else:

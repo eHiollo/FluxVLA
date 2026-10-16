@@ -97,6 +97,7 @@ FluxVLA 的接口发送目标，底层运动规划与执行由控制器负责。
 | --- | --- |
 | [vr_operator.py](../fluxvla/engines/operators/vr_operator.py) | 小型遥操作基类和 VROperator，提供连接、读取映射动作、事件、反馈和关闭接口 |
 | [vr/runtime.py](../fluxvla/engines/operators/vr/runtime.py) | 组装 VR 与 A10，运行循环，处理 follower 启停、锚点、保持和清理 |
+| [vr/control.py](../fluxvla/engines/operators/vr/control.py) | 新迁入的锚点与参考目标计算，当前用于离线回放，尚未接管实机发送 |
 | [vr/input.py](../fluxvla/engines/operators/vr/input.py) | 从服务取得最新手柄数据 |
 | [vr/mapper.py](../fluxvla/engines/operators/vr/mapper.py) | 手柄数据转换为末端增量，包括缩放、精调、坐标映射和输入检查 |
 | `vr/monitor.py`、`vr/ws_server.py`、`vr/server_config.py` | 网页/WSS 服务、消息解析、网络和证书设置 |

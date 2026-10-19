@@ -89,6 +89,7 @@ class ReferenceRuntimeTest(unittest.TestCase):
 
     def test_new_mapping_requires_reference_and_explicit_calibration_in_preview(self):
         cfg = Config.fromfile(ROOT / 'configs/a10/a10_vr_teleop.py')
+        cfg.teleop.pose_calibration_path = None  # Never depend on a user's ignored site calibration.
         old = build_runtime(cfg.teleop)
         self.assertEqual(old.pose_mapping, 'anchor_relative')
         cfg.teleop.pose_mapping = 'calibrated_absolute'

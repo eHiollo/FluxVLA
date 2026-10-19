@@ -666,7 +666,7 @@ def calibrate_pose(cfg, *, output_path, countdown=5, duration_s=1., prompt=None,
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     print(f'标定已保存：{output_path}（{report["quality"]["sample_count"]} 对姿态）', flush=True)
-    print('该结果同时固定平移方向；请先用 --observe 检查方向，再开始实机遥操作。', flush=True)
+    print('这只完成参数拟合；请先用 --verify-calibration 核对现场方向，不能仅凭采样误差认定标定正确。', flush=True)
     return report
 
 

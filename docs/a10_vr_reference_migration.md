@@ -566,3 +566,54 @@ J5 最后回传值约 -13.20°；奇异点由控制器明确报告，不仅是�
 
 独立摘要：work_dirs/a10/vr/two_trials_1634_1635_analysis.json（Git 忽略）。
 本轮未开发或执行新的对齐算法，不应继续按原命令重复实机验证。
+
+## 2026-10-19：新增只读标定验证网页
+
+### 实现范围
+
+- 在 `kaanh_follower_vr` 新增 `--verify-calibration`，与观察、检查、标定入口互斥。
+- `vr/calibration_view.py` 集中管理只读采样、绝对目标计算和线程安全网页快照；复用
+  `CalibratedAnchorState` 的 B*H*C 和平移锚点，不运行 reference governor、IK 或运动生命周期。
+- 机器人使用白名单构造的监视连接，强制 `allow_motion=False`，过滤相机、USB 夹爪和状态轮询配置。
+  启动、运行及关闭只查询 get / 关闭连接，不调用坐标切换、使能、follower、UDP 目标或夹爪接口。
+- 复用现有 HTTPS 服务，新增 `/calibration.html`、只读 `/api/calibration-view`。
+  电脑观察页不接入手柄 WebSocket，关闭观察页不会触发 VR 输入客户端释放逻辑。
+- 网页使用原生 Canvas 投影绘制简化夹爪，叠加实际/目标姿态、前/上箭头和射线，单独显示平移。
+  支持调整观察角度、冻结历史帧、人工逐项记录、下载一份含样本的 JSON 报告；不持续写新日志或覆盖标定。
+- 实际射线从 A-Frame 运行时 raycaster.direction 读取（包括设备偏置），不是默认猜测 -Z。
+  新增诊断元数据贯穿网页→WS→VRInput；使用当前 XRFrame 的有效手柄追踪状态，旧页面缺字段会明确报错。
+- 默认 TCP +Z 前、+X 上仅作为待确认的旧约定；允许选择正负坐标轴并拒绝前/上共轴。
+  修改显示轴不更改标定，且清空旧人工结果，避免把旧判断用于新定义。
+- 反馈故障、运动中、follower 运行、VR 追踪失效或样本过期时清除实时姿态；即使采样阻塞，
+  HTTP 快照也按时间失效。冻结帧保持历史标签，连接状态继续更新。
+
+### 验证记录
+
+- 回归命令：
+
+  ```bash
+  PYTHONPATH=test /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+    test_a10_operator test_vr_reference_runtime test_vr_operator test_vr_control \
+    test_vr_calibration test_vr_native_entry test_vr_calibration_view
+  ```
+
+- 共 **129 项通过**（35.175 秒），其中新增 9 项覆盖大角度无 governor 故障、非交换旋转、
+  q/-q、射线映射、平移重新接管、过期/错误/回退、元数据传递、HTTP 与预览入口。
+- 本地模拟 WebSocket 控制器验证：即使传入 allow_motion=True、相机和 USB 夹爪配置，
+  实际命令集合仍只有 `get`，两路 UDP 均未收到数据，标定文件 SHA256 不变。
+- 修复一项旧测试对未跟踪现场标定文件的依赖：配置校验测试显式关闭本地文件加载，
+  不改用户的现场文件，也不更改生产配置加载逻辑。
+- JavaScript 语法及 7 项射线/追踪辅助检查通过。Firefox 本地模拟网页已验证实时绘图、
+  冻结、逐项样本记录、报告导出及切换轴后清空记录；截图在忽略目录
+  `work_dirs/a10/vr/browser_check/view_live.png`，使用的是明确的模拟姿态。
+
+### 当前限制与现场下一步
+
+本轮没有连接 0.125 或使机械臂运动；VR 真设备射线、夹爪物理轴和现场坐标对应仍待用户只读核对。
+射线与目标共用 B，它们重合不能独立证明 B 正确；应以实际夹爪和现场已知方向作独立参照。
+原单姿态标定算法、初始对齐、控制器奇异点/关节速度/停止问题本轮没有修改，也没有被网页检查证明通过。
+入口与五项检查步骤见 `docs/a10_vr_operator.md`。
+
+按用户追加需求，新增精简入口 `docs/a10_command_cheatsheet.md`，集中区分只读标定验证、
+VR-only、预览和控制器状态检查，注明旧观察/标定入口的区别；使用说明顶部增加链接。
+速查表优先展示当前需要的只读命令，避免把未验收的实机绝对控制命令当作默认流程。

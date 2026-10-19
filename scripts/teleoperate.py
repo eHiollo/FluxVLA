@@ -17,6 +17,8 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--observe', action='store_true',
                         help='只读观察：读取机器人反馈并计算 reference 目标，不启动跟随或发送目标')
+    mode.add_argument('--verify-calibration', action='store_true',
+                      help='只读标定验证网页：显示实际与期望姿态，不运行 reference 或发送运动指令')
     mode.add_argument('--inspect-controller', action='store_true',
                         help='仅从监视端口读取 get 状态，不启动 VR 或任何运动')
     mode.add_argument('--calibrate-pose', action='store_true',
@@ -66,6 +68,17 @@ def main(argv=None):
             args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + '\n')
         print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
         return 0 if report['query_success'] else 1
+    if args.verify_calibration:
+        from fluxvla.engines.operators.vr.calibration_view import build_calibration_view
+        view = build_calibration_view(cfg.teleop)
+        if args.preview:
+            print('只读标定验证配置有效；未启动服务或连接设备。')
+            return 0
+        try:
+            view.run(max_steps=cfg.teleop.get('max_steps'))
+        except KeyboardInterrupt:
+            print('\n只读验证已关闭；未发送运动指令，标定文件未改动。')
+        return 0
     if args.observe:
         cfg.teleop.update(vr_only=False, observe_only=True, control_mode='reference')
     runtime = build_runtime(cfg.teleop)

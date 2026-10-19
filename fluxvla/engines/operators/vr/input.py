@@ -44,6 +44,7 @@ class VRInput:
         self._vr_thread: threading.Thread | None = None
         self._connected = False
         self._vr_event_handler: VREventHandler | None = None
+        self.calibration_view = None
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -60,6 +61,8 @@ class VRInput:
             "xlevr.sample_sequence": int,
             "xlevr.source_timestamp": float,
             "xlevr.reset_arm": bool,
+            "xlevr.ray_direction_local": list,
+            "xlevr.verification_tracking": bool,
         }
 
     @property
@@ -93,6 +96,7 @@ class VRInput:
         deadline = time.time() + self.config.connection_timeout
         while time.time() < deadline:
             if self._vr_monitor.initialize():
+                self._vr_monitor.https_server.calibration_view = self.calibration_view
                 init_ok = True
                 break
             time.sleep(0.1)
@@ -142,11 +146,16 @@ class VRInput:
         if host == '0.0.0.0':
             host = get_local_ip()
         https_port = self._vr_monitor.config.https_port
+        guide = (
+            '  只读标定验证：手柄转动只改变网页目标；侧键仅记录平移锚点，不控制机械臂或夹爪'
+            if self.calibration_view is not None else
+            '  右手 squeeze=粗调，前扳机=精调，右手摇杆 x 控制夹爪\n'
+            '  左手摇杆：上=重置参考，下=停止；右/左的录制事件由录制流程处理'
+        )
         print(
             f"[XLeVR] Teleoperator 已连接，等待 VR 浏览器...\n"
             f"  打开: https://{host}:{https_port}\n"
-            f"  右手 squeeze=粗调，前扳机=精调，右手摇杆 x 控制夹爪\n"
-            f"  左手摇杆：上=重置参考，下=停止；右/左的录制事件由录制流程处理",
+            f"{guide}",
             flush=True,
         )
         logger.info("XLeVR ready. Open https://%s:%s in your VR browser.", host, https_port)
@@ -239,6 +248,8 @@ class VRInput:
             "xlevr.sample_sequence": sample_sequence,
             "xlevr.source_timestamp": source_timestamp,
             "xlevr.reset_arm": reset_arm,
+            "xlevr.ray_direction_local": metadata.get("ray_direction_local"),
+            "xlevr.verification_tracking": metadata.get("verification_tracking"),
         }
 
     def get_vr_events(self) -> dict[str, bool]:
@@ -273,6 +284,8 @@ class VRInput:
             "xlevr.sample_sequence": -1,
             "xlevr.source_timestamp": -1.0,
             "xlevr.reset_arm": False,
+            "xlevr.ray_direction_local": None,
+            "xlevr.verification_tracking": None,
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:

@@ -12,9 +12,34 @@ function readGripPressed(button, wasPressed) {
                     : button.value >= GRIP_PRESS_THRESHOLD;
 }
 
+// Read the actual laser configuration, including device/model offsets.
+// Missing raycaster is unknown, never silently replaced with local -Z.
+function readRayDirectionLocal(hand) {
+  const ray = hand?.components?.raycaster;
+  const d = ray?.data?.direction;
+  if (!d || ray.data.useWorldCoordinates) return null;
+  const length = Math.hypot(d.x, d.y, d.z);
+  return Number.isFinite(length) && length > 0
+    ? [d.x / length, d.y / length, d.z / length] : null;
+}
+
+function readVerificationTracking(hand, handedness) {
+  const xr = hand?.sceneEl?.renderer?.xr;
+  const session = xr?.getSession?.(), frame = xr?.getFrame?.();
+  const reference = xr?.getReferenceSpace?.();
+  const source = Array.from(session?.inputSources || []).find(s => s.handedness === handedness);
+  if (!frame || !reference || !source || !hand.object3D.visible) return false;
+  try { return !!frame.getPose(source.gripSpace || source.targetRaySpace, reference); }
+  catch (_) { return false; }
+}
+
 AFRAME.registerComponent('controller-updater', {
   init: function () {
     console.log("Controller updater component initialized.");
+    if (window.FLUXVLA_VERIFY_ONLY) {
+      document.querySelector('#modeNotice').textContent =
+        '只读标定验证：只显示目标，不控制机械臂或夹爪。电脑打开 /calibration.html；侧键仅记录平移锚点。';
+    }
     // Controllers are enabled
 
     this.leftHand = document.querySelector('#leftHand');
@@ -588,6 +613,8 @@ AFRAME.registerComponent('controller-updater', {
         // Collect left controller data
         leftController.position = { x: leftPos.x, y: leftPos.y, z: leftPos.z };
         leftController.rotation = { x: leftRotX, y: leftRotY, z: leftRotZ };
+        leftController.rayDirectionLocal = readRayDirectionLocal(this.leftHand);
+        leftController.verificationTracking = readVerificationTracking(this.leftHand, 'left');
         leftController.quaternion = {
           x: this.leftHand.object3D.quaternion.x,
           y: this.leftHand.object3D.quaternion.y,
@@ -666,6 +693,8 @@ AFRAME.registerComponent('controller-updater', {
         // Collect right controller data
         rightController.position = { x: rightPos.x, y: rightPos.y, z: rightPos.z };
         rightController.rotation = { x: rightRotX, y: rightRotY, z: rightRotZ };
+        rightController.rayDirectionLocal = readRayDirectionLocal(this.rightHand);
+        rightController.verificationTracking = readVerificationTracking(this.rightHand, 'right');
         rightController.quaternion = {
           x: this.rightHand.object3D.quaternion.x,
           y: this.rightHand.object3D.quaternion.y,

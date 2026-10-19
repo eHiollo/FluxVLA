@@ -359,6 +359,8 @@ class VRWebSocketServer(BaseInputProvider):
                         "relative_position": False,
                         "vr_position": position_array.tolist(),
                         "scaled_position": absolute_position.tolist(),
+                        "ray_direction_local": data.get("rayDirectionLocal"),
+                        "verification_tracking": data.get("verificationTracking"),
                     },
                 ),
             )

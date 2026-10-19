@@ -78,8 +78,20 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == '/vr-config.js':
-            content = f'window.FLUXVLA_WS_PORT={int(self.server.config.websocket_port)};'.encode()
+        view = getattr(self.server, 'calibration_view', None)
+        if self.path == '/api/calibration-view' and view is not None:
+            import json
+            content = json.dumps(view.snapshot(), ensure_ascii=False, allow_nan=False).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(content)
+        elif self.path == '/calibration.html' and view is not None:
+            self.serve_file('web-ui/calibration.html', 'text/html; charset=utf-8')
+        elif self.path == '/vr-config.js':
+            content = (f'window.FLUXVLA_WS_PORT={int(self.server.config.websocket_port)};'
+                       f'window.FLUXVLA_VERIFY_ONLY={str(view is not None).lower()};').encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/javascript')
             self.end_headers()
@@ -123,7 +135,7 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
                     content = file_obj.read()
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
-                if content_type in ("text/html", "application/javascript", "text/css"):
+                if content_type.startswith(("text/html", "application/javascript", "text/css")):
                     self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(content)
@@ -140,11 +152,13 @@ class SimpleHTTPSServer:
         self.httpd = None
         self.server_thread = None
         self.web_root_path = web_root_path
+        self.calibration_view = None
 
     async def start(self):
         self.httpd = ReuseHTTPServer((self.config.host_ip, self.config.https_port), SimpleAPIHandler)
         self.httpd.web_root_path = self.web_root_path
         self.httpd.config = self.config
+        self.httpd.calibration_view = self.calibration_view
 
         if not self.config.ensure_ssl_certificates():
             raise RuntimeError("Cannot create VR TLS certificate")

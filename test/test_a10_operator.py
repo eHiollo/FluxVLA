@@ -6,9 +6,11 @@ import threading
 import time
 import struct
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from fluxvla.engines import build_operator_from_cfg
 from fluxvla.engines.operators.a10_operator import (
@@ -304,6 +306,57 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_pe321_preserves_signed_angles_against_native_sdk_samples(self):
+        fixture = json.loads((Path(__file__).parent / 'data/vr_control/kaanh_cartesian_wire.json').read_text())
+        # Native SDK pq -> pe changes -0.01 degrees into +359.99 degrees.
+        self.assertGreater(fixture['cases'][0]['sdk_pq_to_pe321'][3], 6.)
+        with FakeController() as controller:
+            operator = controller.operator(cartesian_wire_format='pe321')
+            operator.start_follower()
+            for case in fixture['cases']:
+                operator.send_eepose({'right': case['pose']})
+                packet = controller.udp.recv(4096)
+                self.assertEqual(packet[4:40], bytes(36))
+                self.assertEqual(int.from_bytes(packet[:4], 'little'), len(packet) - 40)
+                payload = json.loads(packet[40:])
+                self.assertEqual(set(payload), {'type', 'pe'})
+                self.assertEqual(payload['type'], '321')
+                np.testing.assert_allclose(payload['pe'][0], case['signed_pe321'], atol=1e-14)
+                self.assertLess(case['sdk_matrix_max_error'], 1e-12)
+            operator.stop_follower()
+
+    def test_pe321_unwraps_pi_and_resets_on_new_follower_start(self):
+        with FakeController() as controller:
+            operator = controller.operator(cartesian_wire_format='pe321')
+            operator.start_follower()
+            for yaw in (60., 120., 179., -179.):
+                pose = [0., 0., 0., *Rotation.from_euler('Z', yaw, degrees=True).as_quat()]
+                operator.send_eepose({'right': pose})
+                payload = json.loads(controller.udp.recv(4096)[40:])
+            self.assertAlmostEqual(np.rad2deg(payload['pe'][0][3]), 181.)
+            operator.stop_follower()
+            operator.start_follower()
+            operator.send_eepose({'right': [0., 0., 0., 0., 0., 0., 1.]})
+            np.testing.assert_allclose(json.loads(controller.udp.recv(4096)[40:])['pe'], [[0.] * 6])
+            operator.stop_follower()
+
+    def test_pe321_rejects_singular_or_large_euler_jumps_before_udp(self):
+        with FakeController() as controller:
+            operator = controller.operator(cartesian_wire_format='pe321')
+            operator.start_follower()
+            for angles, error in (([0., 90., 0.], UserWarning), ([100., 0., 0.], ValueError)):
+                pose = [0., 0., 0., *Rotation.from_euler('ZYX', angles, degrees=True).as_quat()]
+                with self.assertRaises(error):
+                    operator.send_eepose({'right': pose})
+                with self.assertRaises(socket.timeout):
+                    controller.udp.recv(4096)
+            np.testing.assert_array_equal(operator._cartesian_euler, np.zeros(3))
+            operator.stop_follower()
+
+    def test_invalid_cartesian_wire_format_rejected_without_connecting(self):
+        with self.assertRaisesRegex(ValueError, 'cartesian_wire_format'):
+            A10Operator(host='127.0.0.1', cartesian_wire_format='guess')
+
     def test_joint_roundtrip_wire_degrees_and_separate_ports(self):
         with FakeController() as controller:
             controller.coordinate = 'Axis'

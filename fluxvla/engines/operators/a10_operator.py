@@ -15,10 +15,12 @@ import socket
 import struct
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Mapping
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from ..utils.root import OPERATORS
 from .base_operator import BaseOperator
@@ -291,6 +293,8 @@ class A10Operator(BaseOperator):
     ``send_eepose({'right': pose})`` expects startup-anchor-relative xyz metres
     + xyzw: T_relative = inverse(T_start) * T_target. Each follower start
     refreshes the controller anchor; [0,0,0,0,0,0,1] holds that startup pose.
+    ``cartesian_wire_format='pe321'`` keeps this public input and encodes signed
+    Euler ZYX radians in ``type=321, pe`` to avoid the SDK pq angle wrap.
     ``send_joints({'right': joints})`` expects six absolute joint angles in
     radians. They are converted to degrees in UDP ``jp --motor_pos=[...]``;
     the gripper remains a separate command. Only the selected follower mode
@@ -319,7 +323,8 @@ class A10Operator(BaseOperator):
                  trajectory_feedback_interval_s=0.1,
                  trajectory_feedback_timeout_s=0.1,
                  trajectory_max_lateness_s=None, status_poll_interval_s=None,
-                 status_max_age_s=0.5, status_ws_port=5888):
+                 status_max_age_s=0.5, status_ws_port=5888,
+                 cartesian_wire_format='pq'):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -330,6 +335,8 @@ class A10Operator(BaseOperator):
             raise ValueError('Cartesian and joint UDP ports must differ')
         if command_mode not in _FOLLOWER_MODES:
             raise ValueError('command_mode must be cartesian or joint')
+        if cartesian_wire_format not in ('pq', 'pe321'):
+            raise ValueError('cartesian_wire_format must be pq or pe321')
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError('timeout_s must be positive and finite')
         if type(allow_motion) is not bool or not isinstance(arm_name, str) or not arm_name:
@@ -388,6 +395,8 @@ class A10Operator(BaseOperator):
         self.gripper_feedback_path = gripper_feedback_path
         self.timeout_s = float(timeout_s)
         self.command_mode = command_mode
+        self.cartesian_wire_format = cartesian_wire_format
+        self._cartesian_euler = np.zeros(3)
         self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s,
                                                joint_udp_port)
         self._status_connection = None
@@ -458,6 +467,7 @@ class A10Operator(BaseOperator):
             self._confirmed_active = self._started_here = False
             self._start_confirmed = False
             self._follower_mode = None
+            self._cartesian_euler = np.zeros(3)
             errors = []
             closers = [self._connection.close]
             if self.camera_operator is not None:
@@ -575,6 +585,7 @@ class A10Operator(BaseOperator):
         if isinstance(budget, bool) or not math.isfinite(budget) or budget <= 0:
             raise ValueError('timeout_s must be positive and finite')
         deadline = time.monotonic() + budget
+        state = None
         while time.monotonic() < deadline:
             state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
             if state.has_error:
@@ -583,7 +594,12 @@ class A10Operator(BaseOperator):
             if state.follower_active is False and info.get('motion') == 'Stopped':
                 return state
             time.sleep(min(.02, max(0., deadline - time.monotonic())))
-        raise TimeoutError('Inactive follower and Stopped feedback were not both confirmed')
+        info = {} if state is None else state.raw['ret_context'].get('robot_msg', {})
+        raise TimeoutError(
+            'Inactive follower and Stopped feedback were not both confirmed; '
+            f'last follower_active={None if state is None else state.follower_active}, '
+            f'motion={info.get("motion")}, activate={info.get("activate")}. '
+            'Confirm stopping on the controller; do not restart motion.')
 
     def _wait_mode(self, active):
         deadline = time.monotonic() + self.timeout_s
@@ -699,6 +715,7 @@ class A10Operator(BaseOperator):
             self._confirmed_active = False
             self._follower_mode = feedback_mode
             self.command_mode = mode
+            self._cartesian_euler = np.zeros(3)
             try:
                 self._connection.send_command(command)
                 return self._wait_mode(True)
@@ -733,13 +750,32 @@ class A10Operator(BaseOperator):
             return state
 
     def send_eepose(self, arm_targets):
-        """Send one startup-anchor-relative pose in metres/xyzw for the arm."""
+        """Accept metres/xyzw; optionally encode signed, continuous Euler 321.
+
+        KAANH 2.5.7's pq receiver maps negative yaw/roll to near 2*pi before
+        scalar filtering/planning. The 321/pe receiver preserves signed angles.
+        """
         if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
             raise ValueError(f'Expected exactly one arm: {self.arm_name}')
         pose = _pose(arm_targets[self.arm_name])
-        payload = json.dumps({'type': 'pq', 'pq': [pose.tolist()]},
-                             separators=(',', ':'), allow_nan=False).encode('utf-8')
-        self._send_follower_target(_pack(payload, command=False), 'Cart')
+        with self._io_lock:
+            euler = None
+            data = {'type': 'pq', 'pq': [pose.tolist()]}
+            if self.cartesian_wire_format == 'pe321':
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('error', message='Gimbal lock detected.*', category=UserWarning)
+                    euler = Rotation.from_quat(pose[3:]).as_euler('ZYX')
+                # Preserve yaw/roll continuity across +/-pi. Ambiguous Euler
+                # branch changes must stop rather than command a large turn.
+                delta = (euler - self._cartesian_euler + np.pi) % (2 * np.pi) - np.pi
+                if np.max(np.abs(delta)) > np.pi / 2:
+                    raise ValueError('Cartesian Euler branch jump exceeds pi/2; refusing target')
+                euler = self._cartesian_euler + delta
+                data = {'type': '321', 'pe': [np.r_[pose[:3], euler].tolist()]}
+            payload = json.dumps(data, separators=(',', ':'), allow_nan=False).encode('utf-8')
+            self._send_follower_target(_pack(payload, command=False), 'Cart')
+            if euler is not None:
+                self._cartesian_euler = euler.copy()
 
     def _send_follower_target(self, packet, mode):
         with self._io_lock:

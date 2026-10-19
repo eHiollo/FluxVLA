@@ -43,6 +43,8 @@ teleop = dict(
     operator=dict(type='A10Operator', host='127.0.0.1',
                   ws_port=5999, udp_port=9998, joint_udp_port=9999,
                   command_mode='cartesian', allow_motion=False,
+                  # Preserve small negative angles; SDK pq normalizes them to ~2*pi.
+                  cartesian_wire_format='pe321',
                   feedback_position_unit=None,
                   # Optional USB gripper: use gripper_transport='usb' and
                   # gripper=dict(port='YOUR_DEVICE', max_width_mm=85., timeout=.015).

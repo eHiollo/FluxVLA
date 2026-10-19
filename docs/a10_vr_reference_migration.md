@@ -286,3 +286,78 @@ python -m unittest discover -s test -p test_a10_operator.py -q
 
 下一步仍属于阶段 3：控制器侧 WS 可用后先读反馈，确认单位和采样语义；在不改后端的前提下
 完成只读观察。真实移动、松手停稳和原生 UDP 动态对照需另行安排现场验证。
+
+
+## 2026-10-19 现场旋转异常排查与前端修复
+
+### 现场证据
+
+- 工作区/分支：`FluxVLA_vr / kaanh_follower_vr`。控制器 `192.168.0.125` 全程只读，
+  未修改文件、重启进程、清错、使能或发送运动目标。
+- 11:47:40 启动，VR 浏览器 `192.168.0.186` 已连接。最近会话共 5343 行，
+  真正向 UDP 下发 17 个目标（含初始保持），有效目标发送跨度约 0.51 秒。
+- 下发最后目标的旋转向量约 `[0.447, 0.626, -0.585]` 度，总角度约 0.97 度；
+  最后一帧运动反馈的第 6 轴相对启动约 +1.28 度。前端日志未覆盖停止等待期间的运动。
+  右手摇杆 x/y 在这些帧都为零，握持键有效且手柄姿态在变化；当前证据不是夹爪摇杆映射到腕部。
+- 11:50:38 控制器 SYSLOG ID 1359：收到“停止跟随”。前端记录模式 inactive 已确认，
+  但 `wait_stopped()` 未确认 `motion=Stopped`，约 11:50:40 退出并关闭 VR。
+- 11:50:45 SYSLOG ID 1360，错误 -503：电机 6 超出正限位，允许最大位置
+  `3.054326 rad`（约 175 度），目标位置 `3.054850 rad`。这是**规划目标**越限，
+  不能写成已经测得实际机械角度到达该值。
+- 此时段 kernel journal 没有上次 11:37 的 EtherCAT 掉线记录。后续监视端口查询被拒绝，
+  再次只读检查时 kaanhbin 已不在运行，未自行重启。
+
+### 当前实际接口与此前审查版本的差异
+
+`/home/kaanh/A10_new` 仍为 kaanh_rtc / 97feb31，但运行目录
+`/home/kaanh/A10_new/build/bin/kaanh.xml` 已包含 `A10UdpFollower` 与 `A10JointFollower`。
+相应新增源码位于 `.worktrees/kaanh-integration`，分支 kaanh_test，HEAD 1f1a056。
+不能再仅凭主工作区 Git HEAD 判断运行实现；本轮没有证明磁盘源码与已结束的进程逐字一致。
+包装层只替换关节 UDP 回调，Cartesian 回调仍由安装的 KAANH 2.5.7 库提供。
+
+SDK 库 SHA256：`fbd638320e3025f5e3c4ec8ec8d9761c5f8499a7c69a96123b05dce039eb52b5`。
+本地静态分析及纯数学验证发现：
+
+1. pq 路径调用 `s_pq2pe(..., "321")`，转换得到的 yaw/roll 负角会加 2π。
+   对库的纯数学函数输入绕 z 轴 -0.01 度，输出为 +359.99 度；-1 度变为 +359 度。
+   没有创建机器人、模型或控制器对象。
+2. 接收器在欧拉分量上调用 LowPass，再把结果放入队列。执行路径按欧拉分量调用
+   MoveAbsolute2，之后转回位姿。它并非直接在四元数上按最短路径插值。
+3. 接收 `type="321", pe=[...]` 的分支直接使用输入六维向量，不经过上述 pq 归一化。
+   因此换发四元数的符号 q/-q、继续减小负角度或只降低前端速度，都不能消除原 pq 路径的分支跳变。
+
+上述证据支持“微小负角度被解释为接近一整圈，再进入滤波/规划”是本次异常的主要原因。
+缺少控制器逐周期轨迹，不能声称已完整复现第 6 轴后续运动和停止路径全部细节。
+
+### 本轮修改
+
+- `a10_operator.py`：增加可选 `cartesian_wire_format='pe321'`；公共输入仍为米/xyzw，
+  在线编码为带符号的 Euler ZYX（321）弧度。yaw/roll 连续展开，跨 ±π 时不跳整圈；
+  遇到欧拉奇异或单包欧拉分支变化大于 π/2 时拒绝发送。角度状态只在发送成功后推进，
+  并在开始新 follower/关闭连接时重置。
+- VR 配置显式使用 pe321，通用 operator 的 pq 默认保持兼容。推理关节通道不受影响。
+- 停止条件仍要求 inactive 和 Stopped 同时满足。超时提示补充最后模式、运动与使能状态，
+  VR 终端明确提示“停止未确认”，不自动重新跟随、掉使能或放宽保护。
+- JSONL 增加 `cartesian_wire_format`，`sent_relative_target` 仍记录内部米/xyzw 目标，
+  不冒充实际 UDP 字节或控制器已到位。
+- `test/data/vr_control/kaanh_cartesian_wire.json` 保存 SDK 纯数学样本。
+  带符号 pe321 经 SDK 转换后与原四元数矩阵最大差约 `1.11e-16`。
+
+### 验证与剩余工作
+
+回归覆盖负角度 UDP 完整报文、SDK 坐标样本、跨 ±π 连续性、新会话重置、奇异与大分支
+跳变零发送，以及 inactive 但 motion=Moving 必须停止确认失败。既有 pq 编码测试保留。
+
+验证命令（仅回环网络和合成输入）：
+
+```bash
+PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
+  /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+  test_a10_operator test_vr_reference_runtime test_vr_operator test_vr_control
+```
+
+结果：**93 项通过**，耗时约 12 秒；当前环境未装 pytest，使用已有 unittest，未新增依赖。
+
+**修复尚未再次实机验收。** 控制器侧仍需核对 stop_follower 在 Cartesian 模式下的
+取消/减速契约及断流行为。此次超时不能简单归因于“2 秒太短”，也不能用自动重试替代停止确认。
+恢复现场时先确认第 6 轴位置及停止状态，排除报警后再进行小范围验收；不自动返回初始姿态。

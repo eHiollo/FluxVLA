@@ -332,6 +332,9 @@ class ReadOnlyProtocolTest(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 robot.wait_stopped(timeout_s=.04)
             server.active = False
+            server.motion = 'Moving'
+            with self.assertRaisesRegex(TimeoutError, 'follower_active=False, motion=Moving'):
+                robot.wait_stopped(timeout_s=.04)
             server.driver_fault = True
             with self.assertRaises(A10ControllerError):
                 robot.wait_stopped()

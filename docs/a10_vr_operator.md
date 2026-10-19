@@ -6,6 +6,22 @@ VR 开发在 `kaanh_follower_vr`，当前独立工作区为 `/home/robot/VLA/Flu
 主目录 `/home/robot/VLA/FluxVLA` 仍属于 `kaanh_follower`，其中的现场修改由用户管理。
 在 IDE 打开 VR 工作区即可查看本轮代码；此工作区沿用现有 `fluxvla` Conda 环境。
 
+### 2026-10-19 现场旋转异常修复
+
+11:50 的现场会话出现第 6 轴持续旋转和松手后停止确认超时。只读对照控制器日志后，
+确认 11:50:38 已收到“停止跟随”，11:50:45 又报第 6 轴目标正限位（-503）。
+**跟随模式 inactive 不代表机械臂已停止。** 详细证据和待验收项见
+[参考目标迁移记录](a10_vr_reference_migration.md#2026-10-19-现场旋转异常排查与前端修复)。
+
+当前 VR 配置选用 `teleop.operator.cartesian_wire_format='pe321'`：内部仍是 xyz 米和
+xyzw 四元数，只有 UDP 编码转换为 `{"type":"321","pe":[[x,y,z,yaw,pitch,roll]]}`，
+角度为带正负号的弧度。SDK 的 pq 接收路径会把微小负角度转换成接近 2π 的正角，
+再逐分量滤波/规划；321 路径保留正负号，避免该绕转问题。
+
+`A10Operator` 通用默认仍为 pq；VR 配置显式选择 pe321。新报文已做 SDK 纯数学
+对照与回环收发验证，**尚未重新完成真机运动、松手停止和断流验收**。
+不通过延长超时、放宽限位或自动掉使能掩盖停止未确认。
+
 ## 文件职责
 
 ```text
@@ -77,6 +93,7 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
 | `teleop.operator.host` | 控制器地址，默认本机占位地址 |
 | `teleop.operator.allow_motion=True` | 允许本会话控制机器人 |
 | `teleop.operator.feedback_position_unit` | 实际 TCP 反馈平移单位 `mm` 或 `m` |
+| `teleop.operator.cartesian_wire_format` | VR 配置为 `pe321`，保留小角度正负号；公共位姿输入仍是四元数 |
 | `teleop.max_position_step_m` | 现场确认的每帧平移限制 |
 | `teleop.max_rotation_step_rad` | 现场确认的每帧旋转限制 |
 | `teleop.max_position_tracking_error_m` | 目标对反馈最大领先距离，默认 .05m |
@@ -151,9 +168,9 @@ follower 使用同样参数。协议迁移完成后，仍需现场比较运动�
 
 | 说明书 | 当前实现／使用方式 |
 | --- | --- |
-| 第 1 页：Cartesian UDP 9998，关节 UDP 9999，按 tg_id 配置控制末端 | `A10Operator` 使用两个独立端口；VR 仅发送单臂的一组 `pq`，控制器 tg_id／ee_ids 必须配置到 A10 末端 |
+| 第 1 页：Cartesian UDP 9998，关节 UDP 9999，按 tg_id 配置控制末端 | `A10Operator` 使用两个独立端口；VR 发送单臂的一组位姿，控制器 tg_id／ee_ids 必须配置到 A10 末端 |
 | 第 2～3 页：`get` 中读取 `follower_msg.running_state` 和 `follower_mode` | 启动、停止及每次目标更新前回读；确认本会话的 Cart 模式后才发目标 |
-| 第 3～4 页：Cartesian 跟随最新位置，下发增量位姿，单位米／弧度，`pq` 七维二维数组 | 持续发送 `{"type":"pq","pq":[[dx,dy,dz,qx,qy,qz,qw]]}`；位姿相对固定启动锚点，非每包重复累加的帧增量；四元数无角度单位 |
+| 第 3～4 页：Cartesian 跟随最新位置，下发增量位姿，单位米／弧度，支持 pq 与 Euler 格式 | 通用接口保留 pq；2026-10-19 起 VR 配置使用带符号的 `type=321, pe`。位姿仍相对固定启动锚点，非每包重复累加的帧增量 |
 | 第 3～4 页：最大跟随速度由点动笛卡尔设置的速度与速度百分比决定 | 实际速度由控制器配置和百分比约束；VR 的位置缩放与单帧／跟踪误差限值不能代替控制器速度设置 |
 | 第 4 页：关节使用 `jp --motor_pos=[...]`，绝对位置，旋转轴单位度 | `send_joints` 单独接入关节 follower，不能把该关节绝对位置格式用于 VR 位姿 |
 | 第 5 页：`set_jog_vel --vel_percent=60`、`set_pgm_vel --vel_percent=60` | 在控制器原生终端／前端按当前运行模式显式设置；当前 `a10_control.py` shell 未提供这两个命令，VR 也不自动修改百分比 |

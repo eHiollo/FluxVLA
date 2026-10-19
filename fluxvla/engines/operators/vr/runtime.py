@@ -234,6 +234,7 @@ class VRTeleopRuntime:
                               sent_relative_target=self.last_relative_target,
                               step_elapsed_s=time.monotonic() - started,
                               error=error, execute=self.execute,
+                              cartesian_wire_format=getattr(self.robot, 'cartesian_wire_format', None),
                               control_mode=self.control_mode, observe_only=self.observe_only,
                               reference_control=self.last_reference_result,
                               stop_status=self.last_stop_status)
@@ -310,6 +311,8 @@ class VRTeleopRuntime:
             logging.getLogger(__name__).info('参考跟随停止确认：inactive + Stopped')
         except BaseException as exc:
             self.last_stop_status['error'] = f'{type(exc).__name__}: {exc}'
+            logging.getLogger(__name__).error(
+                '机械臂停止未确认：%s；请在控制器现场确认停止，勿重新启动遥操作。', exc)
             raise
         finally:
             self._reference_time = None

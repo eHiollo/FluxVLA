@@ -111,6 +111,7 @@ class XLeVRDeltaEEMapper:
         default=None, init=False, repr=False
     )
     _anchor_shadow_last_transport_sequence: int = field(default=0, init=False, repr=False)
+    _anchor_shadow_last_hand_pose: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.position_control_mode not in {"safe_frame_delta", "legacy_frame_delta"}:
@@ -336,6 +337,7 @@ class XLeVRDeltaEEMapper:
         self._anchor_shadow_angle_scale = 0.0
         self._anchor_shadow_last_translation_ee_m = None
         self._anchor_shadow_last_rotation_ee_rad = None
+        self._anchor_shadow_last_hand_pose = None
 
     def _set_anchor_shadow_status(self, status: str) -> None:
         self._current_diagnostics.update(
@@ -392,6 +394,7 @@ class XLeVRDeltaEEMapper:
             translation_final = self._anchor_shadow_last_translation_ee_m.copy()
             rotation_final = self._anchor_shadow_last_rotation_ee_rad.copy()
         else:
+            self._anchor_shadow_last_hand_pose = np.concatenate((position_vr_m, quat)).copy()
             displacement_anchor_vr = delta_position_body(
                 self._anchor_shadow_position_vr_m,
                 position_vr_m,
@@ -448,6 +451,13 @@ class XLeVRDeltaEEMapper:
             "offset": [float(value) for value in offset],
             "gripper": float(output.get("gripper.pos", 0.0)),
         }
+        if self._anchor_shadow_active:
+            # Absolute mapping consumes guarded poses, before body-frame remap.
+            # Duplicate sequences reuse this cache, even if raw payload changes.
+            output["_xlevr.anchor_command"].update(
+                hand_pose_vr=self._anchor_shadow_last_hand_pose.tolist(),
+                position_scale=float(self.vr_to_robot_scale * self._anchor_shadow_pos_scale),
+            )
         self._current_diagnostics["anchor_shadow_transmitted"] = True
 
     def _orientation_delta_rotvec(

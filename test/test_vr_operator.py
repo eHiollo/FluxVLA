@@ -335,6 +335,30 @@ class VRTeleopRuntimeTest(unittest.TestCase):
         self.assertFalse(release['active'])
         self.assertEqual(release['sample_sequence'], 12)
 
+    def test_absolute_hand_output_reuses_guarded_cache_and_excludes_stale_or_spikes(self):
+        mapper = XLeVRDeltaEEMapper(pos_scale=.9, angle_scale=1.3)
+        def raw(seq, p, *, enabled=True, age=0., q=(0., 0., 0., 1.)):
+            return {'xlevr.enabled': enabled, 'xlevr.grip_active': enabled,
+                    'xlevr.target_position': p, 'xlevr.orientation_quat': q,
+                    'xlevr.sample_sequence': seq,
+                    'xlevr.sample_receive_time_s': 10. + seq / 30., 'xlevr.sample_age_s': age}
+        first = mapper(raw(1, [0., 0., 0.]))['_xlevr.anchor_command']
+        self.assertTrue(first['active'])
+        self.assertAlmostEqual(first['position_scale'], .9)
+        accepted = mapper(raw(2, [.001, .002, .003]))['_xlevr.anchor_command']
+        # Raw coordinates stay in tracking space; old axis_remap is not applied again.
+        np.testing.assert_allclose(accepted['hand_pose_vr'][:3], [.001, .002, .003])
+        duplicate = mapper(raw(2, [9., 9., 9.], q=(1., 0., 0., 0.)))['_xlevr.anchor_command']
+        self.assertEqual(accepted['hand_pose_vr'], duplicate['hand_pose_vr'])
+        spike = mapper(raw(3, [9., 9., 9.]))['_xlevr.anchor_command']
+        self.assertFalse(spike['active'])
+        self.assertNotIn('hand_pose_vr', spike)
+        mapper.reset()
+        mapper(raw(4, [0., 0., 0.]))
+        stale = mapper(raw(5, [.001, 0., 0.], age=1.))['_xlevr.anchor_command']
+        self.assertFalse(stale['active'])
+        self.assertNotIn('hand_pose_vr', stale)
+
     def test_real_mapper_and_operator_send_accumulated_udp_pose(self):
         # A fixed actual pose deliberately simulates controller tracking lag.
         # Browser Y maps to tool X. Include a duplicate and a stale sample.

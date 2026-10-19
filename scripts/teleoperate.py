@@ -45,7 +45,8 @@ def main(argv=None):
     runtime = build_runtime(cfg.teleop)
     if args.preview:
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
-              f'control_mode={runtime.control_mode}，未启动服务或连接设备。')
+              f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
+              '未启动服务或连接设备。')
         return 0
     runtime.run(fps=cfg.teleop.get('fps', 30),
                 max_steps=cfg.teleop.get('max_steps'))

@@ -24,11 +24,16 @@ class VRTeleopRuntime:
                  max_feedback_age_s=0.25, gripper_speed_mm_s=30.0,
                  max_position_tracking_error_m=0.05,
                  max_rotation_tracking_error_rad=0.35,
-                 control_mode='delta', reference_options=None, observe_only=False):
+                 control_mode='delta', reference_options=None, observe_only=False,
+                 pose_mapping='anchor_relative', pose_calibration=None):
         if type(execute) is not bool:
             raise ValueError('execute must be bool')
         if control_mode not in ('delta', 'reference'):
             raise ValueError('control_mode must be delta or reference')
+        if pose_mapping not in ('anchor_relative', 'calibrated_absolute'):
+            raise ValueError('pose_mapping must be anchor_relative or calibrated_absolute')
+        if pose_mapping == 'calibrated_absolute' and control_mode != 'reference':
+            raise ValueError('calibrated_absolute requires control_mode=reference')
         if type(observe_only) is not bool:
             raise ValueError('observe_only must be bool')
         if observe_only and (execute or control_mode != 'reference' or robot is None or gripper is not None):
@@ -61,6 +66,7 @@ class VRTeleopRuntime:
             vr, mapper = self.teleoperator.input, self.teleoperator.mapper
         self.vr, self.mapper, self.robot, self.gripper = vr, mapper, robot, gripper
         self.control_mode, self.observe_only = control_mode, observe_only
+        self.pose_mapping = pose_mapping
         self.reference_control = None
         if control_mode == 'reference':
             from .control import ReferenceConfig, VRPoseController
@@ -68,7 +74,9 @@ class VRTeleopRuntime:
                     or getattr(mapper, 'motion_shaping_mode', None) != 'robot_controller'
                     or not getattr(mapper, 'compute_anchor_shadow', False)):
                 raise ValueError('reference mode requires safe_frame_delta, anchor output, and mapper shaping bypass')
-            self.reference_control = VRPoseController(ReferenceConfig(**dict(reference_options or {})))
+            self.reference_control = VRPoseController(
+                ReferenceConfig(**dict(reference_options or {})),
+                pose_mapping=pose_mapping, pose_calibration=pose_calibration)
         elif reference_options:
             raise ValueError('reference_options requires control_mode=reference')
         self.diagnostics_path = diagnostics_path
@@ -236,6 +244,9 @@ class VRTeleopRuntime:
                               error=error, execute=self.execute,
                               cartesian_wire_format=getattr(self.robot, 'cartesian_wire_format', None),
                               control_mode=self.control_mode, observe_only=self.observe_only,
+                              pose_mapping=self.pose_mapping,
+                              pose_calibration=(None if self.reference_control is None else
+                                                self.reference_control.pose_calibration),
                               reference_control=self.last_reference_result,
                               stop_status=self.last_stop_status)
                 self._diagnostics.write(record)
@@ -370,8 +381,7 @@ class VRTeleopRuntime:
             if age > min(self.mapper.stale_timeout_s, self.reference_control.config.max_input_age_s):
                 raise RuntimeError('VR reference input_stale before follower start')
             # Validate all command fields before changing any controller state.
-            from .control import AnchorState
-            AnchorState().update(command, pose)
+            self.reference_control.validate_command(command, pose)
             if self.execute:
                 self.robot.set_tool_coordinate()
                 self._reference_stop_attempted = False

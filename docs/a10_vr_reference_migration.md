@@ -376,3 +376,63 @@ PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
 - 不调整 mapper 缩放、reference/P/加速度算法、松手方式或原生 follower。
   提速不等于解决启停震动，实机效果待用户现场对照。
 - 验证仅使用配置预览，不启动服务、连接控制器或执行机械臂运动。
+
+## 2026-10-19 新增标定后的绝对朝向映射
+
+### 本轮范围与实现
+
+按用户批准方案，仅在 `kaanh_follower_vr` 开发；本轮未访问控制器或执行实机运动。
+新增的数学计算、输入字段和生命周期接入均放在已有 `vr` 模块内：
+
+- `control.py`：增加 `CalibratedAnchorState`，复用原 `AnchorState` 的接管、序号、重复帧和
+  释放协议。平移采用固定 `R_base_vr`，每次接管只重记手柄位置、末端位置和位置倍率；
+  姿态按 `R_base_vr * R_vr_hand * R_hand_tool` 计算，不叠加旧 axis_remap/angle_scale。
+  `VRPoseController.start()` 保留标定及模式，继续复用现有 reference、限速、加速度和误差保护。
+- `mapper.py`：内部锚点命令增加校验后的 `hand_pose_vr` 与接管时 `position_scale`。
+  重复序号使用已接受位姿缓存；尖峰、过期和无效输入不提供有效手柄目标，防止绕过原保护。
+  旧 offset 六维字段及旧模式仍保留。新模式不套用旧增量死区，没有新增输入滤波层。
+- `runtime.py`：接入 `pose_mapping` / `pose_calibration`，新方式只允许 `control_mode=reference`。
+  开始 follower 前先按所选映射校验命令；第一包实际位姿保持、启动后重新取新鲜样本、停止确认
+  沿用原流程。JSONL 增加模式和标定，目标结果也记录映射名。
+- `a10_vr_teleop.py`：`anchor_relative` 仍是默认；两个标定值默认 `None`。
+  新方式缺少有效标定即报错；旧方式忽略标定，可只改模式参数切换，不必删除已有标定值。
+- 回放 CLI 增加 `--pose-mapping` / `--pose-calibration`，不连接设备；拒绝把缺少已校验手柄
+  字段的旧锚点日志直接解释为新模式，拒绝以不同标定冒充原日志的同一次回放。
+
+### 离线验证
+
+完整回归使用已有环境的 unittest（无新增依赖）：
+
+```bash
+PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
+  /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+  test_a10_operator test_vr_reference_runtime test_vr_operator test_vr_control
+```
+
+覆盖固定平移方向与手腕/末端初始朝向解耦、非对易旋转的标定乘法顺序、重新接管位置零跳变与
+绝对朝向一致性、q/-q 与 ±π 最短旋转、标定/输入缺失拒绝、速度/加速度边界、平移与朝向同时
+收敛、原模式回归，以及真实 mapper→runtime→A10Operator→本机模拟 UDP 的带符号 321 报文。
+模拟报文检查首包保持、负角保留、固定方向平移、释放停止确认及诊断字段。
+
+结果：**104 项全部通过，约 12.9 秒**。直接调用配置预览入口也确认：原模式通过；新模式缺少
+标定明确拒绝；通过 `--cfg-options` 提供两个离线示例四元数后预览通过，全程未启动服务。
+
+另读取 `original_speed_trial.jsonl` 中的原始 VR 输入，重新通过当前 mapper 校验并对比两种
+数学目标：处理 3085 帧，其中 164 帧为接受的有效活动输入，验证 16 次重锚点位置连续。
+对照中使用**显式的单位示例标定**，不冒充现场标定；未运行机器人、未验证原生 follower
+的跟踪或停止效果。输出仅保存在忽略目录：
+
+- `work_dirs/a10/vr/calibrated_absolute_offline_comparison.jsonl`
+- `work_dirs/a10/vr/calibrated_absolute_offline_summary.json`
+
+上述旧日志为文件内全部记录的离线处理，不能把多次接管或追加记录算成同一次实机试验。
+
+### 使用与待完成项
+
+两种方式的说明、标定方向、公式、预览与离线命令见
+[VR 使用说明](a10_vr_operator.md)。
+
+新绝对朝向可能在手柄静止的接管时仍要求转动；只重记平移锚点，不重新标定朝向。
+尚需现场确定固定操作坐标系及工具偏置、确认头显空间重置后的标定有效性，再进行实机验收。
+本轮未修改控制器 SDK、UDP 协议、原生 follower 或已知的停止过程；不能据离线通过宣称启停
+震动和控制器停止行为已解决。

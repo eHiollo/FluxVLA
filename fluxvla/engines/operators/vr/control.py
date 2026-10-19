@@ -122,11 +122,56 @@ class AnchorState:
         new_anchor = new_session or key[1] > self.key[1]
         if not new_anchor and sequence <= self.sequence:
             return 'duplicate' if sequence == self.sequence else 'stale'
+        target = self._make_target(command, actual, offset, new_anchor)
         if new_anchor:
             self.robot_anchor = actual.copy()
         self.active, self.key, self.sequence = True, key, sequence
-        self.target = compose_offset(self.robot_anchor, offset)
+        self.target = target
         return 'anchored' if new_anchor else 'updated'
+
+    def _make_target(self, command, actual, offset, new_anchor):
+        return compose_offset(actual if new_anchor else self.robot_anchor, offset)
+
+
+class CalibratedAnchorState(AnchorState):
+    """Fixed-frame translation and calibrated absolute hand orientation.
+
+    R_base_tool = R_base_vr * R_vr_hand * R_hand_tool. The second
+    calibration expresses tool axes in hand coordinates, not its inverse.
+    Only translation anchors/scale are captured again on clutch engagement.
+    Input hand poses must have passed the mapper's freshness/spike guards.
+    """
+
+    def __init__(self, calibration):
+        super().__init__()
+        required = {'vr_to_robot_quat_xyzw', 'hand_to_tool_quat_xyzw'}
+        if not isinstance(calibration, dict) or set(calibration) != required:
+            raise ValueError('pose_calibration requires vr_to_robot_quat_xyzw and hand_to_tool_quat_xyzw')
+        if any(calibration[name] is None for name in required):
+            raise ValueError('pose_calibration requires both measured quaternions; no identity fallback')
+        rotations = []
+        for name in ('vr_to_robot_quat_xyzw', 'hand_to_tool_quat_xyzw'):
+            quat = vector(calibration[name], 4, name)
+            if not np.isclose(np.linalg.norm(quat), 1., atol=1e-6):
+                raise ValueError(f'{name} must be a unit xyzw quaternion')
+            rotations.append(Rotation.from_quat(quat))
+        self.base_from_vr, self.hand_from_tool = rotations
+        self.hand_anchor = None
+        self.position_scale = None
+
+    def _make_target(self, command, actual, offset, new_anchor):
+        # Never use raw runtime input: mapper provides the accepted/cached pose.
+        hand = pose(command.get('hand_pose_vr'))
+        scale = command.get('position_scale')
+        if isinstance(scale, bool) or not isinstance(scale, (float, int)) or not math.isfinite(scale) or scale <= 0:
+            raise ValueError('position_scale must be positive and finite')
+        if new_anchor:
+            self.hand_anchor = hand[:3].copy()
+            self.position_scale = scale
+        robot_anchor = actual if new_anchor else self.robot_anchor
+        translation = self.base_from_vr.apply((hand[:3] - self.hand_anchor) * self.position_scale)
+        rotation = self.base_from_vr * Rotation.from_quat(hand[3:]) * self.hand_from_tool
+        return np.r_[robot_anchor[:3] + translation, rotation.as_quat()]
 
 
 class ReferenceGovernor:
@@ -196,9 +241,20 @@ class VRPoseController:
     promise physical braking. A fault stays latched until reset/start().
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, *, pose_mapping='anchor_relative', pose_calibration=None):
         self.config = config or ReferenceConfig()
-        self.anchor = AnchorState()
+        if pose_mapping not in ('anchor_relative', 'calibrated_absolute'):
+            raise ValueError('pose_mapping must be anchor_relative or calibrated_absolute')
+        if pose_calibration is not None and not isinstance(pose_calibration, dict):
+            raise ValueError('pose_calibration must be a dictionary')
+        if pose_mapping == 'calibrated_absolute' and pose_calibration is None:
+            raise ValueError('calibrated_absolute requires explicit pose_calibration')
+        self.pose_mapping = pose_mapping
+        # Own calibration data so caller edits cannot change a running mapping.
+        self.pose_calibration = (None if pose_calibration is None else
+                                 {key: None if value is None else list(value)
+                                  for key, value in pose_calibration.items()})
+        self.anchor = self._new_anchor()
         self.governor = ReferenceGovernor(self.config)
         self.startup_anchor = self.command_pose = None
         self.linear_velocity = np.zeros(3)
@@ -206,15 +262,25 @@ class VRPoseController:
         self.input_age_s = math.inf
         self.fault_reason = None
 
+    def _new_anchor(self):
+        return (CalibratedAnchorState(self.pose_calibration)
+                if self.pose_mapping == 'calibrated_absolute' else AnchorState())
+
+    def validate_command(self, command, actual):
+        """Validate using the selected mapping before starting any follower."""
+        self._new_anchor().update(command, actual)
+
     def start(self, startup_anchor):
         """Reset after confirmed follower start (or an explicitly labeled shadow anchor)."""
-        self.__init__(self.config)
+        self.__init__(self.config, pose_mapping=self.pose_mapping,
+                      pose_calibration=self.pose_calibration)
         self.startup_anchor = pose(startup_anchor)
         self.command_pose = self.startup_anchor.copy()
 
     def _result(self, status, *, stop=False, packet=None):
         active = status in ('tracking', 'frozen') and not stop
         return dict(state=status, packet_status=packet, stop_requested=stop,
+                    pose_mapping=self.pose_mapping,
                     fault_reason=self.fault_reason,
                     user_target=None if self.anchor.target is None else self.anchor.target.tolist(),
                     reference_pose=None if self.governor.reference is None else self.governor.reference.tolist(),
@@ -329,16 +395,23 @@ def replay_main(argv=None):
     parser.add_argument('--fps', type=float, default=30., help='日志缺少时间时使用的离线名义频率，默认 30')
     parser.add_argument('--max-steps', type=int, help='最多回放多少帧')
     parser.add_argument('--no-acceleration-limit', action='store_true', help='关闭新增的前端加速度整形作对照')
+    parser.add_argument('--pose-mapping', choices=['anchor_relative', 'calibrated_absolute'],
+                        default='anchor_relative', help='目标映射方式，默认保留原锚点相对映射')
+    parser.add_argument('--pose-calibration', type=Path,
+                        help='新模式的标定 JSON，含 vr_to_robot_quat_xyzw 和 hand_to_tool_quat_xyzw')
     args = parser.parse_args(argv)
     if not math.isfinite(args.fps) or args.fps <= 0 or (args.max_steps is not None and args.max_steps <= 0):
         parser.error('fps 和 max-steps 必须为正数')
     if args.output and args.input and args.output.resolve() == args.input.resolve():
         parser.error('输出文件不能覆盖输入日志')
+    if args.output and args.pose_calibration and args.output.resolve() == args.pose_calibration.resolve():
+        parser.error('输出文件不能覆盖标定文件')
     feedback_source = args.feedback_source or ('synthetic-follow' if args.demo else 'recorded')
     if args.demo and feedback_source == 'recorded':
         parser.error('demo 没有真实反馈，请使用 synthetic-follow 或 synthetic-hold')
     config = ReferenceConfig(limit_acceleration=not args.no_acceleration_limit)
-    controller = VRPoseController(config)
+    calibration = None if args.pose_calibration is None else json.loads(args.pose_calibration.read_text())
+    controller = VRPoseController(config, pose_mapping=args.pose_mapping, pose_calibration=calibration)
     initial = np.array([.2, -.1, .3, 0., 0., 0., 1.])
 
     def demo_rows():
@@ -347,6 +420,8 @@ def replay_main(argv=None):
             offset = [min(index / 30., 1.) * .02, 0., 0., 0., 0., min(index / 30., 1.) * .1]
             command = dict(active=active, session_id='offline-demo', anchor_id=1,
                            sample_sequence=index, offset=offset, gripper=0.)
+            command.update(hand_pose_vr=[*offset[:3], *Rotation.from_rotvec(offset[3:]).as_quat()],
+                           position_scale=1.)
             yield dict(mapped_action={'_xlevr.anchor_command': command},
                        sample_age_s=0., sample_receive_time_s=index / args.fps)
 
@@ -381,6 +456,10 @@ def replay_main(argv=None):
             command = (row.get('mapped_action') or {}).get('_xlevr.anchor_command')
             if command is None:
                 raise ValueError(f'第 {index + 1} 帧缺少 _xlevr.anchor_command；请使用当前 mapper 生成的日志')
+            if args.pose_mapping == 'calibrated_absolute' and command.get('active') and 'hand_pose_vr' not in command:
+                raise ValueError('新模式需要 mapper 校验过的 hand_pose_vr；旧日志不能直接当作新模式输入')
+            if row.get('pose_mapping') == 'calibrated_absolute' and row.get('pose_calibration') != calibration:
+                raise ValueError('回放标定与日志标定不一致，请提供录制时的 pose_calibration')
             sample_age = row.get('sample_age_s')
             sample_time = row.get('sample_receive_time_s')
             valid_time = (isinstance(sample_time, (float, int)) and math.isfinite(sample_time) and sample_time >= 0
@@ -444,6 +523,7 @@ def replay_main(argv=None):
         if output:
             output.close()
     summary = dict(offline_only=True, transmitted=False, feedback_source=feedback_source,
+                   pose_mapping=args.pose_mapping, pose_calibration=calibration,
                    synthetic_feedback=synthetic, segments=segments, frames=sum(counts.values()),
                    states=dict(counts), max_reference_tracking_error_m=max_error,
                    fault_frames=dict(fault_frames), first_fault=first_fault,

@@ -62,6 +62,47 @@ def runtime(rows, *, observe=False, robot=None, **kwargs):
 
 
 class ReferenceRuntimeTest(unittest.TestCase):
+    def test_absolute_mapping_holds_start_then_aligns_and_validates_before_start(self):
+        calibration = dict(vr_to_robot_quat_xyzw=[0., 0., 0., 1.],
+                           hand_to_tool_quat_xyzw=[0., 0., 0., 1.])
+        rows = [sample(i) for i in (1, 2, 3)]
+        for index, row in enumerate(rows):
+            row['mapped']['_xlevr.anchor_command'].update(
+                hand_pose_vr=[index * .001, 0., 0., 0., 0., .1, np.sqrt(.99)], position_scale=.9)
+        operator, robot = runtime(rows, pose_mapping='calibrated_absolute', pose_calibration=calibration)
+        clock = Clock()
+        with patch('time.monotonic', clock.now):
+            operator.connect()
+            for _ in rows:
+                clock.advance()
+                operator.step()
+            np.testing.assert_allclose(robot.targets[0]['right'], [0., 0., 0., 0., 0., 0., 1.])
+            np.testing.assert_allclose(operator.reference_control.anchor.robot_anchor[:3], robot.pose[:3])
+            self.assertGreater(robot.targets[-1]['right'][0], 0.)
+            self.assertGreater(robot.targets[-1]['right'][5], 0.)
+            operator.close()
+        bad, robot = runtime([sample(1)], pose_mapping='calibrated_absolute', pose_calibration=calibration)
+        with self.assertRaisesRegex(ValueError, 'pose'):
+            bad.run(max_steps=1)
+        self.assertNotIn('tool', robot.events)
+        self.assertNotIn(('start', 'cartesian'), robot.events)
+
+    def test_new_mapping_requires_reference_and_explicit_calibration_in_preview(self):
+        cfg = Config.fromfile(ROOT / 'configs/a10/a10_vr_teleop.py')
+        old = build_runtime(cfg.teleop)
+        self.assertEqual(old.pose_mapping, 'anchor_relative')
+        cfg.teleop.pose_mapping = 'calibrated_absolute'
+        with self.assertRaisesRegex(ValueError, 'reference'):
+            build_runtime(cfg.teleop)
+        cfg.teleop.control_mode = 'reference'
+        with self.assertRaisesRegex(ValueError, 'pose_calibration'):
+            build_runtime(cfg.teleop)
+        cfg.teleop.pose_calibration = dict(vr_to_robot_quat_xyzw=[0., 0., 0., 1.],
+                                          hand_to_tool_quat_xyzw=[0., 0., 0., 1.])
+        operator = build_runtime(cfg.teleop)
+        self.assertEqual(operator.pose_mapping, 'calibrated_absolute')
+        self.assertFalse(operator._connected)
+
     def test_live_start_discards_old_sample_and_release_confirms_stop(self):
         clock = Clock()
         operator, robot = runtime([sample(1, offset=.1), sample(2), sample(3, offset=.01), sample(4, active=False)])
@@ -251,6 +292,41 @@ class ReferenceRuntimeTest(unittest.TestCase):
             records = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertTrue(records[-1]['stop_status']['reported_stopped'])
             self.assertIsNone(records[-1]['sent_relative_target'])
+            self.assertFalse(server.errors)
+
+    def test_absolute_mapping_real_mapper_to_signed_321_udp_and_diagnostics(self):
+        from fluxvla.engines.operators.vr.mapper import XLeVRDeltaEEMapper
+        calibration = dict(vr_to_robot_quat_xyzw=[0., 0., 0., 1.],
+                           hand_to_tool_quat_xyzw=[0., 0., 0., 1.])
+        rows = [{'xlevr.enabled': seq < 5, 'xlevr.grip_active': seq < 5,
+                 'xlevr.target_position': [.001 * seq, 0., 0.],
+                 'xlevr.orientation_quat': [0., 0., -.1, np.sqrt(.99)],
+                 'xlevr.sample_sequence': seq, 'xlevr.sample_receive_time_s': 10. + seq / 30.,
+                 'xlevr.sample_age_s': 0.} for seq in range(1, 6)]
+        with FakeController() as server, tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'absolute.jsonl'
+            robot = server.operator(feedback_position_unit='mm', cartesian_wire_format='pe321')
+            operator = VRTeleopRuntime(FakeVR(rows), XLeVRDeltaEEMapper(), robot,
+                                      execute=True, control_mode='reference',
+                                      pose_mapping='calibrated_absolute', pose_calibration=calibration,
+                                      diagnostics_path=str(path),
+                                      max_position_step_m=.02, max_rotation_step_rad=.2)
+            operator.run(max_steps=5)
+            payloads = []
+            for _ in range(3):
+                packet = server.udp.recv(4096)
+                self.assertEqual(struct.unpack('<IIQqqq', packet[:40]), (len(packet) - 40, 0, 0, 0, 0, 0))
+                payloads.append(json.loads(packet[40:]))
+            self.assertTrue(all(row['type'] == '321' for row in payloads))
+            np.testing.assert_allclose(payloads[0]['pe'][0], [0.] * 6)
+            self.assertGreater(payloads[-1]['pe'][0][0], 0.)
+            self.assertAlmostEqual(payloads[-1]['pe'][0][1], 0.)
+            self.assertLess(payloads[-1]['pe'][0][3], 0.)
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(all(row['pose_mapping'] == 'calibrated_absolute' for row in records))
+            self.assertEqual(records[-1]['pose_calibration'], calibration)
+            self.assertIn('hand_pose_vr', records[2]['mapped_action']['_xlevr.anchor_command'])
+            self.assertTrue(records[-1]['stop_status']['reported_stopped'])
             self.assertFalse(server.errors)
 
     def test_real_mapper_stale_deactivation_cannot_hide_fault_or_restart_held_hand(self):

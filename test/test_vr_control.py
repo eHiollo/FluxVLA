@@ -192,5 +192,117 @@ class FrontendReferenceTest(unittest.TestCase):
             self.assertIn('缺少真实末端反馈', result.stderr)
 
 
+class CalibratedMappingTest(unittest.TestCase):
+    calibration = dict(vr_to_robot_quat_xyzw=Rotation.from_euler('z', 90, degrees=True).as_quat().tolist(),
+                       hand_to_tool_quat_xyzw=Rotation.from_euler('x', 30, degrees=True).as_quat().tolist())
+
+    def sample(self, seq=1, *, p=(0., 0., 0.), q=(0., 0., 0., 1.), **kwargs):
+        result = command(seq, **kwargs)
+        result.update(hand_pose_vr=[*p, *q], position_scale=.9)
+        return result
+
+    def make_controller(self):
+        result = control.VRPoseController(pose_mapping='calibrated_absolute', pose_calibration=self.calibration)
+        result.start(IDENTITY)
+        return result
+
+    def test_fixed_translation_does_not_rotate_with_wrist_or_robot_anchor(self):
+        for robot_angle in (0, 70):
+            for hand_angle in (0, 100):
+                anchor = control.CalibratedAnchorState(self.calibration)
+                actual = np.r_[[.2, .1, .3], Rotation.from_euler('y', robot_angle, degrees=True).as_quat()]
+                anchor.update(self.sample(p=(1., 2., 3.)), actual)
+                np.testing.assert_allclose(anchor.target[:3], actual[:3])
+                q = Rotation.from_euler('z', hand_angle, degrees=True).as_quat()
+                anchor.update(self.sample(2, p=(1.1, 2., 3.), q=q, offset=(9.,)*6), actual)
+                np.testing.assert_allclose(anchor.target[:3] - actual[:3], [0., .09, 0.], atol=1e-12)
+
+    def test_absolute_orientation_composition_and_reclutch_only_reset_translation(self):
+        anchor = control.CalibratedAnchorState(self.calibration)
+        hand_q = Rotation.from_euler('y', 40, degrees=True).as_quat()
+        expected = (Rotation.from_quat(self.calibration['vr_to_robot_quat_xyzw'])
+                    * Rotation.from_quat(hand_q)
+                    * Rotation.from_quat(self.calibration['hand_to_tool_quat_xyzw']))
+        anchor.update(self.sample(q=hand_q), IDENTITY)
+        np.testing.assert_allclose(Rotation.from_quat(anchor.target[3:]).as_matrix(), expected.as_matrix())
+        anchor.update(command(2, active=False), IDENTITY)
+        actual = np.r_[[.4, -.2, .5], Rotation.from_euler('xyz', [20, 30, 40], degrees=True).as_quat()]
+        anchor.update(self.sample(3, anchor=2, p=(3., 4., 5.), q=hand_q), actual)
+        np.testing.assert_allclose(anchor.target[:3], actual[:3])
+        np.testing.assert_allclose(Rotation.from_quat(anchor.target[3:]).as_matrix(), expected.as_matrix())
+
+    def test_duplicate_stale_and_quaternion_sign_do_not_jump_target(self):
+        anchor = control.CalibratedAnchorState(self.calibration)
+        anchor.update(self.sample(3), IDENTITY)
+        target = anchor.target.copy()
+        self.assertEqual(anchor.update(self.sample(3, p=(10., 0., 0.)), IDENTITY), 'duplicate')
+        self.assertEqual(anchor.update(self.sample(2, p=(10., 0., 0.)), IDENTITY), 'stale')
+        np.testing.assert_allclose(anchor.target, target)
+        anchor.update(self.sample(4, q=(0., 0., 0., -1.)), IDENTITY)
+        self.assertLess((Rotation.from_quat(anchor.target[3:]).inv()
+                         * Rotation.from_quat(target[3:])).magnitude(), 1e-12)
+
+    def test_bad_calibration_and_missing_hand_pose_fail_without_fallback(self):
+        for bad in (None, {}, dict(vr_to_robot_quat_xyzw=[0, 0, 0, 0], hand_to_tool_quat_xyzw=[0, 0, 0, 1]),
+                    dict(vr_to_robot_quat_xyzw=[0, 0, 0, 1], hand_to_tool_quat_xyzw=None)):
+            with self.assertRaises(ValueError):
+                control.VRPoseController(pose_mapping='calibrated_absolute', pose_calibration=bad)
+        controller = self.make_controller()
+        for changes in ({'hand_pose_vr': None}, {'position_scale': 0}, {'position_scale': float('nan')},
+                        {'hand_pose_vr': [0.] * 7}):
+            sample = self.sample()
+            sample.update(changes)
+            with self.assertRaises(ValueError):
+                controller.validate_command(sample, IDENTITY)
+        self.assertFalse(controller.anchor.active)
+
+    def test_restart_retains_calibration_and_absolute_alignment_is_bounded(self):
+        controller = self.make_controller()
+        actual = IDENTITY.copy()
+        last_linear = last_angular = np.zeros(3)
+        for seq in range(1, 50):
+            # Translation starts while the initially large orientation error converges.
+            result = controller.step(self.sample(seq, p=(seq * .001, 0., 0.)), actual, 1 / 30.)
+            self.assertEqual(result['state'], 'tracking')
+            linear, angular = np.array(result['linear_velocity_m_s']), np.array(result['angular_velocity_rad_s'])
+            self.assertLessEqual(np.linalg.norm(linear), .12 + 1e-12)
+            self.assertLessEqual(np.linalg.norm(angular), .32 + 1e-12)
+            self.assertLessEqual(np.linalg.norm(linear - last_linear), .4 / 30 + 1e-12)
+            self.assertLessEqual(np.linalg.norm(angular - last_angular), .96 / 30 + 1e-12)
+            actual = np.array(result['command_pose'])
+            last_linear, last_angular = linear, angular
+        self.assertGreater(actual[1], 0.)
+        target_q = controller.anchor.target[3:].copy()
+        controller.start(actual)
+        controller.step(self.sample(99, p=(50., 20., 0.)), actual, 1 / 30.)
+        np.testing.assert_allclose(controller.anchor.target[:3], actual[:3])
+        np.testing.assert_allclose(controller.anchor.target[3:], target_q)
+
+    def test_rotation_wrap_uses_shortest_path(self):
+        calibration = dict(vr_to_robot_quat_xyzw=[0., 0., 0., 1.], hand_to_tool_quat_xyzw=[0., 0., 0., 1.])
+        controller = control.VRPoseController(control.ReferenceConfig(limit_acceleration=False),
+                                              pose_mapping='calibrated_absolute', pose_calibration=calibration)
+        actual = np.r_[[0., 0., 0.], Rotation.from_euler('z', 179, degrees=True).as_quat()]
+        controller.start(actual)
+        target = Rotation.from_euler('z', -179, degrees=True).as_quat()
+        result = controller.step(self.sample(q=target), actual, .03)
+        delta = (Rotation.from_quat(actual[3:]).inv() * Rotation.from_quat(result['command_pose'][3:])).as_rotvec()
+        self.assertGreater(delta[2], 0.)
+        self.assertLessEqual(np.linalg.norm(delta), .32 * .03 + 1e-12)
+
+    def test_new_mode_cli_requires_calibration_and_labels_synthetic_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calibration = Path(temporary) / 'calibration.json'
+            calibration.write_text(json.dumps(self.calibration))
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/replay_vr_control.py'),
+                                     '--demo', '--pose-mapping', 'calibrated_absolute',
+                                     '--pose-calibration', str(calibration)], capture_output=True, text=True, check=True)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary['pose_mapping'], 'calibrated_absolute')
+            self.assertEqual(summary['frames'], 120)
+            self.assertTrue(summary['synthetic_feedback'])
+            self.assertFalse(summary['transmitted'])
+
+
 if __name__ == '__main__':
     unittest.main()

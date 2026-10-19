@@ -6,6 +6,90 @@ VR 开发在 `kaanh_follower_vr`，当前独立工作区为 `/home/robot/VLA/Flu
 主目录 `/home/robot/VLA/FluxVLA` 仍属于 `kaanh_follower`，其中的现场修改由用户管理。
 在 IDE 打开 VR 工作区即可查看本轮代码；此工作区沿用现有 `fluxvla` Conda 环境。
 
+## 新增：两种手柄位姿映射方式（2026-10-19）
+
+现在可以选择“手柄怎么动，机器人应该去哪里”。这和 `control_mode` 是两个参数：
+`control_mode=reference` 管目标的限速与平滑；`pose_mapping` 管目标的计算方式。
+
+| `pose_mapping` | 平移 | 朝向 |
+| --- | --- | --- |
+| `anchor_relative`（默认，原方式） | 按接管时的手柄和末端坐标计算相对位移 | 从接管时末端朝向开始，跟随手柄相对转动 |
+| `calibrated_absolute`（新增，要求 reference） | 按固定、标定好的操作方向移动；每次接管重新记录起点 | 始终跟随标定后的手柄绝对朝向；不会每次接管重新对齐标定 |
+
+新方式下，例如操作坐标系的“向前”标定好之后，转动手腕或改变机械臂初始朝向都不会改变
+平移的“向前”。重新握住接管时，机器人当前位置就是新的平移起点，不会跳回上次起点。
+
+**朝向仍可能在接管后变化：** 即使手柄不动，如果机械臂当前朝向与标定后的手柄朝向不同，
+机械臂也会逐步对齐。启动第一包保持当前实际位姿，随后读取新鲜手柄数据，经现有
+reference 速度、加速度和跟踪误差保护生成目标；平移不必等待朝向完全对齐。
+这只限制前端发送目标，控制器的物理启停效果仍需实机确认。
+
+### 选择方式与配置检查
+
+原方式无需修改。切换回原 reference 映射：
+
+```bash
+python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
+  --cfg-options teleop.control_mode=reference teleop.pose_mapping=anchor_relative
+```
+
+使用新方式前，在 `configs/a10/a10_vr_teleop.py` 的 `pose_calibration` 中填写**现场标定**的两个
+四元数（顺序均为 `[x,y,z,w]`，长度必须为 1），然后检查：
+
+```bash
+python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
+  --cfg-options teleop.control_mode=reference teleop.pose_mapping=calibrated_absolute
+```
+
+配置中默认都是 `None`，因此未标定时这个命令会明确报错。它不会自动用单位四元数代替。
+标定填好后也可以用 `--cfg-options teleop.pose_calibration.字段名='[x,y,z,w]'` 覆盖。
+原方式会忽略这些标定值，切换参数不必删除标定配置。
+去掉 `--preview` 才会启动 VR；仍默认 `vr_only=True`，不会连接机械臂。
+实机连接沿用下文命令的主机、使能许可、反馈单位等配置，不会由新映射自动开启。
+
+### 两个标定值分别是什么
+
+- `vr_to_robot_quat_xyzw`：把 **VR 固定追踪空间的方向**旋转到**机器人基座方向**。
+  它决定手往哪个方向移动时机器人也往哪个方向移动。它不是每帧随手腕变化的方向。
+- `hand_to_tool_quat_xyzw`：**工具坐标轴在手柄坐标系中的方向**（右乘）。
+  它决定怎样握手柄时夹爪应朝哪里，并非把此四元数取逆后填入。
+
+标定顺序：先根据现场固定坐标轴确定第一个旋转；再把手柄和夹爪摆到期望的对应朝向，
+记录二者的朝向，求第二个旋转。**单次“随便按下握键”不能同时确定这两个旋转。**
+现阶段参数由现场标定结果填写，本次没有增加自动标定或自动摆臂功能。
+头显重置空间、追踪原点改变或设备位置改变后，需要重新确认标定，不能沿用错误的坐标系。
+
+开发时的精确关系如下；`R_A_B` 表示把 B 坐标表达的向量旋转到 A 坐标表达：
+
+```text
+目标位置 = 接管时实际末端位置
+         + R_base_vr × (接管时平移倍率 × (当前手柄位置 - 接管时手柄位置))
+目标朝向 R_base_tool = R_base_vr × R_vr_hand × R_hand_tool
+标定 R_hand_tool = inverse(R_vr_hand_calib) × inverse(R_base_vr) × R_base_tool_calib
+```
+
+平移倍率沿用 `pos_scale × vr_to_robot_scale`，接管时若按精调扳机，再乘 `fine_scale_factor`；
+倍率在该次接管内固定，调整扳机后需松手再接管。新方式朝向为 **1:1**，不再叠加旧方式的
+`angle_scale` 或 `axis_remap`，也不对新绝对目标套用旧增量死区。输入过期、重复帧、尖峰和
+序号回退保护仍经过同一个 mapper；新方式消费的是校验后的缓存位姿，不直接消费未校验的原始值。
+
+### 离线回放
+
+`scripts/replay_vr_control.py` 新增 `--pose-mapping` 和 `--pose-calibration`。
+标定文件为 JSON，包含上述两个字段。例如用**明确仅作离线演示**的单位标定：
+
+```bash
+printf '%s\n' '{"vr_to_robot_quat_xyzw":[0,0,0,1],"hand_to_tool_quat_xyzw":[0,0,0,1]}' \
+  > /tmp/vr_demo_calibration.json
+python scripts/replay_vr_control.py --demo \
+  --pose-mapping calibrated_absolute --pose-calibration /tmp/vr_demo_calibration.json
+```
+
+这只使用合成反馈，不连接设备，不证明现场标定或实机运动效果。新日志会记录映射名、标定值及
+`hand_pose_vr/position_scale`。回放新模式日志时，应提供录制时的标定。
+旧日志缺少校验后的手柄位姿，不能直接按新模式解释；本轮已将旧原始输入重新经过 mapper，
+作数学目标对照，报告见开发记录。
+
 ### 2026-10-19 现场旋转异常修复
 
 11:50 的现场会话出现第 6 轴持续旋转和松手后停止确认超时。只读对照控制器日志后，

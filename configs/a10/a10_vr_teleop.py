@@ -1,4 +1,4 @@
-"""Native VR-only defaults. Fill verified units/limits before live operation.
+"""Native VR-only defaults. Confirm feedback units before live operation.
 
 python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py
 Override parameters with --cfg-options teleop.input.network.host_ip=YOUR_LAN_IP.
@@ -49,7 +49,10 @@ teleop = dict(
                   # Optional USB gripper: use gripper_transport='usb' and
                   # gripper=dict(port='YOUR_DEVICE', max_width_mm=85., timeout=.015).
                   gripper_transport='controller'),
-    max_position_step_m=None, max_rotation_step_rad=None,
+    # ReferenceConfig already defaults to the original vr_vel 0.12 m/s and
+    # 0.32 rad/s. Remove the old CLI overrides 0.01/0.05 for the speed trial.
+    # At 30 Hz this is 4 mm / 0.01067 rad per frame; retain finite step guards.
+    max_position_step_m=.005, max_rotation_step_rad=.015,
     max_feedback_age_s=.25, gripper_speed_mm_s=30.,
     max_position_tracking_error_m=.05,
     max_rotation_tracking_error_rad=.35,

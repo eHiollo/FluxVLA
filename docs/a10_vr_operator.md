@@ -101,11 +101,40 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
 | `teleop.operator.gripper_transport='usb'` | 可选，启用直接 USB 夹爪 |
 | `teleop.operator.gripper` | USB 参数，例如 `dict(port='现场串口', max_width_mm=85., timeout=.015)` |
 
-反馈单位和单帧限值默认未填写；缺失时运行前拒绝接入真机。
+反馈单位默认未填写；缺失时运行前拒绝接入真机。2026-10-19 原速度对照验证使用
+单帧上限 5mm / 0.015rad，覆盖 30Hz 下 0.12m/s / 0.32rad/s 的正常步长；
+它们仍是软件检查值，不代表已经完成相应速度的实机验收。
 开启工控机 follower 服务，人工确认电机 Enabled、Stopped；程序不会自动使能或回零。
 第一次握键选择 Tool 坐标并启动 Cartesian follower。退出请求 stop_follower，再关闭连接。
 关闭连接、松手保持和退出 follower 不等于物理急停。
 当前 VR 配置默认使用同步状态读取；推理配置的后台监视参数没有被改动。
+
+### 按原 vr_vel 速度进行实机对照（2026-10-19）
+
+ReferenceConfig 的默认值本来就是线速度 0.12m/s、角速度 0.32rad/s；之前慢是
+启动命令覆盖成了 0.01 / 0.05。以下命令显式使用原速度，并采用匹配的单帧检查值。
+线/角加速度仍为 0.4m/s² / 0.96rad/s²；本轮没有修改启停、平滑、停止确认或控制器。
+已有轻微启停震动尚未解决，现场先小幅接管/释放，不把本次提速视为高速验收通过。
+
+```bash
+cd /home/robot/VLA/FluxVLA_vr
+conda activate fluxvla
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.control_mode=reference \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0 \
+    teleop.reference_options.max_linear_speed_m_s=0.12 \
+    teleop.reference_options.max_angular_speed_rad_s=0.32 \
+    teleop.diagnostics_path=work_dirs/a10/vr/original_speed_trial.jsonl
+```
+
+`mm` 沿用当前现场反馈单位配置。勿再附加旧命令的 1mm / 0.005rad 单帧限制，
+否则速度恢复后可能触发超限退出。所有反斜杠后面都不能留空格。
 
 ## 4. 诊断和待办
 

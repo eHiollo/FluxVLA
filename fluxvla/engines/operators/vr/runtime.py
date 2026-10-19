@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import logging
 import time
+import json
+from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -523,10 +525,186 @@ class VRTeleopRuntime:
                             self._diagnostics = None
 
 
+def _read_only_robot(operator_cfg):
+    """Whitelist status transport only; never inherit accessories or polling."""
+    from ..a10_operator import A10Operator
+    allowed = ('host', 'timeout_s', 'udp_port', 'joint_udp_port',
+               'feedback_joint_unit', 'feedback_position_unit')
+    options = {key: operator_cfg[key] for key in allowed if key in operator_cfg}
+    options.update(ws_port=operator_cfg.get('status_ws_port', 5888), allow_motion=False)
+    return A10Operator(**options)
+
+
+def _calibration_state(robot, max_age_s):
+    """GET only, with positive stop confirmation and transport freshness."""
+    from .control import pose
+    state = robot.get_state()
+    age = time.monotonic() - state.received_monotonic_s
+    if not math.isfinite(age) or not 0. <= age <= max_age_s or state.has_error is not False:
+        raise ValueError('机械臂反馈过期或有故障，不能标定')
+    motion = state.raw['ret_context'].get('robot_msg', {}).get('motion')
+    if state.follower_active is not False or motion != 'Stopped':
+        raise ValueError('标定要求跟随器未运行且机械臂状态为 Stopped；请先在现场停止')
+    if state.tcp_pq_m is None:
+        raise ValueError('缺少末端实际姿态，请确认 feedback_position_unit 为 mm 或 m')
+    return pose(state.tcp_pq_m)
+
+
+def collect_pose_calibration(vr_input, robot, hand_to_tool, *, duration_s=1., fps=30.,
+                             timeout_s=10., max_age_s=.25):
+    """Collect unique raw VR poses paired with read-only stopped feedback."""
+    from .control import pose, calibrate_reference_pose
+    for name, value in [('duration_s', duration_s), ('fps', fps),
+                        ('timeout_s', timeout_s), ('max_age_s', max_age_s)]:
+        if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f'{name} must be positive and finite')
+    if timeout_s <= duration_s:
+        raise ValueError('timeout_s must exceed duration_s')
+    hands, robots, sequences, stamps = [], [], [], []
+    began = time.monotonic()
+    while time.monotonic() - began < timeout_s:
+        raw = vr_input.get_action()
+        now = time.monotonic()
+        seq = raw.get('xlevr.sample_sequence')
+        stamp = raw.get('xlevr.sample_receive_time_s')
+        age = raw.get('xlevr.sample_age_s')
+        if (not raw.get('xlevr.enabled') or type(seq) is not int or seq < 0
+                or not isinstance(stamp, (float, int)) or not math.isfinite(stamp)
+                or not isinstance(age, (float, int)) or not math.isfinite(age)
+                or not 0. <= age <= max_age_s or not 0. <= now - stamp <= max_age_s):
+            raise ValueError('没有新鲜有效的 VR 姿态；请连接浏览器、按住右手握键并保持静止后重试')
+        if sequences and seq < sequences[-1]:
+            raise ValueError('VR 序号回退或会话重置，请重新标定')
+        if not sequences or seq > sequences[-1]:
+            if stamps and stamp <= stamps[-1]:
+                raise ValueError('VR 新帧时间没有递增，请重新标定')
+            hand = pose(np.r_[raw.get('xlevr.target_position'), raw.get('xlevr.orientation_quat')])
+            actual = _calibration_state(robot, max_age_s)
+            # GET may block. A pre-GET fresh hand must not become an old pair.
+            if time.monotonic() - stamp > max_age_s or time.monotonic() - now + age > max_age_s:
+                raise ValueError('读取机械臂反馈耗时过长，VR 姿态已过期，请重试')
+            hands.append(hand)
+            robots.append(actual)
+            sequences.append(seq)
+            stamps.append(stamp)
+            if len(hands) >= 10 and stamps[-1] - stamps[0] >= duration_s:
+                report = calibrate_reference_pose(hands, robots, hand_to_tool)
+                report.update(sample_sequences=[sequences[0], sequences[-1]],
+                              sample_duration_s=stamps[-1] - stamps[0],
+                              controller_sample_age_verified=False)
+                return report
+        time.sleep(1. / fps)
+    raise TimeoutError('未采到足够多的新鲜 VR 帧；原标定未改动，请检查输入后重试')
+
+
+def calibrate_pose(cfg, *, output_path, countdown=5, duration_s=1., prompt=None, preview=False):
+    """Interactive stationary calibration. Creates no motion-capable operator."""
+    from datetime import datetime, timezone
+    import os
+    import shutil
+    import tempfile
+    from fluxvla.engines.utils.builder import build_operator_from_cfg
+    from .control import CalibratedAnchorState
+    output_path = Path(output_path).expanduser().resolve()
+    if output_path.suffix != '.json':
+        raise ValueError('标定输出必须为 .json 文件，不能覆盖 Python 配置或其他文件')
+    if type(countdown) is not int or not 0 <= countdown <= 30:
+        raise ValueError('countdown must be an integer within 0..30')
+    if not math.isfinite(duration_s) or not 1. <= duration_s <= 5.:
+        raise ValueError('duration_s must be within 1..5 seconds')
+    operator_cfg = cfg['operator']
+    if operator_cfg.get('feedback_position_unit') not in ('mm', 'm'):
+        raise ValueError('标定需要明确 teleop.operator.feedback_position_unit=mm 或 m')
+    hand_to_tool = (cfg.get('pose_calibration') or {}).get('hand_to_tool_quat_xyzw')
+    CalibratedAnchorState(dict(vr_to_robot_quat_xyzw=[0., 0., 0., 1.],
+                              hand_to_tool_quat_xyzw=hand_to_tool))
+    robot = _read_only_robot(operator_cfg)
+    if preview:
+        build_operator_from_cfg(cfg['input'])
+        print(f'只读姿态标定预览：监视端口 {operator_cfg.get("status_ws_port", 5888)}，'
+              f'输出 {output_path}；未启动服务或连接设备。')
+        return None
+    vr = None
+    try:
+        robot.connect()
+        _calibration_state(robot, .25)
+        vr = build_operator_from_cfg(cfg['input'])
+        vr.connect()
+        print('只读姿态标定：机械臂保持静止；手柄的指向和翻转角度都应与期望夹爪朝向对应。', flush=True)
+        print(f'VR 浏览器连接后，准备好按住右手握键；倒计时结束后保持静止约 {duration_s:g} 秒。', flush=True)
+        (input if prompt is None else prompt)('按回车开始倒计时（Ctrl+C 取消）：')
+        for remaining in range(countdown, 0, -1):
+            print(f'{remaining}…', flush=True)
+            time.sleep(1.)
+        print('正在采样，请保持静止并按住握键…', flush=True)
+        report = collect_pose_calibration(vr.input, robot, hand_to_tool, duration_s=duration_s)
+        report.update(schema_version=1, kind='vr_pose_calibration', read_only=True,
+                      created_utc=datetime.now(timezone.utc).isoformat(),
+                      controller_host=operator_cfg['host'],
+                      feedback_position_unit=operator_cfg['feedback_position_unit'],
+                      vr_arm=cfg['input'].get('arm', 'right'),
+                      reference_alignment_operator_confirmed=True)
+    finally:
+        try:
+            if vr is not None:
+                vr.close()
+        finally:
+            robot.close()
+    # Save only after successful capture AND cleanup; failed runs keep old data.
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=output_path.parent,
+                                         suffix='.tmp', delete=False) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(report, stream, ensure_ascii=False, allow_nan=False, indent=2)
+            stream.write('\n')
+        if output_path.exists():
+            shutil.copyfile(output_path, str(output_path) + '.bak')
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    print(f'标定已保存：{output_path}（{report["quality"]["sample_count"]} 对姿态）', flush=True)
+    print('该结果同时固定平移方向；请先用 --observe 检查方向，再开始实机遥操作。', flush=True)
+    return report
+
+
+def _load_pose_calibration(settings):
+    """Auto-load site data only for absolute mapping with no explicit base rotation."""
+    path = settings.pop('pose_calibration_path', None)
+    calibration = dict(settings.get('pose_calibration') or {})
+    if (settings.get('pose_mapping') != 'calibrated_absolute'
+            or calibration.get('vr_to_robot_quat_xyzw') is not None or not path):
+        return
+    path = Path(path).expanduser()
+    if not path.exists():
+        return  # Existing missing-calibration validation supplies the error.
+    report = json.loads(path.read_text(encoding='utf-8'))
+    if (not isinstance(report, dict) or report.get('schema_version') != 1
+            or report.get('kind') != 'vr_pose_calibration' or report.get('read_only') is not True):
+        raise ValueError('标定文件格式不正确，请重新运行 --calibrate-pose')
+    if (report.get('controller_host') != settings['operator']['host']
+            or report.get('vr_arm') != settings['input'].get('arm', 'right')):
+        raise ValueError('标定文件的控制器地址或手柄侧别与当前配置不同，请重新标定')
+    unit = settings['operator'].get('feedback_position_unit')
+    if unit is not None and unit != report.get('feedback_position_unit'):
+        raise ValueError('标定文件与当前配置的反馈位置单位不同，请核对')
+    from .control import CalibratedAnchorState
+    loaded = report.get('pose_calibration')
+    anchor = CalibratedAnchorState(loaded)
+    expected = calibration.get('hand_to_tool_quat_xyzw')
+    if expected is not None and (anchor.hand_from_tool.inv() * Rotation.from_quat(expected)).magnitude() > 1e-8:
+        raise ValueError('当前手柄工具轴约定与标定文件不同，请重新标定')
+    settings['pose_calibration'] = dict(loaded)
+    print(f'已加载姿态标定：{path}', flush=True)
+
+
 def build_runtime(cfg):
     """Construct from a native teleop config; no services open until run()."""
     from fluxvla.engines.utils.builder import build_operator_from_cfg
     settings = dict(cfg)
+    _load_pose_calibration(settings)
     vr_only = settings.pop('vr_only', True)
     if type(vr_only) is not bool:
         raise ValueError('vr_only must be bool')
@@ -578,18 +756,13 @@ def inspect_controller(operator_cfg, *, samples=10, interval_s=.1):
     This characterizes replies and client latency, not hidden follower dynamics
     or the controller's actual sampling age. Unknown capabilities stay unknown.
     """
-    from ..a10_operator import A10Operator
     if type(samples) is not int or not 1 <= samples <= 100:
         raise ValueError('samples must be an integer within 1..100')
     if not math.isfinite(interval_s) or interval_s <= 0:
         raise ValueError('interval_s must be positive and finite')
     # Only transport/decoding fields enter this instance. Camera/gripper/motion
     # options in another workflow must never leak into a read-only inspection.
-    allowed = ('host', 'timeout_s', 'udp_port', 'joint_udp_port',
-               'feedback_joint_unit', 'feedback_position_unit')
-    options = {key: operator_cfg[key] for key in allowed if key in operator_cfg}
-    options.update(ws_port=operator_cfg.get('status_ws_port', 5888), allow_motion=False)
-    robot = A10Operator(**options)
+    robot = _read_only_robot(operator_cfg)
     rows = []
     error = None
     attempts = 0
@@ -620,8 +793,8 @@ def inspect_controller(operator_cfg, *, samples=10, interval_s=.1):
     return dict(read_only=True, query_success=error is None and len(rows) == samples,
                 error=error, get_attempts=attempts, completed_queries=len(rows),
                 commands=['get'] if attempts else [], udp_targets_sent=0,
-                host=options['host'], monitor_port=options['ws_port'],
-                feedback_position_unit=options.get('feedback_position_unit'),
+                host=operator_cfg['host'], monitor_port=operator_cfg.get('status_ws_port', 5888),
+                feedback_position_unit=operator_cfg.get('feedback_position_unit'),
                 controller_sample_age_verified=False,
                 unknown_capabilities=['cartesian_smoothing', 'target_queue',
                                       'packet_ordering', 'stream_timeout_behavior'],

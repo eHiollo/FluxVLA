@@ -14,18 +14,44 @@ def main(argv=None):
     parser.add_argument('--config', required=True)
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     parser.add_argument('--preview', action='store_true', help='只检查配置，不启动服务或连接设备')
-    parser.add_argument('--observe', action='store_true',
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--observe', action='store_true',
                         help='只读观察：读取机器人反馈并计算 reference 目标，不启动跟随或发送目标')
-    parser.add_argument('--inspect-controller', action='store_true',
+    mode.add_argument('--inspect-controller', action='store_true',
                         help='仅从监视端口读取 get 状态，不启动 VR 或任何运动')
+    mode.add_argument('--calibrate-pose', action='store_true',
+                      help='只读标定固定操作坐标系：机械臂静止，摆好手柄后倒计时采样并保存')
+    parser.add_argument('--pose-calibration', type=Path,
+                        help='标定 JSON 路径；标定时为输出，正常运行时为加载文件')
+    parser.add_argument('--calibration-countdown', type=int, default=5, help='标定倒计时秒数，默认 5')
+    parser.add_argument('--calibration-duration', type=float, default=1., help='标定采样时长 1～5 秒，默认 1')
     parser.add_argument('--samples', type=int, default=10, help='只读控制器检查的采样次数，默认 10')
     parser.add_argument('--report', type=Path, help='只读控制器检查报告 JSON 路径')
     args = parser.parse_args(argv)
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
-    if args.observe and args.inspect_controller:
-        parser.error('--observe 和 --inspect-controller 不能同时使用')
+    if args.pose_calibration:
+        cfg.teleop.pose_calibration_path = str(args.pose_calibration.expanduser().resolve())
+        if not args.calibrate_pose:
+            if not args.pose_calibration.is_file():
+                parser.error('--pose-calibration 指定的文件不存在')
+            cfg.teleop.pose_calibration.vr_to_robot_quat_xyzw = None
+    if args.calibrate_pose:
+        from fluxvla.engines.operators.vr.runtime import calibrate_pose
+        output = cfg.teleop.get('pose_calibration_path')
+        if not output:
+            parser.error('请配置 pose_calibration_path 或使用 --pose-calibration 指定输出')
+        try:
+            calibrate_pose(cfg.teleop, output_path=output, countdown=args.calibration_countdown,
+                           duration_s=args.calibration_duration, preview=args.preview)
+        except KeyboardInterrupt:
+            print('\n标定已取消，原标定文件未改动。')
+            return 130
+        except Exception as error:
+            print(f'标定未完成：{error}；原标定文件未改动。', file=sys.stderr)
+            return 1
+        return 0
     if args.inspect_controller and not 1 <= args.samples <= 100:
         parser.error('--samples 必须在 1..100 范围内')
     if args.inspect_controller:

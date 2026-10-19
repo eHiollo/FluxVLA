@@ -88,4 +88,5 @@ FluxBisim/
 
 # Local A10 device addresses and site-specific settings
 /configs/a10/site.local.yaml
+/configs/a10/vr_calibration.local.json
 !fluxvla/projects/a10/vr/web-ui/media/telegrip_instructions.jpg

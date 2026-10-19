@@ -28,6 +28,45 @@ def pose(value):
     return result
 
 
+def calibrate_reference_pose(hand_poses, robot_poses, hand_to_tool_quat_xyzw):
+    """Fit a fixed base/VR rotation from stationary, paired metre/xyzw poses.
+
+    The existing local-axis convention supplies R_hand_tool. Even samples fit
+    R_base_vr; odd samples check reconstruction. This checks consistency, not
+    whether the operator chose the intended physical forward/up directions.
+    """
+    if len(hand_poses) != len(robot_poses) or len(hand_poses) < 10:
+        raise ValueError('标定至少需要 10 对有效手柄和机械臂姿态')
+    hands = np.array([pose(value) for value in hand_poses])
+    robots = np.array([pose(value) for value in robot_poses])
+    tool_quat = vector(hand_to_tool_quat_xyzw, 4, 'hand_to_tool_quat_xyzw')
+    tool = Rotation.from_quat(pose(np.r_[np.zeros(3), tool_quat])[3:])
+    hand_rotation, robot_rotation = Rotation.from_quat(hands[:, 3:]), Rotation.from_quat(robots[:, 3:])
+    quality = {}
+    for label, values, rotations, max_position, max_angle in (
+            ('hand', hands, hand_rotation, .015, math.radians(3.)),
+            ('robot', robots, robot_rotation, .002, math.radians(1.))):
+        distance = float(np.linalg.norm(values[:, :3] - values[0, :3], axis=1).max())
+        angle = float((rotations[0].inv() * rotations).magnitude().max())
+        quality[f'max_{label}_position_change_m'] = distance
+        quality[f'max_{label}_rotation_change_rad'] = angle
+        if distance > max_position or angle > max_angle:
+            raise ValueError(f'{label} 标定期间移动或转动过大，请保持静止后重试')
+    candidates = robot_rotation * tool.inv() * hand_rotation.inv()
+    base_from_vr = candidates[::2].mean()
+    validation_error = ((base_from_vr * hand_rotation[1::2] * tool).inv()
+                        * robot_rotation[1::2]).magnitude()
+    quality.update(sample_count=len(hands), validation_samples=len(validation_error),
+                   max_validation_rotation_error_rad=float(validation_error.max()))
+    if validation_error.max() > math.radians(3.):
+        raise ValueError('留出采样的姿态重建误差过大，请保持静止后重试')
+    calibration = dict(vr_to_robot_quat_xyzw=base_from_vr.as_quat().tolist(),
+                       hand_to_tool_quat_xyzw=tool.as_quat().tolist())
+    return dict(pose_calibration=calibration, quality=quality,
+                reference_hand_pose_vr=np.r_[hands[:, :3].mean(axis=0), hand_rotation.mean().as_quat()].tolist(),
+                reference_robot_pose_m=np.r_[robots[:, :3].mean(axis=0), robot_rotation.mean().as_quat()].tolist())
+
+
 def compose_offset(anchor, offset):
     """T_target = T_robot_anchor * T_offset, matching EeAnchorShadow."""
     anchor, offset = pose(anchor), vector(offset, 6, 'offset')
@@ -411,6 +450,8 @@ def replay_main(argv=None):
         parser.error('demo 没有真实反馈，请使用 synthetic-follow 或 synthetic-hold')
     config = ReferenceConfig(limit_acceleration=not args.no_acceleration_limit)
     calibration = None if args.pose_calibration is None else json.loads(args.pose_calibration.read_text())
+    if isinstance(calibration, dict) and calibration.get('kind') == 'vr_pose_calibration':
+        calibration = calibration.get('pose_calibration')
     controller = VRPoseController(config, pose_mapping=args.pose_mapping, pose_calibration=calibration)
     initial = np.array([.2, -.1, .3, 0., 0., 0., 1.])
 

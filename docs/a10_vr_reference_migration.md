@@ -461,3 +461,54 @@ PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
 
 验证：默认四元数的旋转矩阵与旧轴映射的逆一致；原配置可构造；只缺 VR/基座关系时新模式
 拒绝；只补第一个离线示例四元数后可构造且未连接设备。另运行已有的新模式配置校验用例。
+
+## 2026-10-19 实现只读姿态标定程序和自动加载
+
+用户批准实现上节方案。本轮在 `kaanh_follower_vr` 开发，未连接现场 VR 或机械臂，
+未访问/修改控制器，未触及 `kaanh_follower` 工作区。
+
+### 实现
+
+- `scripts/teleoperate.py` 新增 `--calibrate-pose`，与观察/控制器检查互斥；支持
+  `--pose-calibration` 指定输出或加载路径、`--calibration-countdown`（默认 5 秒）、
+  `--calibration-duration`（默认 1 秒）。`--preview` 只校验参数，取消与失败给出中文提示。
+- `vr/runtime.py` 复用白名单只读 A10 实例构造（也供原 inspect_controller 使用），强制
+  `allow_motion=False`、监视端口默认 5888；不继承摄像头、USB 夹爪或状态后台轮询选项。
+  读取实际末端姿态前确认无故障、跟随 inactive 且 motion=Stopped，单位必须明确。
+- 倒计时后收集至少 10 对、覆盖至少 1 秒的不同序号姿态。重复帧不计数；序号回退、时间不递增、
+  过期、释放握键或机械臂未停止会拒绝。读取 GET 后再次检查手柄年龄，避免阻塞期间变旧。
+- `vr/control.py` 新增纯数学 `calibrate_reference_pose`：沿用手柄/工具轴约定求
+  `R_base_vr = R_base_tool * inverse(R_hand_tool) * inverse(R_vr_hand)`，偶数帧旋转均值拟合，
+  奇数帧验证。四元数均值和误差用 Rotation 计算，q/-q 不产生平均抵消。
+  手柄稳定阈值 15mm/3°、机器人 2mm/1°，留出样本重建误差上限 3°；它们检查一致性，
+  不证明人摆出的平移/朝向关系符合期望。
+- 采样与清理成功后才原子替换 `configs/a10/vr_calibration.local.json`；旧结果备份为
+  `.json.bak`。记录时间、主机、侧别、单位、样本范围、参考姿态、质量及两个四元数。
+  接收时间不是控制器实际采样时间，因此记录 `controller_sample_age_verified=False`。
+- 配置新增 `pose_calibration_path`；新模式缺少显式基座/VR 旋转时自动加载。核对主机、
+  侧别、已声明单位、轴约定及四元数格式；旧模式忽略文件，完整显式配置优先。
+  默认结果和备份均已被 Git 忽略。回放 CLI 可直接读取新保存的完整报告。
+- 网页补充每秒一次 WebSocket 重连及组件清理，避免标定结束/下一进程启动时必须刷新页面。
+  重连不创建新的 XR 会话。需保持页面和 XR 追踪空间；刷新、退出 VR、重新居中后应重新
+  确认/标定，程序目前不能自动识别追踪原点是否变化。
+
+### 验证
+
+```bash
+PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
+  /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+  test_a10_operator test_vr_reference_runtime test_vr_operator test_vr_control test_vr_calibration
+PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
+  /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest test_vr_native_entry
+```
+
+结果：**111 + 9 = 120 项通过**（约 14.1 秒 + 6.9 秒）。新增用例覆盖非对易旋转拟合、
+符号等价、稳定性拒绝、重复/回退/过期、慢 GET、真实一秒回环采样、只读命令、保存/备份、
+失败不覆盖、自动加载及不匹配拒绝、CLI 零连接预览、完整标定文件回放。模拟控制器的命令
+集合为 `{get}`，笛卡尔和关节 UDP 均无数据，带入摄像头/USB/allow_motion 配置也未打开设备。
+
+网页脚本另在内置 V8 中用假 WebSocket/定时器验证语法、断线重连与组件移除后取消重试，
+未创建真实连接或 XR 会话。使用步骤及可复制命令已同步 `a10_vr_operator.md`。
+
+**仍需用户现场标定与只读方向核对。** 开发测试没有产生现场标定文件，没有执行实机运动，
+也没有解决原生 follower 的启停行为；本轮校验不能替代真实方向、跟踪及停止验收。

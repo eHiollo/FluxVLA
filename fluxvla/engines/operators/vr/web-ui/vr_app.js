@@ -100,44 +100,60 @@ AFRAME.registerComponent('controller-updater', {
     const serverHostname = window.location.hostname;
     const websocketPort = window.FLUXVLA_WS_PORT || 8442; // Make sure this matches controller_server.py
     const websocketUrl = `wss://${serverHostname}:${websocketPort}`;
+    this.websocketRetry = null;
+    this.websocketDisposed = false;
+    this.retryWebSocket = () => {
+      if (!this.websocketDisposed && this.websocketRetry === null) {
+        this.websocketRetry = setTimeout(() => {
+          this.websocketRetry = null;
+          this.connectWebSocket();
+        }, 1000);
+      }
+    };
     console.log(`Attempting WebSocket connection to: ${websocketUrl}`);
     // !!! IMPORTANT: Replace 'YOUR_LAPTOP_IP' with the actual IP address of your laptop !!!
     // const websocketUrl = 'ws://YOUR_LAPTOP_IP:8442';
-    try {
-      this.websocket = new WebSocket(websocketUrl);
-      this.websocket.onopen = (event) => {
-        console.log(`WebSocket connected to ${websocketUrl}`);
-        this.reportVRStatus(true);
-      };
-      this.websocket.onerror = (event) => {
-        // More detailed error logging
-        console.error(`WebSocket Error: Event type: ${event.type}`, event);
-        this.reportVRStatus(false);
-      };
-      this.websocket.onclose = (event) => {
-        console.log(`WebSocket disconnected from ${websocketUrl}. Clean close: ${event.wasClean}, Code: ${event.code}, Reason: '${event.reason}'`);
-        // Attempt to log specific error if available (might be limited by browser security)
-        if (!event.wasClean) {
-          console.error('WebSocket closed unexpectedly.');
-        }
-        this.websocket = null; // Clear the reference
-        this.reportVRStatus(false);
-      };
-      this.websocket.onmessage = (event) => {
-        let data;
-        try {
-          data = JSON.parse(event.data);
-        } catch (error) {
-          return;
-        }
-        if (data && data.type === 'hud') {
-          this.applyHud(data);
-        }
-      };
-    } catch (error) {
+    this.connectWebSocket = () => {
+      if (this.websocketDisposed || this.websocket) return;
+      try {
+        this.websocket = new WebSocket(websocketUrl);
+        this.websocket.onopen = (event) => {
+          console.log(`WebSocket connected to ${websocketUrl}`);
+          this.reportVRStatus(true);
+        };
+        this.websocket.onerror = (event) => {
+          // More detailed error logging
+          console.error(`WebSocket Error: Event type: ${event.type}`, event);
+          this.reportVRStatus(false);
+        };
+        this.websocket.onclose = (event) => {
+          console.log(`WebSocket disconnected from ${websocketUrl}. Clean close: ${event.wasClean}, Code: ${event.code}, Reason: '${event.reason}'`);
+          // Attempt to log specific error if available (might be limited by browser security)
+          if (!event.wasClean) {
+            console.error('WebSocket closed unexpectedly.');
+          }
+          this.websocket = null; // Clear the reference
+          this.reportVRStatus(false);
+          // Reconnect transport without refreshing/restarting the XR session.
+          this.retryWebSocket();
+        };
+        this.websocket.onmessage = (event) => {
+          let data;
+          try {
+            data = JSON.parse(event.data);
+          } catch (error) {
+            return;
+          }
+          if (data && data.type === 'hud') {
+            this.applyHud(data);
+          }
+        };
+      } catch (error) {
         console.error(`Failed to create WebSocket connection to ${websocketUrl}:`, error);
         this.reportVRStatus(false);
-    }
+        this.retryWebSocket();
+      }
+    };
     // --- End WebSocket Setup ---
 
     this.reportVRStatus = (connected) => {
@@ -158,6 +174,7 @@ AFRAME.registerComponent('controller-updater', {
         // Ignore cross-origin errors
       }
     };
+    this.connectWebSocket();
 
     if (!this.leftHand || !this.rightHand || !this.leftHandInfoText || !this.rightHandInfoText) {
       console.error("Controller or text entities not found!");
@@ -345,6 +362,13 @@ AFRAME.registerComponent('controller-updater', {
     }
     // --- End Modify Event Listeners ---
 
+  },
+
+  remove: function () {
+    this.websocketDisposed = true;
+    if (this.websocketRetry !== null) clearTimeout(this.websocketRetry);
+    this.websocketRetry = null;
+    if (this.websocket) this.websocket.close();
   },
 
   createAxisIndicators: function() {

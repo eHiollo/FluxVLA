@@ -21,6 +21,8 @@ teleop = dict(
         vr_to_robot_quat_xyzw=None,
         hand_to_tool_quat_xyzw=[0.7071067811865475, 0.7071067811865475, 0.0, 0.0],
     ),
+    # Site result, written by --calibrate-pose; auto-loaded only in absolute mode.
+    pose_calibration_path=str(_root / 'configs/a10/vr_calibration.local.json'),
     diagnostics_path=str(_root / 'work_dirs/a10/vr/teleop_diagnostics.jsonl'),
     input=dict(type='VROperator', arm='right',
                network=dict(host_ip='127.0.0.1', https_port=8443,

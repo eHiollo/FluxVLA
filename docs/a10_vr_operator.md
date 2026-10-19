@@ -65,7 +65,7 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
 参考姿态应明确手柄的指向和绕自身轴的转角；沿用这套约定后不能再独立指定任意平移方向，
 生成的固定平移坐标也由这次对应关系决定，应先只读检查方向是否符合操作习惯。
 如果要独立指定另一套平移方向和握持姿态，则需要重新确定这两个旋转。
-现阶段仍需填写现场参数，下面的交互标定程序只是待开发方案，不是已有命令。
+下面的交互标定程序会计算并保存现场参数，不必手填四元数。
 头显重置空间、追踪原点改变或设备位置改变后，需要重新确认标定，不能沿用错误的坐标系。
 
 开发时的精确关系如下；`R_A_B` 表示把 B 坐标表达的向量旋转到 A 坐标表达：
@@ -78,21 +78,73 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
 标定 R_base_vr = R_base_tool_calib × inverse(R_hand_tool) × inverse(R_vr_hand_calib)
 ```
 
-### 待开发：一次参考姿态标定程序
+### 一次参考姿态标定：照着操作即可
 
-计划扩展现有 `scripts/teleoperate.py`，新增 `--calibrate-pose` 入口；交互和采样放在现有
-`vr/runtime.py`，纯数学计算放在 `vr/control.py`，不另建工程目录。流程：
+已实现 `--calibrate-pose`。交互和采样在现有 `vr/runtime.py`，数学计算在 `vr/control.py`。
+**标定只读控制器监视端口（默认 5888），不使能、不启动 follower、不发送运动或夹爪指令。**
+机械臂停在你希望作为参照的姿态，先结束其他遥操作/跟随程序；控制器需已运行通信服务。
 
-1. 只读连接控制器监视端口并启动 VR 网页，不使能、不启动 follower、不发送运动或夹爪指令。
-2. 确认机械臂已停止；戴上 VR，把手柄摆成期望与夹爪对应的朝向。
-3. 终端确认后倒计时，再保持手柄静止约 1 秒；采集多帧新鲜的手柄及末端姿态，拒绝过期、
-   重复输入、姿态抖动过大或机械臂仍在运动的数据，不直接用单帧决定标定。
-4. 计算固定关系，用留出的采样检查稳定性与姿态重建误差（不等于方向已符合人的习惯）；合格后写入
-   `configs/a10/vr_calibration.local.json`（计划加入 Git 忽略规则），保留标定来源和参考姿态。
-5. 后续新模式从本地文件加载；重标定由明确命令触发，普通握键不覆盖。恢复控制前先用只读
-   观察检查朝向和固定平移方向，再进入正常遥操作。
+```bash
+cd /home/robot/VLA/FluxVLA_vr
+conda activate fluxvla
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop.py \
+  --calibrate-pose \
+  --cfg-options \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0
+```
 
-当前已完成默认值复用，**未实现上述交互入口和标定文件加载**，请勿直接运行拟定的选项。
+1. 在 VR 浏览器打开终端打印的 `https://电脑局域网IP:8443`。首次连接仍需信任本地证书。
+2. 观察静止的夹爪，把右手手柄摆成希望对应夹爪的朝向，注意指向和翻转角度。
+3. 在电脑终端按回车，会倒计时 **5 秒**；利用这段时间戴好头显、摆正手柄并按住右手握键。
+4. 保持手柄及机械臂静止约 **1 秒**。程序采集至少 10 对不同序号的新鲜姿态，
+   默认持续至少 1 秒；重复帧不计数，序号回退、过期、故障或跟随仍活动会拒绝。
+5. 看到“标定已保存”即完成。松开握键即可，程序会关闭 VR 服务与状态连接。
+   此过程不会让夹爪对齐手柄；它只记住你主动摆出的对应关系。
+
+**标定完成后保持 VR 页面和当前追踪会话，不要刷新页面、退出 VR 或重新居中。**
+启动下一条观察/遥操作命令后，网页会每秒重试 WebSocket，服务恢复即可继续发送同一追踪空间的数据。
+WebSocket 重连只恢复传输，不会重新创建 XR 会话。如果追踪空间已重置，文件无法自动检测其变化，
+应重新标定；不能仅凭“文件加载成功”认定旧方向仍有效。
+
+默认保存 `configs/a10/vr_calibration.local.json`，已加入 Git 忽略；文件包括两个四元数、
+控制器地址、手柄侧别、单位、时间、参考姿态和质量结果。再次明确执行标定才更新，
+替换前将旧文件备份为 `.json.bak`；取消、采样不合格或连接失败不会覆盖旧标定。
+
+可以先在命令中加 `--preview` 检查参数，不会连接设备或写标定文件。其他选项：
+
+| 选项 | 意义 |
+| --- | --- |
+| `--calibration-countdown 8` | 把准备倒计时改为 8 秒（允许 0～30） |
+| `--calibration-duration 2` | 保持并采样至少 2 秒（允许 1～5） |
+| `--pose-calibration /绝对路径/结果.json` | 指定标定输出；正常运行时同一选项用于加载该文件 |
+
+稳定性检查：手柄相对首帧位移不超过 15mm、转角不超过 3°；机器人不超过 2mm/1°；
+反馈和手柄最大接收年龄 0.25 秒。偶数帧拟合，奇数帧检查姿态重建误差不超过 3°。
+这些检查验证采样一致性，**不证明固定平移方向已经符合人的习惯**，仍需下面的只读观察。
+控制器本身的真实采样年龄未知，报告显式记录 `controller_sample_age_verified=false`。
+
+### 标定后先观察：不会发送运动指令
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop.py --observe \
+  --cfg-options \
+    teleop.pose_mapping=calibrated_absolute \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0
+```
+
+选择新模式且配置中的基座/VR 四元数为空时，会自动加载本地标定文件并打印路径。
+显式配置完整四元数时优先使用配置；旧 `anchor_relative` 模式不读取本地文件。
+控制器地址、手柄侧别、已声明的单位或手柄/工具轴约定不一致会拒绝加载，不会自动重新标定。
+如果用了自定义结果路径，观察和运行时都加 `--pose-calibration 该路径`。
+观察目标写入原 JSONL 的 `reference_control.user_target`，实际反馈在 `feedback.tcp_pq_m`；
+`sent_relative_target` 应为空。核对手往各方向移动时的目标变化，以及转动时的朝向是否符合预期。
+确定后再沿用实机连接参数切换到执行模式；本轮程序开发未代替现场验收。
 
 平移倍率沿用 `pos_scale × vr_to_robot_scale`，接管时若按精调扳机，再乘 `fine_scale_factor`；
 倍率在该次接管内固定，调整扳机后需松手再接管。新方式朝向为 **1:1**，不再叠加旧方式的
@@ -102,7 +154,8 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
 ### 离线回放
 
 `scripts/replay_vr_control.py` 新增 `--pose-mapping` 和 `--pose-calibration`。
-标定文件为 JSON，包含上述两个字段。例如用**明确仅作离线演示**的单位标定：
+回放既支持上面保存的完整标定结果，也支持只有上述两个字段的 JSON。
+例如用**明确仅作离线演示**的单位标定：
 
 ```bash
 printf '%s\n' '{"vr_to_robot_quat_xyzw":[0,0,0,1],"hand_to_tool_quat_xyzw":[0,0,0,1]}' \

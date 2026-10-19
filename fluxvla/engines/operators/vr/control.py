@@ -148,7 +148,7 @@ class CalibratedAnchorState(AnchorState):
         if not isinstance(calibration, dict) or set(calibration) != required:
             raise ValueError('pose_calibration requires vr_to_robot_quat_xyzw and hand_to_tool_quat_xyzw')
         if any(calibration[name] is None for name in required):
-            raise ValueError('pose_calibration requires both measured quaternions; no identity fallback')
+            raise ValueError('pose_calibration has missing quaternions; no identity fallback')
         rotations = []
         for name in ('vr_to_robot_quat_xyzw', 'hand_to_tool_quat_xyzw'):
             quat = vector(calibration[name], 4, name)

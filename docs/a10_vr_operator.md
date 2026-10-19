@@ -33,15 +33,17 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
   --cfg-options teleop.control_mode=reference teleop.pose_mapping=anchor_relative
 ```
 
-使用新方式前，在 `configs/a10/a10_vr_teleop.py` 的 `pose_calibration` 中填写**现场标定**的两个
-四元数（顺序均为 `[x,y,z,w]`，长度必须为 1），然后检查：
+使用新方式前，需要补齐 `configs/a10/a10_vr_teleop.py` 的 `pose_calibration`。
+`hand_to_tool_quat_xyzw` 已复用旧局部轴映射作为默认值，只需确定现场的
+`vr_to_robot_quat_xyzw`。四元数顺序均为 `[x,y,z,w]`，范数必须为 1，然后检查：
 
 ```bash
 python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
   --cfg-options teleop.control_mode=reference teleop.pose_mapping=calibrated_absolute
 ```
 
-配置中默认都是 `None`，因此未标定时这个命令会明确报错。它不会自动用单位四元数代替。
+`vr_to_robot_quat_xyzw` 仍默认 `None`，因此未完成现场标定时这个命令会明确报错。
+它不会自动用单位四元数代替。
 标定填好后也可以用 `--cfg-options teleop.pose_calibration.字段名='[x,y,z,w]'` 覆盖。
 原方式会忽略这些标定值，切换参数不必删除标定配置。
 去掉 `--preview` 才会启动 VR；仍默认 `vr_only=True`，不会连接机械臂。
@@ -53,10 +55,17 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
   它决定手往哪个方向移动时机器人也往哪个方向移动。它不是每帧随手腕变化的方向。
 - `hand_to_tool_quat_xyzw`：**工具坐标轴在手柄坐标系中的方向**（右乘）。
   它决定怎样握手柄时夹爪应朝哪里，并非把此四元数取逆后填入。
+  默认 `[0.7071067811865475, 0.7071067811865475, 0, 0]` 来自原 LeRobot
+  `AXIS_REMAP_VR_TO_ROBOT` 的逆旋转，沿用手柄局部轴到末端局部轴的约定。
+  这不是 XML 中法兰到夹爪的工具安装偏移，也不是 VR 固定空间到基座的标定。
 
-标定顺序：先根据现场固定坐标轴确定第一个旋转；再把手柄和夹爪摆到期望的对应朝向，
-记录二者的朝向，求第二个旋转。**单次“随便按下握键”不能同时确定这两个旋转。**
-现阶段参数由现场标定结果填写，本次没有增加自动标定或自动摆臂功能。
+沿用默认局部轴约定时，只需一次**有意识的参考姿态对齐**：机械臂静止，手柄握成希望与当前
+夹爪对应的朝向，同时读取两者姿态，结合已知的 `R_hand_tool` 求 `R_base_vr` 并固定保存。
+不要求手柄和夹爪位于同一位置，也不必再做两次方向移动标定。
+参考姿态应明确手柄的指向和绕自身轴的转角；沿用这套约定后不能再独立指定任意平移方向，
+生成的固定平移坐标也由这次对应关系决定，应先只读检查方向是否符合操作习惯。
+如果要独立指定另一套平移方向和握持姿态，则需要重新确定这两个旋转。
+现阶段仍需填写现场参数，下面的交互标定程序只是待开发方案，不是已有命令。
 头显重置空间、追踪原点改变或设备位置改变后，需要重新确认标定，不能沿用错误的坐标系。
 
 开发时的精确关系如下；`R_A_B` 表示把 B 坐标表达的向量旋转到 A 坐标表达：
@@ -65,8 +74,25 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
 目标位置 = 接管时实际末端位置
          + R_base_vr × (接管时平移倍率 × (当前手柄位置 - 接管时手柄位置))
 目标朝向 R_base_tool = R_base_vr × R_vr_hand × R_hand_tool
-标定 R_hand_tool = inverse(R_vr_hand_calib) × inverse(R_base_vr) × R_base_tool_calib
+沿用默认轴约定时：
+标定 R_base_vr = R_base_tool_calib × inverse(R_hand_tool) × inverse(R_vr_hand_calib)
 ```
+
+### 待开发：一次参考姿态标定程序
+
+计划扩展现有 `scripts/teleoperate.py`，新增 `--calibrate-pose` 入口；交互和采样放在现有
+`vr/runtime.py`，纯数学计算放在 `vr/control.py`，不另建工程目录。流程：
+
+1. 只读连接控制器监视端口并启动 VR 网页，不使能、不启动 follower、不发送运动或夹爪指令。
+2. 确认机械臂已停止；戴上 VR，把手柄摆成期望与夹爪对应的朝向。
+3. 终端确认后倒计时，再保持手柄静止约 1 秒；采集多帧新鲜的手柄及末端姿态，拒绝过期、
+   重复输入、姿态抖动过大或机械臂仍在运动的数据，不直接用单帧决定标定。
+4. 计算固定关系，用留出的采样检查稳定性与姿态重建误差（不等于方向已符合人的习惯）；合格后写入
+   `configs/a10/vr_calibration.local.json`（计划加入 Git 忽略规则），保留标定来源和参考姿态。
+5. 后续新模式从本地文件加载；重标定由明确命令触发，普通握键不覆盖。恢复控制前先用只读
+   观察检查朝向和固定平移方向，再进入正常遥操作。
+
+当前已完成默认值复用，**未实现上述交互入口和标定文件加载**，请勿直接运行拟定的选项。
 
 平移倍率沿用 `pos_scale × vr_to_robot_scale`，接管时若按精调扳机，再乘 `fine_scale_factor`；
 倍率在该次接管内固定，调整扳机后需松手再接管。新方式朝向为 **1:1**，不再叠加旧方式的

@@ -14,10 +14,13 @@ teleop = dict(
     control_mode='delta', observe_only=False,
     # Old mapping stays the default. New mode requires control_mode='reference'.
     pose_mapping='anchor_relative',  # or 'calibrated_absolute'
-    # Supply measured unit xyzw quaternions when selecting the new mode:
-    # dict(vr_to_robot_quat_xyzw=[...], hand_to_tool_quat_xyzw=[...])
-    # No identity fallback: tracking space -> robot base; tool axes -> hand.
-    pose_calibration=dict(vr_to_robot_quat_xyzw=None, hand_to_tool_quat_xyzw=None),
+    # Tracking space -> robot base still requires an intentional reference pose.
+    # Tool axes -> hand reuses inverse(AXIS_REMAP_VR_TO_ROBOT) from old teleop.
+    # This preserves the local-axis convention, not a measured world calibration.
+    pose_calibration=dict(
+        vr_to_robot_quat_xyzw=None,
+        hand_to_tool_quat_xyzw=[0.7071067811865475, 0.7071067811865475, 0.0, 0.0],
+    ),
     diagnostics_path=str(_root / 'work_dirs/a10/vr/teleop_diagnostics.jsonl'),
     input=dict(type='VROperator', arm='right',
                network=dict(host_ip='127.0.0.1', https_port=8443,

@@ -34,6 +34,13 @@ class OpenPIA10DenormalizeAction:
         stats = load_a10_stats(norm_stats)['action']
         self.low, self.high = stats['q01'], stats['q99']
 
+    def normalize_absolute(self, actions, state):
+        """Encode retained absolute targets relative to the NEW observation."""
+        actions = np.array(actions, dtype=np.float32, copy=True)
+        actions[:, :6] -= np.asarray(state, dtype=np.float32)[:6]
+        return np.ascontiguousarray(2. * (actions - self.low) /
+                                    (self.high - self.low + 1e-6) - 1., dtype=np.float32)
+
     def __call__(self, data):
         action = np.asarray(data['action'], dtype=np.float32)
         state = np.asarray(data['state'], dtype=np.float32)
@@ -44,6 +51,44 @@ class OpenPIA10DenormalizeAction:
         if state.shape != (7,) or not np.isfinite(state).all():
             raise ValueError('Expected finite original state[7]')
         action = (action[:, :7] + 1.) / 2. * (self.high - self.low + 1e-6) + self.low
+        action[:, :6] += state[:6]
+        if not np.isfinite(action).all():
+            raise ValueError('Nonfinite A10 action')
+        return np.ascontiguousarray(action, dtype=np.float32)
+
+
+@TRANSFORMS.register_module()
+class A10RTCDenormalizeAction:
+    """Undo native RTC training mean/std and restore absolute joint targets."""
+
+    def __init__(self, norm_stats):
+        if isinstance(norm_stats, (str, Path)):
+            norm_stats = json.loads(Path(norm_stats).read_text())
+        stats = norm_stats['a10']['action']
+        self.mean = np.asarray(stats['mean'], dtype=np.float32)
+        self.std = np.asarray(stats['std'], dtype=np.float32)
+        if (self.mean.shape != (7,) or self.std.shape != (7,)
+                or not np.isfinite(self.mean).all() or not np.isfinite(self.std).all()
+                or np.any(self.std < 0)):
+            raise ValueError('Expected finite seven-dimensional action mean/std')
+
+    def normalize_absolute(self, actions, state):
+        if np.any(self.std <= 0):
+            raise ValueError('RTC guidance requires positive action standard deviations')
+        actions = np.array(actions, dtype=np.float32, copy=True)
+        actions[:, :6] -= np.asarray(state, dtype=np.float32)[:6]
+        return np.ascontiguousarray((actions - self.mean) / self.std, dtype=np.float32)
+
+    def __call__(self, data):
+        action = np.asarray(data['action'], dtype=np.float32)
+        state = np.asarray(data['state'], dtype=np.float32)
+        if action.ndim == 3 and action.shape[0] == 1:
+            action = action[0]
+        if action.ndim != 2 or not len(action) or action.shape[1] < 7:
+            raise ValueError('Expected nonempty [T,D>=7] actions')
+        if state.shape != (7,) or not np.isfinite(state).all():
+            raise ValueError('Expected finite original state[7]')
+        action = action[:, :7] * self.std + self.mean
         action[:, :6] += state[:6]
         if not np.isfinite(action).all():
             raise ValueError('Nonfinite A10 action')

@@ -57,3 +57,20 @@ def load_openpi_a10_policy(checkpoint_dir, model_config):
             if buffer.is_meta:
                 raise RuntimeError(f'Unmaterialized model buffer: {type(module).__name__}.{name}')
     return model.eval()
+
+
+@VLAS.register_module(name='NativeA10Policy')
+def load_native_a10_policy(checkpoint_dir, model_config):
+    """Load a merged native A10 state dict strictly, without OpenPI remapping."""
+    from fluxvla.engines import build_vla_from_cfg
+    root = Path(checkpoint_dir).expanduser().resolve()
+    cfg = copy.deepcopy(dict(model_config))
+    cfg.update(pretrained_name_or_path=None, use_lora=False,
+               enable_mixed_precision_training=False)
+    with torch.device('cpu'):
+        model = build_vla_from_cfg(cfg)
+    tensors = load_file(str(root / 'model.safetensors'), device='cpu')
+    # The native export includes the expert embedding table. Keep all tensors.
+    model.load_state_dict(tensors, strict=True, assign=True)
+    print(f'[A10] Native checkpoint: {root}; {len(tensors)} tensors loaded strictly')
+    return model.eval()

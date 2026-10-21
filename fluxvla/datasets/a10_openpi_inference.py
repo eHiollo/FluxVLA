@@ -61,3 +61,50 @@ class OpenPIA10InferenceDataset:
             lang_tokens=torch.tensor([tokens], dtype=torch.long),
             lang_masks=torch.tensor([mask], dtype=torch.bool),
             states=torch.tensor(np.pad(normalized, (0, 25))[None], dtype=torch.float32))
+
+
+@DATASETS.register_module()
+class A10RTCInferenceDataset:
+    """Match the native RTC export's mean/std, HF tokenizer and PIL images."""
+
+    def __init__(self, norm_stats, tokenizer_path, max_token_len=128):
+        import json
+        from pathlib import Path
+        from fluxvla.engines import build_transform_from_cfg
+        if isinstance(norm_stats, (str, Path)):
+            norm_stats = json.loads(Path(norm_stats).read_text())
+        self.stats = norm_stats['a10']
+        pipeline = [
+            dict(type='NormalizeStatesAndActions', norm_type='mean_std',
+                 state_key='proprio', action_key=None, output_dtype='float32'),
+            dict(type='PreparePromptWithState'),
+            dict(type='ProcessPrompts', max_len=max_token_len,
+                 tokenizer=dict(type='PretrainedTokenizer', model_path=str(tokenizer_path),
+                                trust_remote_code=False)),
+            dict(type='PadStatesAndActions', model_action_dim=32),
+            dict(type='ResizeImagesWithPad', height=224, width=224, backend='pil'),
+            dict(type='SimpleNormalizeImages'),
+        ]
+        self.transforms = [build_transform_from_cfg(item) for item in pipeline]
+
+    def __call__(self, observation):
+        state = np.asarray(observation['qpos'], dtype=np.float32)
+        if state.shape != (7,) or not np.isfinite(state).all():
+            raise ValueError('Expected finite actual qpos[7]')
+        images = []
+        for key in ('base_0_rgb', 'right_wrist_0_rgb'):
+            image = np.asarray(observation[key])
+            if (image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8
+                    or min(image.shape[:2]) == 0):
+                raise ValueError('A10 images must be nonempty HWC uint8 RGB')
+            images.append(image.transpose(2, 0, 1))
+        data = dict(states=state.copy(), stats=self.stats,
+                    task_description=observation['task_description'],
+                    images=[images[0], np.zeros_like(images[0]), images[1]])
+        for transform in self.transforms:
+            data = transform(data)
+        return dict(images=torch.as_tensor(data['images'][None], dtype=torch.float32),
+                    img_masks=torch.tensor([[True, False, True]]),
+                    states=torch.as_tensor(data['states'][None], dtype=torch.float32),
+                    lang_tokens=torch.as_tensor(data['lang_tokens'][None], dtype=torch.long),
+                    lang_masks=torch.as_tensor(data['lang_masks'][None], dtype=torch.bool))

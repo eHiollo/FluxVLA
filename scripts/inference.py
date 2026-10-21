@@ -32,6 +32,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Train a model with the given configuration.')
     parser.add_argument(
+        '--acceleration', choices=['on', 'off'], default=None,
+        help='Select Triton/CUDA Graph (on) or plain PyTorch (off); omitted uses config default')
+    parser.add_argument(
         '--config',
         type=str,
         required=True,
@@ -59,6 +62,8 @@ if __name__ == '__main__':
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    from fluxvla.engines.utils.inference_config import select_inference_acceleration
+    select_inference_acceleration(cfg, args.acceleration)
     cfg.inference.cfg = cfg
     cfg.inference.ckpt_path = args.ckpt_path
     inference_runner = build_runner_from_cfg(cfg.inference)

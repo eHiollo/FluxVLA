@@ -154,6 +154,7 @@ class FakeController:
         self.fault = fault
         self.no_pong = no_pong
         self.commands, self.errors, self.operators = [], [], []
+        self.command_replies = {}
         self.actual = True
         self.tcp = True
         self.start_mode_override = None
@@ -203,7 +204,11 @@ class FakeController:
         options.update(kwargs)
         operator = A10Operator(**options)
         self.operators.append(operator)
-        operator.connect()
+        # Transaction deadline tests use 50--100 ms budgets. Give the local
+        # server thread time to schedule its handshake independently of that
+        # deliberately short command deadline on busy development machines.
+        with patch.object(operator._connection, 'timeout_s', max(.5, operator.timeout_s)):
+            operator.connect()
         return operator
 
     def handle(self, ws):
@@ -221,6 +226,15 @@ class FakeController:
                 command = packet[40:].decode('utf-8')
                 with self.lock:
                     self.commands.append(command)
+                if command in self.command_replies:
+                    reply = self.command_replies[command]
+                    if reply is None:
+                        ws.close()
+                        return
+                    if callable(reply):
+                        reply = reply()
+                    ws.send(wire_reply(reply))
+                    continue
                 if command == 'get':
                     reply = status_reply(active=self.active, mode=self.mode)
                     reply['ret_context']['motion_msg']['jog_coordinate'] = self.coordinate

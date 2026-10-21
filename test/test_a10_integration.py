@@ -138,6 +138,86 @@ class A10TrajectoryTest(unittest.TestCase):
         options.update(overrides)
         return operator.execute_trajectory(**options)
 
+    def test_trace_records_send_times_feedback_and_cross_chunk_gap(self):
+        import time
+        operator = self.started_operator(record_trajectory_trace=True)
+        self.execute(operator, count=2)
+        first = operator.last_trajectory
+        self.assertEqual(len(first['trace']), 2)
+        self.assertTrue(all(row['joint_sent'] and row['gripper_sent'] for row in first['trace']))
+        self.assertTrue(first['feedback_checks'])
+        for row in first['trace']:
+            self.assertGreaterEqual(row['joint_send_finished_s'], row['joint_send_started_s'])
+            self.assertEqual(row['target_joints_rad'], [.1] * 6)
+            self.assertEqual(row['feedback']['follower_mode'], 'Axis')
+        time.sleep(.03)
+        self.execute(operator, count=1)
+        row = operator.last_trajectory['trace'][0]
+        self.assertGreater(row['joint_send_gap_s'], .03)
+        self.assertIsNotNone(row['feedback']['actual_joints_rad'])
+        operator.stop_follower()
+
+    def test_trace_distinguishes_joint_sent_from_failed_usb_target(self):
+        operator = self.started_operator(record_trajectory_trace=True)
+        with patch.object(operator, '_send_gripper_target', side_effect=OSError('USB target failed')):
+            with self.assertRaisesRegex(OSError, 'USB target failed'):
+                self.execute(operator, count=1)
+        result = operator.last_trajectory
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['sent'], 0)
+        self.assertTrue(result['trace'][0]['joint_sent'])
+        self.assertFalse(result['trace'][0]['gripper_sent'])
+        self.assertIn('USB target failed', result['error'])
+        operator.stop_follower()
+
+    def test_60hz_joint_repeats_preserve_30hz_model_timing_and_usb_rate(self):
+        import json
+        import time
+        operator = self.started_operator(record_trajectory_trace=True,
+                                         trajectory_feedback_interval_s=1.)
+        targets = np.repeat(np.array([.1, .2, .3])[:, None], 6, axis=1)
+        started = time.monotonic()
+        self.execute(operator, count=3, arm_trajectories={'right': targets},
+                     dt=1. / 30., joint_target_repeat=2)
+        elapsed = time.monotonic() - started
+        packets = [self.controller.joint_udp.recv(1024) for _ in range(6)]
+        wire = np.array([json.loads(packet[40:].decode().split('=', 1)[1]) for packet in packets])
+        np.testing.assert_allclose(wire, np.rad2deg(np.repeat(targets, 2, axis=0)))
+        trace = operator.last_trajectory['trace']
+        self.assertEqual([r['action_index'] for r in trace], [0, 0, 1, 1, 2, 2])
+        self.assertEqual([r['repeat_index'] for r in trace], [0, 1, 0, 1, 0, 1])
+        self.assertTrue(all(r['joint_sent'] for r in trace))
+        self.assertEqual([r['gripper_sent'] for r in trace], [True, False] * 3)
+        np.testing.assert_allclose(np.diff([r['scheduled_monotonic_s'] for r in trace]),
+                                   1. / 60., atol=1e-6)
+        gaps = np.diff([r['joint_send_started_s'] for r in trace])
+        self.assertGreater(float(gaps.min()), .010)
+        self.assertLess(float(np.median(gaps)), .025)
+        self.assertGreaterEqual(elapsed, .095)
+        self.assertLess(elapsed, .3)
+        self.assertEqual(len([p for p in self.serial.writes if p[4] == 0x83]), 3)
+        self.assertEqual(operator.last_trajectory['selected'], 3)
+        self.assertEqual(operator.last_trajectory['sent'], 3)
+        self.assertEqual(operator.last_trajectory['joint_packets_sent'], 6)
+        self.assertEqual(operator.last_trajectory['gripper_targets_sent'], 3)
+        print('60Hz loopback: packet gaps ms=', (gaps * 1000).round(2).tolist(),
+              '3 model targets / 6 UDP packets / 3 USB writes, elapsed=', round(elapsed, 4))
+        operator.stop_follower()
+
+    def test_repeat_cancellation_does_not_send_second_copy(self):
+        operator = self.started_operator(record_trajectory_trace=True)
+        original = operator.send_joints
+        def cancel_after_first(target):
+            original(target)
+            operator._traj_stop_event.set()
+        with patch.object(operator, 'send_joints', side_effect=cancel_after_first):
+            with self.assertRaises(InterruptedError):
+                self.execute(operator, count=2, joint_target_repeat=2)
+        self.assertEqual(operator.last_trajectory['joint_packets_sent'], 1)
+        self.assertEqual(operator.last_trajectory['sent'], 0)
+        self.assertFalse(operator.last_trajectory['completed'])
+        operator.stop_follower()
+
     def test_paced_loopback_rows_and_usb_packets(self):
         import json
         import struct
@@ -184,7 +264,9 @@ class A10TrajectoryTest(unittest.TestCase):
                         dict(gripper_trajectories={'right': bad_grip}),
                         dict(gripper_trajectories={'right': [40]}),
                         dict(gripper_trajectories={'right': [40, float('nan'), 40]}),
-                        dict(dt=0), dict(async_exec=True), dict(head_trajectory=[0])):
+                        dict(dt=0), dict(async_exec=True), dict(head_trajectory=[0]),
+                        dict(joint_target_repeat=0), dict(joint_target_repeat=True),
+                        dict(joint_target_repeat=1.5)):
             with self.subTest(options=options), self.assertRaises((ValueError, NotImplementedError)):
                 self.execute(operator, **options)
         with self.assertRaises(TimeoutError):

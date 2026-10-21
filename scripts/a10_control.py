@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 HELP = """可用指令：
   reconnect                     重新连接并查询状态，不重发控制指令（仅 shell）
+  启动控制台                    python scripts/a10_control.py shell（自动启动共享连接）
   get [--raw]                   查看状态；--raw 显示完整回复
   manual_en                     手动使能，回读 Enabled
   manual_ds                     手动掉使能，回读 Disabled（不是急停）
@@ -25,9 +26,11 @@ HELP = """可用指令：
   follower_aj                   启动本连接的六轴关节跟随（仅 shell）
   joints                        查询六轴实际角度（度），只读取不发送目标
   joints --deg q1 q2 q3 q4 q5 q6 发送六轴绝对角度目标（仅 shell）
-  stop_follower                 停止本连接启动的跟随（仅 shell）
+  stop_follower                 停止跟随（共享模式也可停止推理；仅 shell）
   pq x y z qx qy qz qw          发送一个 UDP 目标（仅 shell）
   g_move --pos=毫米数            发送夹爪目标，范围 0..100 mm
+  其他指令（如 m_init）          原文发送到控制器，显示完整回复
+  raw 控制器指令                显式透传，可发送与内置名称相同的原生命令
   help                          显示帮助
   exit                          停止本次跟随后关闭连接，不自动掉使能
 
@@ -38,9 +41,18 @@ pq 的 xyz 单位是米，四元数顺序是 xyzw，须为单位四元数。
 UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场核对。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
 断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
-清错仍使用现场控制器界面，本控制台不透传任意控制器命令。
+内置指令保留参数检查和反馈确认；其他指令原文透传，不自动重试。
+透传回复 ret_code=0 只表示控制器接受，不表示动作完成；--read-only 禁止透传。
+原生命令回复默认等待 60 秒，可用启动参数 --command-timeout 修改。
+共享模式下查询不打断推理；控制指令会先停止推理跟随，推理不会自动恢复。
+回复超时表示执行结果未知；本地连接会关闭以隔离迟到回复，输入 reconnect 恢复查询。
+透传会撤销本地 UDP 目标发送资格；需 stop_follower 后重新启动跟随。
 """
 SESSION_COMMANDS = {'follower_cart', 'follower_aj', 'stop_follower', 'pq', 'reconnect'}
+BUILTIN_COMMANDS = SESSION_COMMANDS | {
+    'get', 'manual_en', 'manual_ds', 'exit', 'help',
+    'set_jog_coordinate', 'joints', 'g_move',
+}
 
 
 class CommandError(ValueError):
@@ -52,7 +64,16 @@ class CommandParser(argparse.ArgumentParser):
         raise CommandError(message)
 
 
-def parse_command(tokens):
+def parse_command(tokens, *, raw_text=None):
+    if tokens[:1] == ['raw']:
+        if len(tokens) < 2:
+            raise CommandError('raw 后请输入控制器指令。')
+        text = (raw_text.lstrip()[3:].lstrip() if raw_text is not None
+                else shlex.join(tokens[1:]))
+        return argparse.Namespace(command='controller_command', text=text)
+    if tokens and tokens[0] not in BUILTIN_COMMANDS:
+        return argparse.Namespace(command='controller_command',
+                                  text=raw_text if raw_text is not None else shlex.join(tokens))
     parser = CommandParser(prog='a10', add_help=False, allow_abbrev=False)
     subs = parser.add_subparsers(dest='command', required=True,
                                  parser_class=CommandParser)
@@ -108,8 +129,9 @@ def show_state(state, output=print):
 
 
 class A10Console:
-    def __init__(self, robot, output=print):
+    def __init__(self, robot, output=print, prepare_connection=None):
         self.robot, self.output = robot, output
+        self.prepare_connection = prepare_connection
         self.unresolved_follower = False
 
     def observe(self, state):
@@ -121,7 +143,7 @@ class A10Console:
         self.output(f'操作未完成：{exc}')
         if not self.robot.is_connected:
             self.unresolved_follower |= self.robot.follower_stop_pending
-            self.output('连接已断开，控制台保留。设备恢复后输入 reconnect；不会自动重发控制指令。')
+            self.output('控制连接当前不可用，控制台保留。输入 reconnect 重新连接并查询；不会自动重发控制指令。')
             if self.unresolved_follower:
                 self.output('之前的跟随尚未确认停止，请通过现场控制器确认；重连不会自动接管。')
 
@@ -133,6 +155,8 @@ class A10Console:
         else:
             self.unresolved_follower |= self.robot.follower_stop_pending
             self.robot.close()
+            if self.prepare_connection is not None:
+                self.prepare_connection()
             self.robot.connect()
             state = self.observe(self.robot.get_state())
             self.output('连接成功（状态读取已确认），未发送使能或运动指令。')
@@ -197,19 +221,26 @@ class A10Console:
         elif cmd == 'g_move':
             robot.send_gripper({robot.arm_name: args.pos})
             out('夹爪命令已收到成功回复；尚未确认夹爪到位。')
+        elif cmd == 'controller_command':
+            out(f'准备发送原生命令，最多等待 {robot.command_timeout_s:g} 秒回复；不会自动重发。')
+            reply = robot.send_controller_command(args.text)
+            out('控制器原始回复：' + json.dumps(reply, ensure_ascii=False, indent=2))
+            if reply['ret_code'] != 0:
+                raise RuntimeError(f"控制器拒绝指令，ret_code={reply['ret_code']}：{reply.get('ret_msg', '')}")
+            out('控制器已回复；未确认动作完成。')
         return True
 
     def shell(self, input_fn=input):
         self.output('输入 help 查看命令。此控制台可以发送控制指令；连接本身不会使能或启动跟随。')
         while True:
             try:
-                line = input_fn('a10> ').strip()
-                if not line:
+                line = input_fn('a10> ')
+                if not line.strip():
                     continue
                 tokens = shlex.split(line)
                 if tokens in (['--help'], ['-h']):
                     tokens = ['help']
-                if not self.execute(parse_command(tokens)):
+                if not self.execute(parse_command(tokens, raw_text=line)):
                     return 0
             except EOFError:
                 return 0
@@ -246,13 +277,25 @@ class A10Console:
 
 def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     parser = argparse.ArgumentParser(description='A10 真机通信控制台',
-                                     epilog='例如：--host 192.168.110.124 shell',
+                                     epilog='例如：shell（默认机器人 192.168.0.125）',
                                      allow_abbrev=False)
-    parser.add_argument('--host', required=True, help='工控机 IP 或主机名')
+    parser.add_argument('--host', default='192.168.0.125',
+                        help='工控机 IP 或主机名（默认：192.168.0.125）')
     parser.add_argument('--ws-port', type=int, default=5999)
     parser.add_argument('--udp-port', type=int, default=9998)
     parser.add_argument('--joint-udp-port', type=int, default=9999)
-    parser.add_argument('--timeout', type=float, default=5.0, help='命令确认超时秒数')
+    parser.add_argument('--timeout', type=float, default=5.0, help='连接、get 及内置反馈确认超时秒数')
+    parser.add_argument('--command-timeout', type=float, default=60.0,
+                        help='原生/透传控制器指令的回复等待秒数（默认：60；与 --timeout 独立）')
+    connection_mode = parser.add_mutually_exclusive_group()
+    connection_mode.add_argument('--shared', dest='shared', action='store_true',
+                                 help='使用共享连接（默认；控制台自动启动本机服务）')
+    connection_mode.add_argument('--direct', dest='shared', action='store_false',
+                                 help='独占直连机器人，不启动共享服务')
+    parser.set_defaults(shared=True)
+    parser.add_argument('--status-ws-port', type=int, default=5888)
+    parser.add_argument('--shared-host', default='127.0.0.1')
+    parser.add_argument('--shared-port', type=int, default=5870)
     parser.add_argument('--read-only', action='store_true', help='只读；禁止设置和控制命令')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='shell 或单次指令；默认 shell')
     args = parser.parse_args(argv)
@@ -272,15 +315,27 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
         return 0
 
     console = None
+    shared_service = None
     result = 0
     try:
         if operator_factory is None:
             from fluxvla.engines.operators.a10_operator import A10Operator
             operator_factory = A10Operator
+        if args.shared:
+            from fluxvla.engines.communication.a10_shared_server import ConsoleSharedControl
+            shared_service = ConsoleSharedControl(
+                (args.shared_host, args.shared_port), output=output,
+                host=args.host, ws_port=args.ws_port, status_ws_port=args.status_ws_port,
+                udp_port=args.udp_port, joint_udp_port=args.joint_udp_port,
+                timeout_s=args.timeout)
         robot = operator_factory(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
                                  joint_udp_port=args.joint_udp_port,
-                                 timeout_s=args.timeout, allow_motion=not args.read_only)
-        console = A10Console(robot, output)
+                                 timeout_s=args.timeout, command_timeout_s=args.command_timeout,
+                                 allow_motion=not args.read_only,
+                                 **(dict(shared_control=dict(host=args.shared_host, port=args.shared_port, role='console'))
+                                    if args.shared else {}))
+        console = A10Console(robot, output,
+                             prepare_connection=shared_service.start if shared_service else None)
         if interactive:
             try:
                 console.reconnect()
@@ -288,6 +343,8 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
                 console.report_error(exc)
             result = console.shell(input_fn)
         else:
+            if shared_service is not None:
+                shared_service.start()
             robot.connect()
             console.execute(command)
     except KeyboardInterrupt:
@@ -299,6 +356,12 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     finally:
         if console is not None and not console.cleanup():
             result = 1
+        if shared_service is not None:
+            try:
+                shared_service.close()
+            except (Exception, KeyboardInterrupt) as exc:
+                output(f'共享连接清理未完成：{exc}')
+                result = 1
     return result
 
 

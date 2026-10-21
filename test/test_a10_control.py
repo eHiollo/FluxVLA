@@ -7,11 +7,17 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
-from scripts.a10_control import main, parse_command, CommandError
+from scripts.a10_control import main as control_main, parse_command, CommandError
 from test_a10_operator import FakeController
+
+
+def main(argv=None, **kwargs):
+    # Existing protocol regressions explicitly exercise the direct transport.
+    return control_main(['--direct', *(argv or [])], **kwargs)
 
 
 class ConsoleTest(unittest.TestCase):
@@ -19,7 +25,7 @@ class ConsoleTest(unittest.TestCase):
         script = Path(__file__).resolve().parents[1] / 'scripts/a10_control.py'
         with FakeController() as c:
             c.activation = 'Disabled'
-            result = subprocess.run([sys.executable, str(script), '--host', '127.0.0.1',
+            result = subprocess.run([sys.executable, str(script), '--direct', '--host', '127.0.0.1',
                 '--ws-port', str(c.server.socket.getsockname()[1]),
                 '--udp-port', str(c.udp.getsockname()[1]),
                 '--joint-udp-port', str(c.joint_udp.getsockname()[1]), '--timeout', '1', 'shell'],
@@ -207,7 +213,7 @@ class ConsoleTest(unittest.TestCase):
 
     def test_malformed_commands_keep_shell_usable_and_send_no_controls(self):
         with FakeController() as c:
-            code, output = self.run_console(c, ['bogus', '"unterminated',
+            code, output = self.run_console(c, ['"unterminated',
                 'manual_en --typo', 'set_jog_coordinate --base',
                 'pq 0 0', 'pq nan 0 0 0 0 0 1', 'g_move --pos=101',
                 'get --raw', 'help', 'exit'])
@@ -335,7 +341,7 @@ class ConsoleTest(unittest.TestCase):
             self.assertIn('ret_context', '\n'.join(out))
             self.assertFalse(c.operators[0].is_connected)
         with patch('socket.socket', side_effect=AssertionError('unexpected network')):
-            for cmd in (['follower_cart'], ['stop_follower'], ['pq','0','0','0','0','0','0','1'], ['bad']):
+            for cmd in (['follower_cart'], ['stop_follower'], ['pq','0','0','0','0','0','0','1']):
                 self.assertEqual(main(['--host','example',*cmd], output=lambda _:None), 2)
             self.assertEqual(main(['--host','example','help'], output=lambda _:None), 0)
             with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exc:
@@ -348,6 +354,155 @@ class ConsoleTest(unittest.TestCase):
         self.assertEqual(parse_command(['joints','--deg','-1e-3','0','0','0','0','0']).targets[0],-.001)
         with self.assertRaises(CommandError):
             parse_command(['set_jog_coordinate','--to'])
+
+    def test_unknown_commands_preserve_text_and_controller_reply(self):
+        commands = ['m_init', '  custom --value="两个 words"  --pos=[1,2]  ']
+        with FakeController() as c:
+            for command in commands:
+                c.command_replies[command] = {'ret_code': 0, 'ret_msg': 'accepted',
+                                               'ret_context': 'plain controller text'}
+            code, output = self.run_console(c, [*commands, 'get', 'exit'])
+            self.assertEqual(code, 0)
+            self.assertEqual([v for v in c.commands if v != 'get'], commands)
+            self.assertIn('plain controller text', output)
+            self.assertNotIn('操作未完成', output)
+            self.assertFalse(c.operators[0].follower_stop_pending)
+
+    def test_unknown_command_failure_displays_actual_response_and_keeps_shell(self):
+        with FakeController() as c:
+            c.command_replies['m_init'] = {'ret_code': 72, 'ret_msg': 'init rejected',
+                                          'ret_context': {'reason': 'not ready'}}
+            code, output = self.run_console(c, ['m_init', 'get', 'exit'])
+            self.assertEqual(code, 0)
+            self.assertIn('"ret_code": 72', output)
+            self.assertIn('not ready', output)
+            self.assertIn('控制器拒绝指令', output)
+            self.assertNotIn('控制器已回复；未确认动作完成', output)
+
+    def test_unknown_command_readonly_and_disconnected_do_not_send(self):
+        with FakeController() as c:
+            code, output = self.run_console(c, ['m_init', 'exit'], ['--read-only'])
+            self.assertEqual(code, 0)
+            self.assertNotIn('m_init', c.commands)
+            self.assertIn('allow_motion is false', output)
+        with FakeController() as c:
+            c.command_replies['disconnect_me'] = None
+            code, output = self.run_console(c, ['disconnect_me', 'm_init', 'help', 'exit'])
+            self.assertEqual(code, 0)  # Arbitrary commands are not follower starts.
+            self.assertIn('控制台保留', output)
+            self.assertIn('可用指令', output)
+            self.assertNotIn('m_init', c.commands)
+
+    def test_unknown_command_invalidates_targets_but_preserves_cleanup(self):
+        with FakeController() as c:
+            c.command_replies['m_init'] = {'ret_code': 0, 'ret_context': ''}
+            code, output = self.run_console(c, ['follower_aj', 'm_init',
+                'joints --deg 0 0 0 0 0 0', 'reconnect', 'exit'])
+            self.assertEqual(code, 0)
+            self.assertIn('Axis follower start has not been confirmed', output)
+            self.assertIn('连接已保留', output)
+            self.assertEqual(c.commands.count('stop_follower'), 1)
+            with self.assertRaises(socket.timeout):
+                c.joint_udp.recvfrom(65535)
+
+    def test_unknown_command_can_start_follower_without_granting_udp_permission(self):
+        with FakeController() as c:
+            def start():
+                c.active, c.mode = True, 'Axis'
+                return {'ret_code': 0, 'ret_context': ''}
+            c.command_replies['custom_start'] = start
+            code, output = self.run_console(c, ['custom_start',
+                'joints --deg 0 0 0 0 0 0', 'exit'])
+            self.assertEqual(code, 0)
+            self.assertIn('Axis follower start has not been confirmed', output)
+            self.assertFalse(c.active)
+            self.assertEqual(c.commands.count('stop_follower'), 1)
+
+    def test_one_shot_unknown_command(self):
+        with FakeController() as c:
+            c.command_replies['m_init --mode=1'] = {'ret_code': 0, 'ret_context': ''}
+            out = []
+            self.assertEqual(main(['--host', '127.0.0.1', 'm_init', '--mode=1'],
+                operator_factory=lambda **_: c.operator(), output=out.append), 0)
+            self.assertIn('m_init --mode=1', c.commands)
+
+    def test_explicit_raw_preserves_native_arguments_for_builtin_name(self):
+        with FakeController() as c:
+            native = 'manual_en --native="two words"  --value=3'
+            c.command_replies[native] = {'ret_code': 0, 'ret_context': 'native response'}
+            code, output = self.run_console(c, ['raw ' + native, 'exit'])
+            self.assertEqual(code, 0)
+            self.assertIn(native, c.commands)
+            self.assertIn('native response', output)
+        with self.assertRaises(CommandError):
+            parse_command(['raw'])
+
+    def test_raw_start_stop_and_readonly_keep_ownership_rules(self):
+        with FakeController() as c:
+            code, output = self.run_console(c, ['raw follower_aj',
+                'joints --deg 0 0 0 0 0 0', 'raw stop_follower', 'exit'])
+            self.assertEqual(code, 0)
+            self.assertIn('Axis follower start has not been confirmed', output)
+            self.assertEqual(c.commands.count('stop_follower'), 1)
+            self.assertFalse(c.active)
+        with FakeController() as c:
+            code, output = self.run_console(c, ['raw manual_en', 'exit'], ['--read-only'])
+            self.assertEqual(code, 0)
+            self.assertNotIn('manual_en', c.commands)
+
+    def test_native_reply_budget_is_independent_from_get_timeout(self):
+        with FakeController() as c:
+            def slow_reply():
+                time.sleep(.12)
+                return {'ret_code': 0, 'ret_context': 'init reply'}
+            c.command_replies['m_init'] = slow_reply
+            code, output = self.run_console(c, ['m_init', 'get', 'exit'],
+                ['--timeout', '.05', '--command-timeout', '.5'])
+            self.assertEqual(code, 0)
+            self.assertIn('init reply', output)
+            self.assertEqual(c.commands.count('m_init'), 1)
+            self.assertNotIn('stop_follower', c.commands)
+            self.assertEqual(c.operators[0].timeout_s, .05)
+            self.assertEqual(c.operators[0].command_timeout_s, .5)
+
+    def test_native_timeout_has_no_fictitious_follower_and_reconnect_does_not_replay(self):
+        with FakeController() as c:
+            def late_reply():
+                time.sleep(.12)
+                return {'ret_code': 0, 'ret_context': 'late init reply'}
+            c.command_replies['m_init'] = late_reply
+            code, output = self.run_console(c,
+                ['m_init', 'get', 'reconnect', 'get', 'exit'], ['--command-timeout', '.03'])
+            self.assertEqual(code, 0)
+            self.assertIn('执行结果未知', output)
+            self.assertIn('为避免迟到回复串线', output)
+            self.assertNotIn('之前的跟随尚未确认停止', output)
+            self.assertNotIn('late init reply', output)
+            self.assertNotIn('stop_follower', c.commands)
+            self.assertEqual(c.commands.count('m_init'), 1)
+            self.assertGreaterEqual(c.commands.count('get'), 4)
+            self.assertFalse(c.operators[0].follower_stop_pending)
+
+    def test_known_raw_follower_start_timeout_retains_stop_obligation(self):
+        with FakeController() as c:
+            def late_start():
+                c.active, c.mode = True, 'Axis'
+                time.sleep(.12)
+                return {'ret_code': 0, 'ret_context': ''}
+            c.command_replies['follower_aj'] = late_start
+            code, output = self.run_console(c, ['raw follower_aj', 'exit'],
+                ['--command-timeout', '.03'])
+            self.assertEqual(code, 1)
+            self.assertIn('之前的跟随尚未确认停止', output)
+            self.assertEqual(c.commands.count('follower_aj'), 1)
+            self.assertNotIn('stop_follower', c.commands)
+
+    def test_native_default_timeout_is_longer_than_connection_budget(self):
+        with FakeController() as c:
+            code, output = self.run_console(c, ['exit'])
+            self.assertEqual(code, 0)
+            self.assertEqual(c.operators[0].command_timeout_s, 60.)
+            self.assertEqual(c.operators[0].timeout_s, .15)
 
 
 if __name__ == '__main__':

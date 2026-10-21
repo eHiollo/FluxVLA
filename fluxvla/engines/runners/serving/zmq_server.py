@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Callable
 
@@ -66,6 +67,7 @@ class PolicyServer:
             port: TCP port to listen on.
         """
         self.running = True
+        self.debug_log = None
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind('tcp://{}:{}'.format(host, port))
@@ -133,12 +135,16 @@ class PolicyServer:
                     if handler.requires_input else handler.handler())
                 self.socket.send(MsgSerializer.to_bytes(result))
             except Exception as e:
+                if self.debug_log is not None:
+                    self.debug_log.record('server_error', error=repr(e), traceback=traceback.format_exc())
                 print(f'Error in server: {e}')
                 self.socket.send(MsgSerializer.to_bytes({'error': str(e)}))
 
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.close()
         self.context.term()
+        if self.debug_log is not None:
+            self.debug_log.close()
 
     def _handle_protobuf_predict(self, message: bytes):
         """Decode a protobuf ``PredictActionRequest`` and reply.
@@ -180,6 +186,8 @@ class PolicyServer:
         ``run()`` loop finishes its current iteration.
         """
         self.running = False
+        if self.debug_log is not None:
+            self.debug_log.close()
 
 
 def create_server(
@@ -191,6 +199,8 @@ def create_server(
     port: int = 5555,
     device: str = 'cuda:0',
     mixed_precision_dtype=torch.bfloat16,
+    debug_log=None,
+    model_metadata=None,
 ) -> PolicyServer:
     """Create a ZMQ server that wraps a VLA model.
 
@@ -204,6 +214,12 @@ def create_server(
         device: CUDA device.
         mixed_precision_dtype: Dtype for autocast.
     """
+    from fluxvla.engines.utils.a10_debug_log import create_a10_debug_log
+    recorder = create_a10_debug_log(debug_log, role='server', metadata=dict(
+        model=model_metadata or {}, implementation=type(vla).__name__,
+        mixed_precision_dtype=str(mixed_precision_dtype), device=device,
+        input_stats=getattr(dataset, 'stats', None),
+        denormalizer_state=(vars(denormalize_action) if hasattr(denormalize_action, '__dict__') else None)))
     torch_device = torch.device(device)
     vla.eval()
     vla.to(torch_device)
@@ -221,6 +237,19 @@ def create_server(
 
         obs = _obs_dict if _obs_dict is not None else \
             ObsSerializer.from_bytes(obs_data)
+        rtc_request = None
+        if isinstance(obs, dict) and 'a10_rtc_config' in obs:
+            import json
+            rtc_request = dict(config=json.loads(obs.pop('a10_rtc_config')),
+                               absolute_actions=obs.pop('a10_rtc_actions', None))
+            if _wire_format == FORMAT_PROTOBUF:
+                raise ValueError('A10 RTC currently requires the msgpack serializer')
+        rtc_info = None
+        if recorder is not None:
+            recorder.record('request_received',
+                            client_request_id=obs.get('debug_request_id') if isinstance(obs, dict) else None,
+                            observation_state=obs.get('qpos') if isinstance(obs, dict) else None,
+                            instruction=obs.get('task_description') if isinstance(obs, dict) else None)
         denormalize_context = {}
         if isinstance(obs, dict) and obs.get('qpos') is not None:
             denormalize_context['state'] = np.asarray(
@@ -238,6 +267,12 @@ def create_server(
             batch = obs
         if unnorm_key:
             batch['unnorm_key'] = unnorm_key
+        if rtc_request is not None:
+            from fluxvla.engines.utils.a10_rtc import inject_rtc
+            rtc_info = inject_rtc(batch, rtc_request, state=denormalize_context.get('state'),
+                                  denormalizer=denormalize_action, model=vla)
+            if recorder is not None:
+                recorder.record('rtc_guidance', client_request_id=obs.get('debug_request_id'), **rtc_info)
 
         t0 = time.perf_counter()
         autocast_enabled = (
@@ -253,8 +288,19 @@ def create_server(
             actions = vla.predict_action(**batch)
         infer_time = time.perf_counter() - t0
 
+        if recorder is not None:
+            raw_actions_np = actions.detach().cpu().numpy()
+            output_ready_s = time.perf_counter() - t0
+            recorder.record('model_prediction', client_request_id=obs.get('debug_request_id') if isinstance(obs, dict) else None,
+                            raw_normalized_actions=raw_actions_np,
+                            model_output_cpu_ready_s=output_ready_s,
+                            model_inputs={k: v for k, v in batch.items()
+                                          if k in ('states', 'lang_tokens', 'lang_masks', 'img_masks')},
+                            observation_state=denormalize_context.get('state'),
+                            instruction=obs.get('task_description') if isinstance(obs, dict) else None,
+                            infer_s=infer_time)
         if denormalize_action is not None:
-            actions_np = actions.cpu().numpy()
+            actions_np = raw_actions_np if recorder is not None else actions.cpu().numpy()
             d = denormalize_action(
                 dict(
                     action=actions_np,
@@ -278,7 +324,19 @@ def create_server(
                 'avg_infer={:.1f}ms'.format(avg * 1000),
                 flush=True)
 
-        return {'action_data': action_bytes, 'infer_time': infer_time}
+        result = {'action_data': action_bytes, 'infer_time': infer_time}
+        if rtc_info is not None:
+            result['debug'] = dict(rtc=rtc_info)
+        if recorder is not None:
+            info = dict(server_run_id=recorder.run_id, server_log_dir=str(recorder.path),
+                        request_number=n, client_request_id=obs.get('debug_request_id') if isinstance(obs, dict) else None,
+                        model=model_metadata or {}, implementation=type(vla).__name__)
+            if rtc_info is not None:
+                info['rtc'] = rtc_info
+            recorder.record('returned_actions', **info, absolute_actions_rad_mm=actions,
+                            infer_s=infer_time)
+            result['debug'] = info
+        return result
 
     def reset() -> dict:
         return {'status': 'ok'}
@@ -295,6 +353,7 @@ def create_server(
         }
 
     server = PolicyServer(host=host, port=port)
+    server.debug_log = recorder
     server.register_endpoint('predict_action', predict_action)
     server.register_endpoint('reset', reset, requires_input=False)
     server.register_endpoint('get_status', get_status, requires_input=False)

@@ -109,6 +109,22 @@ class A10RunnerTest(unittest.TestCase):
                             and 'action 1/4, joint 1' in line for line in logs.output))
         self.assertNotIn('start', operator.events)
 
+    def test_joint_repeat_keeps_model_step_count_and_partial_final_chunk(self):
+        runner, operator = self.make_runner(dry_run=False, action_dt=1. / 30.,
+                                            joint_target_repeat=2)
+        runner.run()
+        self.assertEqual(runner.last_cycle['steps'], 3)
+        self.assertEqual([len(x['arm_trajectories']['right']) for x in operator.batches], [2, 1])
+        for batch in operator.batches:
+            self.assertEqual(batch['dt'], 1. / 30.)
+            self.assertEqual(batch['joint_target_repeat'], 2)
+        self.assertEqual(runner.last_cycle['joint_publish_hz'], 60.)
+        self.assertEqual(runner.last_cycle['joint_target_repeat'], 2)
+        self.assertEqual(operator.events[-2:], ['stop', 'close'])
+        for value in (0, -1, True, 1.5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'joint_target_repeat'):
+                self.make_runner(joint_target_repeat=value)
+
     def test_joint_gripper_split_partial_final_chunk_and_dt(self):
         runner, operator = self.make_runner(dry_run=False, action_dt=.04)
         runner.run()

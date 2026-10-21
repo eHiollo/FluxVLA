@@ -53,6 +53,27 @@ class A10OpenPITest(unittest.TestCase):
             'state': {'q01': [-1.] * 7, 'q99': [2.] * 7},
             'actions': {'q01': [-.1] * 6 + [0.], 'q99': [.1] * 6 + [100.]}}}
 
+    def test_acceleration_selection_preserves_checkpoint_and_input_contract(self):
+        from fluxvla.engines.utils.inference_config import select_inference_acceleration
+        path = str(ROOT / 'configs/a10/a10_openpi_inference.py')
+        plain = Config.fromfile(path)
+        accelerated = Config.fromfile(path)
+        select_inference_acceleration(plain, 'off')
+        select_inference_acceleration(accelerated, 'on')
+        self.assertEqual(plain.inference_model.model_config.type, 'PI05FlowMatching')
+        self.assertEqual(plain.inference_model.model_config.llm_backbone.type, 'ConditionGemmaModel')
+        self.assertEqual(accelerated.inference_model.model_config.type, 'A10PI05FlowMatchingInference')
+        self.assertEqual(accelerated.inference_model.model_config.llm_backbone.type, 'ConditionGemmaInferenceModel')
+        self.assertEqual(plain.inference_model.checkpoint_dir, accelerated.inference_model.checkpoint_dir)
+        self.assertEqual(plain.inference.dataset, accelerated.inference.dataset)
+        self.assertEqual(plain.inference.denormalize_action, accelerated.inference.denormalize_action)
+        for mode in ('on', 'off'):
+            remote = Config.fromfile(str(ROOT / 'configs/a10/a10_remote_inference.py'))
+            with self.assertRaisesRegex(ValueError, 'model server'):
+                select_inference_acceleration(remote, mode)
+        with self.assertRaisesRegex(ValueError, 'does not declare'):
+            select_inference_acceleration(Config(dict(model=dict(type='OtherModel'))), 'on')
+
     def test_stats_and_denormalization_preserve_source(self):
         stats = load_a10_stats(self.stats)
         np.testing.assert_array_equal(stats['proprio']['q01'], [-1.] * 7)
@@ -191,7 +212,7 @@ class A10OpenPITest(unittest.TestCase):
         denorm = build_transform_from_cfg(cfg.inference.denormalize_action)
         model = build_vla_from_cfg(cfg.inference_model)
         self.assertEqual(len(list(model.parameters())), 811)
-        self.assertEqual(type(model).__name__, 'A10PI05FlowMatchingInference')
+        self.assertEqual(type(model).__name__, 'PI05FlowMatching')
         server = create_server(model, dataset, denorm, task_suite_name='a10',
                                host='127.0.0.1', port=0, device='cuda:0',
                                mixed_precision_dtype=torch.float32)

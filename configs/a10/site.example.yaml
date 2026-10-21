@@ -1,6 +1,6 @@
 # Copy to site.local.yaml and replace the addresses and camera placeholders.
 robot:
-  host: 127.0.0.1  # Address of the machine running the A10_new service.
+  host: 192.168.0.125  # Address of the machine running the A10_new service.
   port: 8080
   allow_motion: false
   max_joint_step_rad: null  # Confirm the permitted joint step onsite.

@@ -6,7 +6,7 @@ paths:
   outputs: work_dirs/a10
 robot:
   backend: A10LegacyFollower
-  host: 192.168.110.124
+  host: 192.168.0.125
   port: 8080
   timeout_ms: 300000
   state_dim: 7

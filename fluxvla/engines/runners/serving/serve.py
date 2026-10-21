@@ -21,6 +21,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Serve a VLA model via ZMQ for remote inference')
     parser.add_argument(
+        '--acceleration', choices=['on', 'off'], default=None,
+        help='Select Triton/CUDA Graph (on) or plain PyTorch (off); omitted uses config default')
+    parser.add_argument(
         '--config', required=True, help='Path to mmengine config file')
     weights = parser.add_mutually_exclusive_group(required=True)
     weights.add_argument('--ckpt-path', help='Path to native model checkpoint')
@@ -51,12 +54,16 @@ def main():
     configure_inference_attention_defaults()
 
     cfg = Config.fromfile(args.config)
+    from fluxvla.engines.utils.inference_config import select_inference_acceleration
+    select_inference_acceleration(cfg, args.acceleration)
 
     print('[serve] Building VLA model from config ...')
     if hasattr(cfg, 'inference_model'):
         vla = build_vla_from_cfg(cfg.inference_model)
     else:
         vla = build_vla_from_cfg(cfg.model)
+
+    print(f'[serve] Model implementation: {type(vla).__name__}')
 
     ckpt_path = args.ckpt_path
     if ckpt_path:
@@ -138,6 +145,14 @@ def main():
         port=args.port,
         device=args.device,
         mixed_precision_dtype=dtype_map[args.dtype],
+        debug_log=cfg.get('inference', {}).get('debug_log'),
+        model_metadata=dict(config_path=str(Path(args.config).resolve()),
+                            checkpoint_dir=cfg.get('inference_model', {}).get('checkpoint_dir'),
+                            checkpoint_path=args.ckpt_path,
+                            acceleration=args.acceleration,
+                            dtype=args.dtype,
+                            dataset=cfg.get('inference', {}).get('dataset'),
+                            denormalize_action=cfg.get('inference', {}).get('denormalize_action')),
     )
     print(f'[serve] ZMQ server starting on tcp://{args.host}:{args.port}')
     try:

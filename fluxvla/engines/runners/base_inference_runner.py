@@ -481,6 +481,7 @@ class BaseInferenceRunner:
             'total_ms': t_total * 1000,
             'payload_kb': payload_size / 1024,
             'response_kb': resp_size / 1024,
+            'server_debug': response.get('debug'),
         }
 
         if self._enable_profiling:

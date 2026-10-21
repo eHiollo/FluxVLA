@@ -4,13 +4,59 @@
 
 本节用于直接连接工控机上的 KAANH follower。命令解析放在 `scripts/a10_control.py`，机器人通信仍由 `fluxvla/engines/operators/a10_operator.py` 完成。
 
-### 1. 打开控制台
+### 默认自动选择推理连接
+
+推理启动时自动选择连接：本机5870共享服务存在就复用；没有服务就直接连接机器人5999（控制）和5888（状态）。无需先启动控制台。
+模型服务已启动后直接执行：
+
+```bash
+python scripts/inference.py --config configs/a10/a10_remote_inference.py
+```
+
+控制台已打开时，直接使用上述推理命令即可同时使用，无需配置参数。
+仅当本机共享端口明确拒绝连接时才采用直连；服务超时、协议错误或机器人地址/端口不匹配会明确报错，不会静默回退。
+连接方式在启动或显式重连时选择；运行中不会切换连接或自动重发运动命令。
+若先启动推理并已直连，之后再打开控制台无法接管现有直连；需结束推理，先开控制台，再启动推理。
+
+### 可选：控制台与推理共用连接
+
+机器人5999和5888端口按单连接方式共享；5867留给示教器。仅在需要控制台与推理同时使用时启用共享连接，
+共享服务统一持有机器人两条WebSocket及UDP发送socket，控制台默认自动启动共享服务。
+首次切换需退出旧的直连控制台/推理客户端一次；机器人端服务不必关闭。
+之后控制台窗口可以一直保留，`get` 与推理状态查询并行，命令回复不会串到其他会话。
+
+同一 `fluxvla` 环境、仓库根目录，启动控制台即可：
+
+```bash
+python scripts/a10_control.py shell
+```
+
+看到“共享连接已自动启动”及连接成功后，保持控制台打开，在另一终端启动推理。
+已有共享服务时自动复用，不会再连接一份机器人。模型服务保持原启动方式；推理客户端仍使用：
+
+```bash
+python scripts/inference.py --config configs/a10/a10_remote_inference.py
+```
+
+- 查询不会抢占动作控制权；`--read-only shell` 仍禁止控制指令。
+- 控制台 `m_init`、使能/掉使能、夹爪等控制器指令会先停止共享服务所属的推理follower并回读确认，再执行。停止未确认时不执行后续命令。
+- 控制台可 `stop_follower` 停止当前推理；也可显式启动自身follower。被接管的推理终止当前发送并清理，不自动恢复，也不会停止控制台新启动的follower。
+- 单个时刻只允许一个会话发送关节/末端目标。推理不会抢占控制台已启动的follower；控制台停止后再显式重启推理。
+- 控制连接意外关闭时，服务尝试停止该会话所属follower并确认；服务/网络异常仍不能保证物理停止。日志目录后缀 `_shared_control` 保存控制权切换和确认结果。
+- 共享服务只监听本机127.0.0.1:5870，机器人控制端口仍固定5999，状态5888、UDP9998/9999不变。相机与USB夹爪仍由推理客户端管理。
+- 控制台退出时会关闭自己启动的共享服务，并尝试停止当前共享跟随；推理期间请保持该控制台打开。复用外部服务时，退出控制台不会关闭外部服务。
+
+需要临时回到独占直连时，关闭共享服务后，控制台加 `--direct`；推理配置可显式设置 `inference.operator.shared_control=None`。
+
+### 1. 独占直连控制台（未使用共享服务时）
+
+机器人默认 IP 为 `192.168.0.125`，控制 WebSocket 端口固定为 `5999`（按2026-10-16新版控制器接口分配；5867留给示教器），状态端口为 `5888`，控制台与原生推理配置已统一；独占连接时加 `--direct`，用 `--host` 覆盖地址。模型服务的 `--host 127.0.0.1` 是本机监听地址，与机器人 IP 无关。
 
 工控机的 kaanhbin 需已正常运行；已运行时不要再启动一份。以下命令在运行 FluxVLA 的机器终端执行：
 
 ```bash
 cd /home/robot/VLA/FluxVLA
-/home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 shell
+/home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --direct --host 192.168.0.125 shell
 ```
 
 当前 **kaanh_follower** 分支统一在 `/home/robot/VLA/FluxVLA` 开发和运行。原 VR 未提交开发内容保存在 `backup/vr-before-consolidation-20261015` 分支；迁回前的版本和附件备份位置见迁移计划末尾。迁回验证已通过，三个旧的独立工作目录已移除；后续统一从本目录运行。
@@ -20,10 +66,10 @@ cd /home/robot/VLA/FluxVLA
 只想查询一次可运行：
 
 ```bash
-/home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --host 192.168.110.124 get
+/home/robot/miniforge3/envs/fluxvla/bin/python scripts/a10_control.py --direct --host 192.168.0.125 get
 ```
 
-只读交互模式：在 shell 前加 `--read-only`。查看帮助用 `--help`，查看指令列表用 `--host 192.168.110.124 help`；帮助不连接设备。默认 WS 5999、Cartesian UDP 9998、关节 UDP 9999、超时 5 秒，可在 shell/get 前用 `--ws-port`、`--udp-port`、`--joint-udp-port`、`--timeout` 修改。两路 UDP 端口不能相同。
+只读交互模式：在 shell 前加 `--read-only`。查看帮助用 `--help`，查看指令列表用 `--host 192.168.0.125 help`；帮助不连接设备。默认 WS 5999、Cartesian UDP 9998、关节 UDP 9999、超时 5 秒，可在 shell/get 前用 `--ws-port`、`--udp-port`、`--joint-udp-port`、`--timeout` 修改。两路 UDP 端口不能相同。
 
 ### 2. 首次现场验证：每次输入一条，检查成功后再下一条
 
@@ -40,7 +86,7 @@ stop_follower
 
 预期结果依次是：状态可读取且无故障 → 坐标系 Tool → 电机 Enabled → 跟随运行中、Cart → 状态再次确认 → 跟随未运行。
 
-- 若 get 报警，先在控制器界面核对并清除，不继续后面的控制命令。本控制台不提供猜测的清错命令。
+- 若 get 报警，先核对故障及现场控制器文档；控制台支持透传已知的控制器原生命令（如 `m_init`），不推测清错命令的语义。
 - manual_en/manual_ds 仅适用于确认的 Manual 模式；不会自动切换 Auto/Manual。
 - 若已有其他程序启动的 follower，控制台拒绝接管。请由原操作方结束。
 - 本轮只验证启停，不包含 pq 或夹爪目标，不能据此宣称运动接口已完整验收。
@@ -65,11 +111,25 @@ stop_follower
 | `stop_follower` | 停止本连接启动的跟随并确认，只能在 shell 使用 |
 | `pq x y z qx qy qz qw` | 将占位符替换成 7 个实际数字；仅 shell，发送一个 UDP 目标 |
 | `g_move --pos=毫米数` | 替换成 0..100 的数字，发送夹爪目标；回复成功不等于到位 |
+| `m_init` 等其他指令 | 未内置的指令按输入原文透传至控制 WebSocket，显示控制器完整 JSON 回复 |
+| `raw 控制器指令` | 显式透传，例如 `raw manual_en --原生参数`；可处理与内置名称重名的原生命令 |
 | `exit` | 尝试停止本次跟随并关闭连接，不自动掉使能 |
 
 pq 的 xyz 单位是 **米**，四元数为 **xyzw** 且长度须为 1；采用附件模板的相对启动基准目标，不是绝对位置，也不是“每输入一次就再走这么远”。七个零不是有效四元数。该控制台不累加、不插值、不做坐标变换；规划属于控制器。单次发送没有应用层 ACK，显示“已发送”不证明收到或执行。具体方向、尺度、旋转组合和接收频率需要现场单独验收，未验证前不要直接套用其他机器人的目标数值。
 
 get 没有实际夹爪字段时显示“暂无反馈”，不填假数据。夹爪尚未验证到位条件。控制台不后台记录数据、不新增 work_dirs 结果目录；需要开发排查时可手动保留终端输出。
+
+在 `a10>` 输入 `m_init` 或带参数的其他控制器指令即可发送，参数、引号及空格按原文保留。内置命令继续执行原有格式检查；需要使用同名命令的原生参数时加 `raw ` 前缀。也支持单次执行 `python scripts/a10_control.py m_init`。单次入口的参数先经系统 shell 解析，控制台会重新引用后发送；需要字节一致的文本时使用交互入口。
+
+透传也受 `--read-only` 限制；未连接时不会发送，不自动重试。完整回复中的非零 `ret_code` 会明确显示为失败，零只表示收到接受回复，不表示机器人动作完成。透传前后会查询状态，期间撤销本地 UDP 目标发送资格。已知 `follower_cart`／`follower_aj` 的启动尝试、原有本次跟随，以及透传后反馈确认从未跟随变为跟随，会保留停止清理义务；普通 `m_init` 仅因回复超时不会被当作启动了 follower。透传后需要发送 UDP 目标时，如有待停止的本次跟随先 `stop_follower`，再用内置 `follower_aj` 或 `follower_cart` 重新确认启动。未接管其他会话已运行的跟随。
+
+原生控制器命令回复默认等待 **60 秒**，与连接、`get` 和内置反馈确认的 `--timeout`（默认 5 秒）独立。长时命令可以这样增加等待时间：
+
+```bash
+python scripts/a10_control.py --command-timeout 120 shell
+```
+
+本地控制器源码 `A10_new/robot.cpp` 中 `m_init` 会持续运行到关节到位或约 28000 个控制周期；该磁盘源码不证明实机一定使用同一版本，但说明不能把它视为必须立即回复的短命令。回复等待超时只表示**执行结果未知**，不证明未执行、失败或机器人已停止。客户端关闭本地控制连接以隔离迟到回复；输入 `reconnect` 只重连并查询，不补发 `m_init`。普通命令超时不产生虚假的跟随停止提醒；确有本次 follower 未确认停止时仍保留提醒。
 
 ### 4. 退出及错误处理
 
@@ -126,7 +186,7 @@ UDP wire 使用 40 字节 ARIS 消息头 + UTF-8 `jp --motor_pos=[六个度数]`
 
 ## 原生 A10 推理接入（2026-10-12）
 
-当前已经接入 **相机观测 → 模型推理 → 关节 follower 与 USB 夹爪**。2026-10-15 用户确认集成目录已跑通，现统一迁回主目录；下面从只读观测开始介绍使用方法。默认配置仍为 dry_run，VR 未纳入本轮。
+当前已经接入 **相机观测 → 模型推理 → 关节 follower 与 USB 夹爪**。2026-10-15 用户确认集成目录已跑通，现统一迁回主目录；下面从只读观测开始介绍使用方法。远程配置已按现场设置为实际执行（`dry_run=False`、`allow_motion=True`），只读示例必须显式覆盖；VR 未纳入本轮。
 
 ### 1. 进入本轮开发目录
 
@@ -146,7 +206,7 @@ conda activate fluxvla
 
 两种方式都使用 `A10InferenceRunner → A10Operator`，不调用旧 `projects/a10` 推理循环，也不启动原 OpenPI 服务。模型名称有 OpenPI 是因为权重来自那里，运行使用 FluxVLA 原生模型。
 
-本机已准备好忽略的资产：`checkpoints/a10_openpi_90000/`（权重、config.json、assets 内统计文件）和 `checkpoints/tokenizers/paligemma_tokenizer.model`。搬到另一台机器时要一起复制；它们没有提交进 Git。也可以设置 `A10_OPENPI_CHECKPOINT` / `A10_OPENPI_TOKENIZER` 指向准备好的资产，运行不需要旁边的 OpenPI 仓库。
+本机已准备好忽略的资产：`checkpoints/a10_openpi_40000/`（权重、config.json、assets 内统计文件）和 `checkpoints/tokenizers/paligemma_tokenizer.model`。搬到另一台机器时要一起复制；它们没有提交进 Git。也可以设置 `A10_OPENPI_CHECKPOINT` / `A10_OPENPI_TOKENIZER` 指向准备好的资产，运行不需要旁边的 OpenPI 仓库。
 
 USB 夹爪依赖已在 fluxvla 环境安装；新环境安装：
 
@@ -154,21 +214,92 @@ USB 夹爪依赖已在 fluxvla 环境安装；新环境安装：
 python -m pip install -r requirements-a10.txt
 ```
 
-### 默认加速推理（2026-10-15）
+### 自动调试日志
 
-`a10_openpi_inference.py` 默认使用 `A10PI05FlowMatchingInference`，基于原生
-Triton + CUDA Graph、BF16 内核，保留 10 次去噪和 30 步预测。本机推理与按此
-配置启动的 ZMQ 服务都使用此路径；机器人端 `a10_remote_inference.py` 无需修改。
-已运行的服务需重启才能加载新配置。
+A10 配置默认开启持久化调试记录，保持现有启动命令即可。客户端和模型服务各自
+打印 `A10 debug log directory: ...`，输出位于
+`work_dirs/a10/inference_logs/<UTC时间_随机编号>_client/` 或 `_server/`。
+更新后须重启模型服务和客户端才能启用新记录。
 
-A10 数据预处理仍输出三视角及 `[True, False, True]` mask，模型适配器只移除无效
-左腕占位图，保留 base/right 顺序。它也将所有融合权重移到 CUDA，首次预测完成
-内核准备和图录制，此次耗时不代表稳定推理耗时。服务命令的 `--dtype fp32` 表示
-关闭外层 autocast；融合内核仍使用 BF16。
+- `metadata.json`：实际配置、模型目录/精度/实现、有效归一化统计、代码版本与源码哈希、软件版本、单位。
+- `events.jsonl`：每轮状态、完整预测和选择的动作、夹爪限幅前后目标、跨块目标跳变、名义目标速度/加速度、耗时和停止原因。
+- 客户端轨迹 trace：每帧计划/实际发包时间、相邻发包间隔、关节/USB发送成功标记及已有状态反馈；异常时保留部分发送结果。
+- 服务端：归一化模型输出、实际状态/token/mask、反归一化目标、请求编号和模型身份；请求编号关联客户端与服务端记录。
+- `console.log`：Python 日志和异常；`frames/`：原始RGB图像抽样，默认每5轮一次，另保存启动观测。
+- `summary.json`：日志关闭时的丢弃事件数与写入错误数。没有该文件可能仍在运行或未正常关闭。
 
-Thor 上预热后 20 次测试约 100ms/次（约 10Hz，纯模型），不含机器人执行。
-相同噪声的单个样本与 FP32 对照最大关节差约 0.0044rad、夹爪差约 3.14mm；
-该结果不代表任务成功率验证。此变更保留 dry_run/allow_motion 和执行限幅配置。
+磁盘写入在有界后台队列中执行；关节发送循环只积累内存 trace，不增加机器人查询。
+队列满会记录丢弃数，写盘失败会报告；需要连同日志健康信息检查记录是否完整。
+反馈时间是本机接收时间，跨主机 monotonic 时钟不可直接比较；发送成功不等于
+控制器接收或物理到位。名义目标速度/加速度也不是实测机械臂速度/加速度。
+
+生成便于粘贴的摘要：
+
+```bash
+python scripts/a10_log_summary.py work_dirs/a10/inference_logs/实际的_client目录
+```
+
+调试时保留对应 client 和 server 两个目录；可先贴摘要和目录路径，后续可直接读取
+完整动作、图像及异常定位。用 `inference.debug_log.image_every_n_cycles=0`
+关闭图像抽样；用 `inference.debug_log.enabled=False` 关闭客户端记录。
+
+### 原生 RTC 训练 50000 步模型
+
+新模型位于 `checkpoints/FluxVLA-A10-RTC-50k/`，专用配置是
+`configs/a10/a10_rtc_inference.py`。它严格加载 812 个原生权重张量（LoRA
+已合并，不再注入），使用随包 tokenizer、PIL 缩放、训练配置中的
+`mean_std` 状态/动作归一化，并将前六维关节 delta 还原为绝对目标；
+夹爪仍为毫米绝对值。不能直接替换旧 OpenPI 加载器的权重目录。
+
+先停止旧模型服务，再运行：
+
+```bash
+python -m fluxvla.engines.runners.serving.serve \
+  --config configs/a10/a10_rtc_inference.py \
+  --from-config --dtype fp32 --acceleration off --host 127.0.0.1 --port 5555
+```
+
+机器人端继续使用 `python scripts/inference.py --config configs/a10/a10_remote_inference.py`。
+客户端默认任务已同步为训练指令：抓水瓶、放入旁边盒子、关盖并回到初始位置。
+设备、执行步数及限值保留现场配置。OpenPI 配置现默认加载 `checkpoints/a10_openpi_40000/`；90000 权重仍保留作比较。40000 来自 OpenPI 的 `checkpoints/pi05_a10_finetune/40000`，已验证 811 个参数严格加载、数值有限且统计文件与源一致；该 checkpoint 未保存历史任务指令，不能将当前代码默认 prompt 当作已验证的训练记录。
+
+这是更换 **RTC 训练权重**，当前 A10 同步 runner 尚未启用推理时的前缀条件
+或异步执行。`rtc_training_config.max_delay=9` 的本仓库实现采样 **0..8** 步，
+延迟前缀作为已知动作并在损失中屏蔽，并非每个样本固定丢弃前九步。
+加速开关不修改此训练参数。将来接入实时 RTC 时须根据实际观测到发送的延迟
+计算对应前缀，不能仅将九改成纯模型推理耗时除以动作间隔。
+
+### 推理加速开关（2026-10-15）
+
+为比较推理效果，`a10_openpi_inference.py` 默认使用普通 PyTorch
+`PI05FlowMatching`。启动入口支持 `--acceleration off`（普通 PyTorch）和
+`--acceleration on`（原生 Triton + CUDA Graph，BF16 融合内核）。省略开关
+时使用配置默认值。两条路径使用同一份 checkpoint、归一化统计和 tokenizer，
+均为 10 次去噪、30 步预测。此处 OpenPI 配置默认使用 40000 步权重，新 RTC 权重使用上节专用配置。
+
+远程推理把开关加在**模型服务**命令上，切换时先 Ctrl+C 退出旧模型服务，再重启：
+
+```bash
+# 普通 PyTorch FP32，用于本轮效果对比
+python -m fluxvla.engines.runners.serving.serve \
+  --config configs/a10/a10_openpi_inference.py \
+  --from-config --dtype fp32 --acceleration off --host 127.0.0.1 --port 5555
+
+# Triton + CUDA Graph；--dtype fp32 关闭外层 autocast，融合内核仍为 BF16
+python -m fluxvla.engines.runners.serving.serve \
+  --config configs/a10/a10_openpi_inference.py \
+  --from-config --dtype fp32 --acceleration on --host 127.0.0.1 --port 5555
+```
+
+服务启动打印实际模型类型：`PI05FlowMatching` 为普通路径，
+`A10PI05FlowMatchingInference` 为加速路径。机器人端仍运行
+`python scripts/inference.py --config configs/a10/a10_remote_inference.py`，
+不要把加速开关加到远程客户端，它不能切换已运行的服务。
+本机推理可使用 `python scripts/inference.py --config configs/a10/a10_openpi_inference.py --acceleration off`（或 `on`）。
+
+普通路径通常更慢，可能拉长动作块之间的等待；关闭加速不等于修复动作衔接。
+首次加速预测仍包含内核准备和图录制。历史加速耗时与数值对照见迁移记录，
+不代表普通路径的性能或实机任务成功率。
 
 ### 3. 可以先只启动模型服务，不接设备
 
@@ -189,7 +320,8 @@ python -m fluxvla.engines.runners.serving.serve \
 ```bash
 python scripts/inference.py \
   --config configs/a10/a10_openpi_inference.py \
-  --cfg-options inference.operator.host=192.168.110.124
+  --cfg-options inference.operator.host=192.168.0.125 \
+    inference.dry_run=True inference.operator.allow_motion=False
 ```
 
 使用上一步启动的 ZMQ 服务（另开一个终端进入相同目录/环境）：
@@ -197,27 +329,36 @@ python scripts/inference.py \
 ```bash
 python scripts/inference.py \
   --config configs/a10/a10_remote_inference.py \
-  --cfg-options inference.operator.host=192.168.110.124
+  --cfg-options inference.operator.host=192.168.0.125 \
+    inference.dry_run=True inference.operator.allow_motion=False
 ```
 
-示例保留 `dry_run=True` 和 `allow_motion=False`：读取设备实际反馈、预测并检查动作，但不发关节/夹爪运动目标，不使能、不启动跟随。没有两路相机或 USB 夹爪时会报错，不会拿假图像/零位置代替。仅启动模型服务不要求设备在线。
+以上只读示例显式设置 `dry_run=True` 和 `allow_motion=False`：读取设备实际反馈、预测并检查动作，但不发关节/夹爪运动目标，不使能、不启动跟随。没有两路相机或 USB 夹爪时会报错，不会拿假图像/零位置代替。仅启动模型服务不要求设备在线。
 
 ### 5. 真正执行动作时的参数
 
-先完成上面的只读步骤，确认关节顺序/弧度、夹爪毫米、相机画面和现场控制器设置。执行需要显式设置 `dry_run=False`、`operator.allow_motion=True` 和已现场确认的 `max_joint_step_rad`；不提供未经核对的限值。电机使能仍由现场用户使用控制台单独完成，runner 不自动使能或回零。
+先完成上面的只读步骤，确认关节顺序/弧度、夹爪毫米、相机画面和现场控制器设置。远程配置已按用户现场设置保存 `dry_run=False`、`operator.allow_motion=True`、`max_joint_step_rad=0.2`；直接运行远程配置会发送运动目标，无需再输入覆盖参数。电机使能仍由现场用户使用控制台单独完成，runner 不自动使能或回零。下表为当前远程配置；本机配置可能不同。
 
 | 参数 | 当前默认含义 |
 | --- | --- |
 | `action_chunk=30` | 模型一次预测 30 步，和 checkpoint metadata 对齐 |
-| `execute_horizon=10` | 每轮只发送前 10 步，然后重新拍照、读取状态、预测 |
-| `action_dt=1/30` | 原数据每秒 30 帧，连续训练目标的间隔为约 33.3ms |
-| `max_publish_step=30` | 本次运行累计选择 30 步后结束 |
+| `execute_horizon=15` | 每轮只发送前 15 步，然后重新拍照、读取状态、预测 |
+| `action_dt=1/30` | 原数据每秒 30 帧，每个模型目标的持续时间约 33.3ms |
+| `joint_target_repeat=2` | 当前默认：每个关节目标以约 16.7ms 间隔发两遍，UDP 60Hz；USB夹爪仍每个模型目标发一次。设为1恢复30Hz |
+| `max_publish_step=3000` | 本次运行累计选择 3000 步后结束 |
 | `max_joint_step_rad` | 检查第一步相对实际观测，以及随后各步的关节目标变化 |
 | `gripper_mm_range=(0,85)` | 默认 USB 夹爪工作范围；模型预测超出范围时限制到边界并打印提示，不把毫米当速度 |
 
-`execute_trajectory()` 是把 10 行动作按时间逐行发送：前六个数走关节 UDP 9999，第七个数走本机 USB 夹爪。一个周期发送一次各自目标，机器人内部插补/运动规划由控制器负责；UDP 没有每帧 ACK，返回完成仅代表发送流程结束，不能据此证明实际到位。
+`execute_trajectory()` 按模型时间逐行发送；当前每行前六个关节数通过 UDP 9999
+在 `t` 和 `t+1/60秒` 各发一次，下一行在 `t+1/30秒` 开始；夹爪仅第一遍写本机USB。
+15个模型目标对应30个UDP包，计划时长仍为0.5秒（另加状态检查耗时），不是把动作加速两倍。
+日志保留模型 `selected/sent` 计数，并增加 `joint_packets_sent`、`gripper_targets_sent`、
+`joint_publish_hz`、逐包 `action_index/repeat_index`，用于核对60Hz实际间隔。
+超时/取消后不突发补发重复包。推理等待期间的跨块发包空档仍存在。
+机器人内部插补/运动规划由控制器负责；UDP没有每帧ACK，发送结束不证明实际到位。
+提高刷新频率是否改善跟随须现场对比，不能仅据频率认定运动速度加倍。
 
-推理配置用 WebSocket 5888 每 0.05 秒请求一次 `get` 并保存最新状态；5999 仍负责 follower 启停，UDP 9999 仍逐行发送六轴目标。拍照推理和动作块检查读取最近状态，超过 0.5 秒未收到新反馈、监视连接断开、出现故障或跟随模式变化就停止发新目标。状态查询和动作发送互不占用同一 WebSocket 请求；USB 夹爪仍单独读写。查询时间和相机／夹爪时间不构成严格硬件同步；UDP 仍没有每帧确认。手动控制台没有启用后台监视时保留同步查询方式。
+推理配置用 WebSocket 5888 每 0.05 秒请求一次 `get` 并保存最新状态；5999 负责 follower 启停，UDP 9999 仍逐行发送六轴目标。拍照推理和动作块检查读取最近状态，超过 0.5 秒未收到新反馈、监视连接断开、出现故障或跟随模式变化就停止发新目标。状态查询和动作发送互不占用同一 WebSocket 请求；USB 夹爪仍单独读写。查询时间和相机／夹爪时间不构成严格硬件同步；UDP 仍没有每帧确认。手动控制台没有启用后台监视时保留同步查询方式。
 
 Ctrl+C 请求停止当前会话的 follower 并关闭资源；`p` + Enter 在当前动作块完成后结束。停止失败会明确输出未确认日志，需现场处理。关闭串口/网络不代表机械臂/夹爪物理停止，也不自动掉使能。
 
@@ -233,7 +374,7 @@ conda activate fluxvla
 python scripts/inference.py \
   --config configs/a10/a10_remote_inference.py \
   --cfg-options \
-    inference.operator.host=192.168.110.124 \
+    inference.operator.host=192.168.0.125 \
     inference.operator.allow_motion=False \
     inference.dry_run=True \
     inference.execute_horizon=30 \
@@ -370,7 +511,7 @@ python -m fluxvla.projects.a10 validate --root datasets/a10/onsite_trial_001 --e
 目前模型只训练两步，已出现夹爪越界预测，只证明软件流程连通，不能用来直接控制机器人。正式训练与实机效果均尚未验收。
 
 
-2026-10-12 启动修复：后台监视配置下，连接时首次真实状态读取也来自 5888；5999 仍用于跟随启停及其原有确认。若启动报监视端状态超时，尚未执行动作，需检查控制器服务；不会以默认状态继续运动。
+2026-10-12 启动修复：后台监视配置下，连接时首次真实状态读取也来自 5888；5999 用于跟随启停及其原有确认。若启动报监视端状态超时，尚未执行动作，需检查控制器服务；不会以默认状态继续运动。
 
 模型夹爪输出允许出现有限的边界偏差，runner 将其限制在 gripper_mm_range（默认 0～85mm）；关节目标不因此改变，手动夹爪目标越界仍报错。
 

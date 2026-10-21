@@ -1,0 +1,22 @@
+终端一：启动加速模型服务
+
+    cd /home/robot/VLA/FluxVLA
+    source /home/robot/miniforge3/etc/profile.d/conda.sh
+    conda activate fluxvla
+
+    python -m fluxvla.engines.runners.serving.serve \
+    --config configs/a10/a10_openpi_inference.py \
+    --from-config \
+    --dtype fp32 \
+    --host 127.0.0.1 \
+    --port 5555
+
+
+ 终端二：启动机器人控制台
+    启动kaanhbin程序
+    conda activate fluxvla
+    python scripts/a10_control.py shell
+
+ 终端三：启动机器人控制
+    python scripts/inference.py \
+  --config configs/a10/a10_remote_inference.py

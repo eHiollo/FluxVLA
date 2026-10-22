@@ -28,7 +28,16 @@ class VRTeleopRuntime:
                  max_rotation_tracking_error_rad=0.35,
                  control_mode='delta', reference_options=None, observe_only=False,
                  pose_mapping='anchor_relative', pose_calibration=None,
-                 controller_speed_percent=None):
+                 controller_speed_percent=None, cartesian_adapter='legacy_anchor'):
+        if cartesian_adapter not in ('legacy_anchor', 'sdk_tool_cumulative'):
+            raise ValueError('Unknown cartesian_adapter')
+        if cartesian_adapter == 'sdk_tool_cumulative':
+            if control_mode != 'reference' or getattr(vr, 'is_dual', False) or getattr(robot, 'is_multi_arm', False):
+                raise ValueError('SDK tool adapter requires single-arm reference mode')
+            if robot is not None and getattr(robot, 'cartesian_wire_format', None) != 'pe321':
+                raise ValueError('SDK tool adapter requires cartesian_wire_format=pe321')
+        self.cartesian_adapter = cartesian_adapter
+        self.last_sdk_command = None
         if controller_speed_percent is not None and (
                 type(controller_speed_percent) is not int or not 1 <= controller_speed_percent <= 100):
             raise ValueError('controller_speed_percent must be None or an integer within 1..100')
@@ -225,8 +234,14 @@ class VRTeleopRuntime:
         inverse_anchor = Rotation.from_quat(anchor[3:]).inv()
         relative = np.concatenate((inverse_anchor.apply(target[:3] - anchor[:3]),
                                    (inverse_anchor * Rotation.from_quat(target[3:])).as_quat()))
-        self.robot.send_eepose({self.robot.arm_name: relative})
-        self.last_relative_target = relative.copy()
+        if self.cartesian_adapter == 'sdk_tool_cumulative':
+            self.last_sdk_command = self.robot.send_sdk_tool_pose(
+                target, max_position_step_m=self.max_position_step_m,
+                max_rotation_step_rad=self.max_rotation_step_rad)
+            self.last_relative_target = None  # Cumulative 321 is not a relative pose.
+        else:
+            self.robot.send_eepose({self.robot.arm_name: relative})
+            self.last_relative_target = relative.copy()
 
     def _check_tracking(self, pose, target):
         position_error = np.linalg.norm(target[:3] - pose[:3])
@@ -264,6 +279,7 @@ class VRTeleopRuntime:
         self.gripper.set_position_mm(target)
 
     def step(self):
+        self.last_sdk_command = None
         self.last_relative_target = None
         self.last_reference_result = None
         started = time.monotonic()
@@ -303,6 +319,8 @@ class VRTeleopRuntime:
                               sent_relative_target=self.last_relative_target,
                               step_elapsed_s=time.monotonic() - started,
                               error=error, execute=self.execute,
+                              cartesian_adapter=self.cartesian_adapter,
+                              sdk_tool_command=self.last_sdk_command,
                               cartesian_wire_format=getattr(self.robot, 'cartesian_wire_format', None),
                               control_mode=self.control_mode, observe_only=self.observe_only,
                               pose_mapping=self.pose_mapping,
@@ -392,6 +410,7 @@ class VRTeleopRuntime:
             self._target_pose = self._follower_anchor_pose = None
             self._engaged = False
             self._last_gripper_time = None
+            self.last_sdk_command = None
 
     def _step_reference(self, raw, action):
         """Read-only shadow or the explicitly selected new UDP control path."""
@@ -461,7 +480,11 @@ class VRTeleopRuntime:
                                              transmitted=False,
                                              startup_anchor_assumed=self.observe_only)
             if self.execute:
+                if self.cartesian_adapter == 'sdk_tool_cumulative':
+                    self.robot.begin_sdk_tool_trajectory(pose)
                 self._send_absolute_target(pose)
+                if self.cartesian_adapter == 'sdk_tool_cumulative':
+                    self.last_reference_result['relative_target'] = None
                 self.last_reference_result['transmitted'] = True
             return action
         # A fresh VR anchor appearing during a movement is not permission to
@@ -505,8 +528,9 @@ class VRTeleopRuntime:
             angle = (Rotation.from_quat(previous_target[3:]).inv() * Rotation.from_quat(target[3:])).magnitude()
             if distance > self.max_position_step_m or angle > self.max_rotation_step_rad:
                 raise ValueError('Reference command exceeds the configured step limit')
-            self.robot.send_eepose({self.robot.arm_name: result['relative_target']})
-            self.last_relative_target = np.array(result['relative_target'])
+            self._send_absolute_target(target)
+            if self.cartesian_adapter == 'sdk_tool_cumulative':
+                result['relative_target'] = None
             result['transmitted'] = True
             self._send_fresh_gripper(raw, action)
         self._target_pose = target.copy()

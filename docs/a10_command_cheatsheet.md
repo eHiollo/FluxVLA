@@ -2,6 +2,44 @@
 
 **用旧锚点算法调试实机，选第 ⑤ 条；检查标定方向，选第 ① 条。** 不需要每条都执行。
 
+## SDK 工具坐标适配试验（2026-10-22）
+
+只用于单臂 `reference` 模式；两种 `pose_mapping` 都可使用。默认仍为旧发送方式。
+新适配已完成离线测试，尚未实机验收；它修正指令坐标语义，没有添加实际误差积分补偿。
+
+在当前实机命令的 `--cfg-options` 参数中添加这一行即可：
+
+```bash
+teleop.cartesian_adapter=sdk_tool_cumulative
+```
+
+完整命令（先用 `--preview` 检查配置；现场准备好后去掉该参数启动）：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop.py --preview \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.control_mode=reference \
+    teleop.pose_mapping=calibrated_absolute \
+    teleop.cartesian_adapter=sdk_tool_cumulative \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0 \
+    teleop.controller_speed_percent=50 \
+    teleop.reference_options.max_linear_speed_m_s=0.06 \
+    teleop.reference_options.max_angular_speed_rad_s=0.32 \
+    teleop.reference_options.max_reference_lead_m=0.03 \
+    teleop.reference_options.max_reference_lead_rad=0.20
+```
+
+- 使用旧锚点映射：只把 `teleop.pose_mapping` 改为 `anchor_relative`。
+- 回退旧发送方式：停掉当前进程，改为 `teleop.cartesian_adapter=legacy_anchor` 后重新启动。
+- 正常完成控制并确认停止后才能换路径；不在同一次 follower 中混用。
+- 实机先验证单轴、再验证组合旋转和平移；若目标停住仍持续偏离，不提高阈值掩盖偏差。
+
 ## 先进入正确目录
 
 每次新开终端先执行：

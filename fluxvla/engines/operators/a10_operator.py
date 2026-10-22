@@ -3,8 +3,9 @@
 Wire layout follows the user-supplied robot.7z reference. Controller-side
 planning stays on the controller. This module does not open connections at
 import/construction, automatically enable motors, interpret VR increments, or invent a
-seventh joint. A Cartesian target is relative to the follower startup pose,
-with translation/orientation expressed in that anchor frame, not joint state.
+seventh joint. Legacy Cartesian packets retain their original encoding. Native
+Tool follower integrates cumulative component differences in current tool axes;
+use the opt-in SDK tool adapter for base-frame planned pose trajectories.
 """
 
 from __future__ import annotations
@@ -34,6 +35,42 @@ _HEADER = struct.Struct('<IIQqqq')
 _MAX_PAYLOAD = 1024 * 1024
 _FOLLOWER_MODES = {'cartesian': ('follower_cart', 'Cart'),
                    'joint': ('follower_aj', 'Axis')}
+
+
+class SDKToolCumulativeAdapter:
+    """Geometric feedforward only; does not estimate SDK execution progress.
+
+    Candidate generation is transactional: commit only after local UDP success.
+    Euler increments approximate the SDK's finer-grained component integration.
+    """
+
+    def __init__(self, startup_pose):
+        self.previous_pose = _pose(startup_pose).copy()
+        self.cumulative_pe = np.zeros(6)
+
+    def propose(self, target, *, max_position_step_m, max_rotation_step_rad):
+        target = _pose(target)
+        for limit in (max_position_step_m, max_rotation_step_rad):
+            if not math.isfinite(limit) or limit <= 0:
+                raise ValueError('SDK adapter step limits must be positive and finite')
+        previous_rotation = Rotation.from_quat(self.previous_pose[3:])
+        translation = previous_rotation.inv().apply(target[:3] - self.previous_pose[:3])
+        rotation = previous_rotation.inv() * Rotation.from_quat(target[3:])
+        if (np.linalg.norm(translation) > max_position_step_m
+                or rotation.magnitude() > max_rotation_step_rad):
+            raise ValueError('SDK adapter target exceeds step limit')
+        # This interface is for small continuous steps, never large Euler jumps.
+        if rotation.magnitude() >= np.pi / 2:
+            raise ValueError('SDK adapter rotation must be smaller than pi/2')
+        incremental = np.r_[translation, rotation.as_euler('ZYX')]
+        candidate = self.cumulative_pe + incremental
+        if not np.isfinite(candidate).all():
+            raise ValueError('SDK adapter cumulative target is not finite')
+        return target.copy(), candidate
+
+    def commit(self, target, cumulative_pe):
+        self.previous_pose = target.copy()
+        self.cumulative_pe = cumulative_pe.copy()
 
 
 class A10ProtocolError(ValueError):
@@ -385,16 +422,17 @@ class _FollowerConnection:
 class A10Operator(BaseOperator):
     """Six-axis A10 + gripper, using the reference KAANH follower protocol.
 
-    ``send_eepose({'right': pose})`` expects startup-anchor-relative xyz metres
+    Legacy ``send_eepose({'right': pose})`` accepts xyz metres
     + xyzw: T_relative = inverse(T_start) * T_target. Each follower start
-    refreshes the controller anchor; [0,0,0,0,0,0,1] holds that startup pose.
+    resets SDK cumulative progress. Tool packets are accumulated component
+    coordinates, not exact fixed-anchor pose targets for mixed rotations.
     ``cartesian_wire_format='pe321'`` keeps this public input and encodes signed
     Euler ZYX radians in ``type=321, pe`` to avoid the SDK pq angle wrap.
     ``send_joints({'right': joints})`` expects six absolute joint angles in
     radians. They are converted to degrees in UDP ``jp --motor_pos=[...]``;
     the gripper remains a separate command. Only the selected follower mode
     may receive targets, after this session's start is confirmed in feedback.
-    It does not convert absolute poses or per-frame VR deltas. Joint feedback
+    The opt-in SDK tool interface converts planned base poses separately. Joint feedback
     defaults to degrees on the wire per the template; set feedback_joint_unit
     to the verified controller convention. Position units are unknown by
     default. get_state() remains controller-only. get_frame() can compose
@@ -510,6 +548,8 @@ class A10Operator(BaseOperator):
         self.timeout_s = float(timeout_s)
         self.command_mode = command_mode
         self.cartesian_wire_format = cartesian_wire_format
+        self._sdk_tool_adapter = None
+        self._cartesian_raw_used = False
         self._cartesian_euler = np.zeros(3)
         self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
         self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s,
@@ -543,6 +583,8 @@ class A10Operator(BaseOperator):
                             arms=self._arm_specs, arm_name=self.arm_name)
 
     def _reset_cartesian_encoding(self):
+        self._sdk_tool_adapter = None
+        self._cartesian_raw_used = False
         self._cartesian_euler = np.zeros(3)
         self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
 
@@ -919,6 +961,7 @@ class A10Operator(BaseOperator):
     def stop_follower(self):
         self._traj_stop_event.set()
         with self._io_lock:
+            self._sdk_tool_adapter = None
             self._require_motion()
             if not self._started_here:
                 raise RuntimeError('This connection did not start the follower')
@@ -930,6 +973,50 @@ class A10Operator(BaseOperator):
             self._follower_mode = None
             return state
 
+    def begin_sdk_tool_trajectory(self, startup_pose):
+        """Initialize once after a confirmed fresh single-arm Tool follower start."""
+        with self._io_lock:
+            self._require_single_arm('SDK tool adapter')
+            self._require_target_owner()
+            self._require_motion()
+            if (not self._started_here or not self._confirmed_active
+                    or self._follower_mode != 'Cart' or self._sdk_tool_adapter is not None
+                    or self._cartesian_raw_used):
+                raise RuntimeError('SDK adapter requires a fresh confirmed Cartesian follower')
+            if self.cartesian_wire_format != 'pe321':
+                raise ValueError('SDK adapter requires cartesian_wire_format=pe321')
+            state = self.get_state()
+            if state.has_error or state.follower_active is not True or state.raw[
+                    'ret_context']['motion_msg'].get('jog_coordinate') != 'Tool':
+                raise RuntimeError('SDK adapter requires healthy active Tool feedback')
+            self._sdk_tool_adapter = SDKToolCumulativeAdapter(startup_pose)
+
+    def send_sdk_tool_pose(self, target, *, max_position_step_m, max_rotation_step_rad):
+        """Send a base-frame planned pose as cumulative local 321 components.
+
+        No actual-error integral or application ACK is implied by this method.
+        """
+        with self._io_lock:
+            adapter = self._sdk_tool_adapter
+            if adapter is None:
+                raise RuntimeError('SDK tool adapter is not initialized')
+            target, cumulative = adapter.propose(
+                target, max_position_step_m=max_position_step_m,
+                max_rotation_step_rad=max_rotation_step_rad)
+            payload = json.dumps(dict(type='321', pe=[cumulative.tolist()]),
+                                 separators=(',', ':'), allow_nan=False).encode('utf-8')
+            try:
+                self._send_follower_target(_pack(payload, command=False), 'Cart')
+            except BaseException:
+                # Delivery may be uncertain. Never resume the cumulative stream.
+                self._sdk_tool_adapter = None
+                self._confirmed_active = False
+                raise
+            adapter.commit(target, cumulative)
+            return dict(cumulative_pe321=cumulative.tolist(),
+                        planned_pose_m=target.tolist(), local_send_success=True,
+                        execution_confirmed=False)
+
     def send_eepose(self, arm_targets):
         """Accept metres/xyzw; optionally encode signed, continuous Euler 321.
 
@@ -940,6 +1027,8 @@ class A10Operator(BaseOperator):
             raise ValueError(f'Expected the complete arm group: {self.cartesian_target_order}')
         poses = {name: _pose(arm_targets[name]) for name in self.cartesian_target_order}
         with self._io_lock:
+            if self._sdk_tool_adapter is not None:
+                raise RuntimeError("Cannot mix legacy packets with SDK tool adapter")
             eulers = {}
             data = {'type': 'pq', 'pq': [value.tolist() for value in poses.values()]}
             if self.cartesian_wire_format == 'pe321':
@@ -956,6 +1045,7 @@ class A10Operator(BaseOperator):
                     rows.append(np.r_[value[:3], eulers[name]].tolist())
                 data = {'type': '321', 'pe': rows}
             payload = json.dumps(data, separators=(',', ':'), allow_nan=False).encode('utf-8')
+            self._cartesian_raw_used = True  # Includes uncertain sends; no mid-stream switch.
             self._send_follower_target(_pack(payload, command=False), 'Cart')
             if eulers:
                 self._cartesian_eulers.update(eulers)

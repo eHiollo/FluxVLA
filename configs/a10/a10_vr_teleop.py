@@ -15,6 +15,8 @@ teleop = dict(
     # Optional one-run controller percentage (1..100); None leaves it unchanged.
     # Applied/read back before follower start; restored only after confirmed stop.
     controller_speed_percent=None,
+    # Opt-in single-arm reference adapter; does not enable feedback compensation.
+    cartesian_adapter='legacy_anchor',  # or 'sdk_tool_cumulative'
     # Used only in reference mode. Offline-selected initial values, not hardware acceptance.
     # Outer half of each budget gradually slows outward reference progress.
     reference_options=dict(max_reference_lead_m=.02, max_reference_lead_rad=.12),

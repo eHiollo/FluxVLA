@@ -539,3 +539,37 @@ python scripts/teleoperate.py \
 `raw_input` 分左右手，`mapped_action`、`feedback.arms`、`reference_control.arms` 和
 `sent_relative_target` 按机械臂名区分。`reengage_requires_release` 表示该臂需要重新松手再接管。
 VR-only 中反馈和发送目标为空；该日志不是训练数据集，也不能证明实际机械臂已经停止。
+
+
+## 单臂 SDK Tool 累计指令适配（2026-10-22）
+
+`teleop.cartesian_adapter` 默认 `legacy_anchor`。在单臂 `control_mode=reference` 中选择
+`sdk_tool_cumulative`，可同时用于 `anchor_relative` 和 `calibrated_absolute`；要求 operator
+使用 `cartesian_wire_format=pe321`。delta 和双臂拒绝启用此适配。
+
+上层锚点、标定、reference、速度/加速度和跟踪保护保持原设计。新接口把相邻平滑 command
+位姿的差转换为上一计划工具系的小步运动，再累计为 SDK 的 xyz/Euler321 通道。
+它是几何前馈适配，不把反馈误差逐帧积分；下游滤波、规划时差与丢包仍可能导致残差。
+
+`A10Operator.begin_sdk_tool_trajectory(startup_pose)` 只能在本会话新启动、确认健康的 Tool
+Cartesian follower 且没有发送旧路径数据时调用。`send_sdk_tool_pose()` 接收机器人基坐标系
+中的米/xyzw 计划位姿，校验小步限值后发 `type=321, pe=[[...]]`。
+累计状态在本地发送成功后提交；成功仅表示本机发送，不表示控制器执行或 UDP 已送达。
+发送异常后废弃适配状态并撤销可发送资格，不自动重放。重复目标保持累计值；停止、关闭及
+重新启动会废弃旧状态；同一会话不能混用原 `send_eepose()`。
+
+新日志字段：`cartesian_adapter`、`sdk_tool_command.cumulative_pe321`（前三项米、后三项
+Euler321 弧度累计通道）、`planned_pose_m`、`local_send_success`、`execution_confirmed=false`。
+新路径不把累计六维通道伪装成 `sent_relative_target` 四元数。观察模式仍只计算目标，无适配发送。
+
+运行命令见 [命令速查](a10_command_cheatsheet.md)。回放工具：
+
+```bash
+python test/test_a10_sdk_adapter.py \
+  --replay-log work_dirs/a10/vr/teleop_diagnostics.jsonl \
+  --report work_dirs/a10/vr/sdk_tool_adapter_replay.json
+```
+
+此工具选取最近完成的旧发送方式绝对朝向实机会话，以历史 command 不变为前提，比较新旧
+累计指令在 SDK 几何叠加模型中的终点。不是完整滤波/规划复现，不重跑真实反馈闭环，
+不能将回放误差解释为实机控制精度。本轮尚未进行新适配的实机验收。

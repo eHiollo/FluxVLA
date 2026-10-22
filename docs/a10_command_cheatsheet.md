@@ -109,6 +109,28 @@ python scripts/teleoperate.py \
 - 该命令会真实控制机械臂，不能加 `--observe` 或 `--verify-calibration` 当作执行开关。
   程序不自动使能或回零；初次小幅操作，现场确认停止，切回旧映射不会修复已发现的控制器奇异点/停止问题。
 
+### ⑤补充：单次倍率与 reference 超前范围
+
+⑤的命令默认**不改控制器倍率**；单臂 reference 已启用 20 mm / 0.12 rad 超前范围。
+需要指定倍率时，在⑤的 `--cfg-options` 参数列表末尾增加（25 只是示例，需现场选择）：
+
+```text
+teleop.controller_speed_percent=25
+```
+
+程序在启动 follower 前设置并回读倍率，退出且确认停止后恢复原倍率。断线、停止未确认、
+现场改变模式或倍率时，不盲目恢复，终端会提示。只读观察和 VR-only 不修改倍率。
+
+| 可选运行参数 | 含义 |
+| --- | --- |
+| `teleop.controller_speed_percent=None` | 默认保留现场倍率；1～100 的整数表示本次采用的百分比 |
+| `teleop.reference_options.max_reference_lead_m=0.02` | reference 相对反馈最多正常超前约 20 mm，外侧一半范围逐渐减慢 |
+| `teleop.reference_options.max_reference_lead_rad=0.12` | 姿态同理，约 6.9°；两项仅在 reference 模式生效 |
+
+这些数值由离线回放选出，尚未实机验收；20 mm 是 reference 的正常预算，不保证最终 command 或机械臂
+制动距离也在 20 mm 内。原 50 mm / 0.35 rad 异常保护保留。**本次没有改松手停止流程，也没有修复 SDK 停止语义。**
+需要旧 reference 对照时，把两个 `max_reference_lead_*` 都设为 `None`。
+
 ## ⑥ 双臂基础状态查询：控制器部署双臂后使用
 
 ```bash

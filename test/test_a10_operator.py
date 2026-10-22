@@ -164,6 +164,9 @@ class FakeController:
         self.coordinate = 'Tool'
         self.motion = 'Stopped'
         self.op_mode = 'Manual'
+        self.jog_vel, self.pgm_vel = 10, 50
+        self.speed_change = True
+        self.reject_speed = False
         self.activation = 'Enabled'
         self.activation_change = True
         self.reject_enable = False
@@ -230,6 +233,8 @@ class FakeController:
                     reply['ret_context']['robot_msg']['motion'] = self.motion
                     reply['ret_context']['robot_msg']['op_mode'] = self.op_mode
                     reply['ret_context']['robot_msg']['activate'] = self.activation
+                    reply['ret_context']['motion_msg']['jog_vel'] = self.jog_vel
+                    reply['ret_context']['program_msg'] = {'vel': self.pgm_vel}
                     if not self.actual:
                         del reply['ret_context']['motion_msg']['actual_pos']
                     if not self.tcp:
@@ -260,6 +265,17 @@ class FakeController:
                         continue
                     time.sleep(self.get_reply_delay_s)
                     ws.send(frame)
+                elif command.startswith(('set_jog_vel --vel_percent=', 'set_pgm_vel --vel_percent=')):
+                    value = float(command.split('=')[1])
+                    if self.reject_speed:
+                        ws.send(wire_reply({'ret_code': 9, 'ret_msg': 'speed denied', 'ret_context': ''}))
+                    else:
+                        if self.speed_change:
+                            if command.startswith('set_jog_vel'):
+                                self.jog_vel = value
+                            else:
+                                self.pgm_vel = value
+                        ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                 elif command in ('follower_cart', 'follower_aj', 'stop_follower'):
                     if command != 'stop_follower' and self.start_rejected:
                         self.active = self.active_after_rejection

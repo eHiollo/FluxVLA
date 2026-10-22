@@ -27,7 +27,11 @@ class VRTeleopRuntime:
                  max_position_tracking_error_m=0.05,
                  max_rotation_tracking_error_rad=0.35,
                  control_mode='delta', reference_options=None, observe_only=False,
-                 pose_mapping='anchor_relative', pose_calibration=None):
+                 pose_mapping='anchor_relative', pose_calibration=None,
+                 controller_speed_percent=None):
+        if controller_speed_percent is not None and (
+                type(controller_speed_percent) is not int or not 1 <= controller_speed_percent <= 100):
+            raise ValueError('controller_speed_percent must be None or an integer within 1..100')
         if type(execute) is not bool:
             raise ValueError('execute must be bool')
         if control_mode not in ('delta', 'reference'):
@@ -104,9 +108,59 @@ class VRTeleopRuntime:
         self._input_read_time = None
         self._reference_stop_attempted = False
         self._require_release = False
+        self.controller_speed_percent = controller_speed_percent
+        self._speed_restore = None
+        self.speed_status = dict(requested_percent=controller_speed_percent, state='unchanged')
+
+    def _speed_event(self):
+        logging.getLogger(__name__).info('控制器倍率：%s', self.speed_status)
+        if self._diagnostics is not None:
+            self._diagnostics.write(dict(event='controller_speed_override',
+                                         controller_speed_override=self.speed_status))
+
+    def _apply_speed_override(self):
+        if self.controller_speed_percent is None:
+            return
+        if not self.execute:
+            self.speed_status['state'] = 'ignored_read_only'
+            self._speed_event()
+            return
+        try:
+            original = self.robot.get_speed_override()
+            self.speed_status.update(original=original, state='setting')
+            # A timed-out write may already have applied: retain restoration intent.
+            if original['percent'] != self.controller_speed_percent:
+                self._speed_restore = original
+            confirmed = self.robot.set_speed_override(
+                self.controller_speed_percent, expected_mode=original['mode'])
+            self.speed_status.update(state='confirmed', confirmed=confirmed)
+        except BaseException as exc:
+            self.speed_status.update(state='set_failed', error=str(exc))
+            self._speed_event()
+            raise
+        self._speed_event()
+
+    def _restore_speed_override(self):
+        original, self._speed_restore = self._speed_restore, None
+        if original is None:
+            return
+        try:
+            # Never reconnect or overwrite a different mode/operator's new setting.
+            if not self.robot.is_connected:
+                raise RuntimeError('连接已断开，未恢复倍率')
+            current = self.robot.get_speed_override()
+            if current['mode'] != original['mode'] or current['percent'] not in (
+                    self.controller_speed_percent, original['percent']):
+                raise RuntimeError('控制器模式或倍率已被改变，未覆盖现场设置')
+            self.robot.set_speed_override(original['percent'], expected_mode=original['mode'])
+            self.speed_status['state'] = 'restored'
+        except Exception as exc:
+            self.speed_status.update(state='restore_unconfirmed', restore_error=str(exc))
+            logging.getLogger(__name__).error('倍率恢复未确认：%s', exc)
+        self._speed_event()
 
     def connect(self):
-        """Start VR input and read-only robot connection; defer follower start."""
+        """Connect input/feedback, optionally set speed, and defer follower start."""
         if self._connected:
             raise RuntimeError('VR operator is already connected')
         try:
@@ -121,6 +175,8 @@ class VRTeleopRuntime:
             if self.execute or self.observe_only:
                 self.robot.connect()
                 self._checked_frame(require_active=False)
+            self._apply_speed_override()
+            if self.execute or self.observe_only:
                 if self.gripper is not None:
                     self.gripper.connect()
             self._connected = True
@@ -253,6 +309,7 @@ class VRTeleopRuntime:
                               pose_calibration=(None if self.reference_control is None else
                                                 self.reference_control.pose_calibration),
                               reference_control=self.last_reference_result,
+                              controller_speed_override=self.speed_status,
                               stop_status=self.last_stop_status)
                 self._diagnostics.write(record)
             self._frame_index += 1
@@ -506,7 +563,10 @@ class VRTeleopRuntime:
                     self._stop_reference()
                 else:
                     self.robot.stop_follower()
+                    if self._speed_restore is not None:
+                        self.robot.wait_stopped()
         finally:
+            self._restore_speed_override()
             self._started_follower = False
             self._connected = False
             self._last_gripper_time = None
@@ -914,6 +974,9 @@ def build_runtime(cfg):
     robot_cfg = dict(settings.pop('operator'))
     settings.pop('fps', None)
     settings.pop('max_steps', None)
+    if settings.get('control_mode', 'delta') != 'reference':
+        # Shared config also supports delta; its reference settings stay dormant.
+        settings.pop('reference_options', None)
     gripper = None
     robot = None
     observe_only = settings.get('observe_only', False)

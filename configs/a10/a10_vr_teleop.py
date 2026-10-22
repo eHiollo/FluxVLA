@@ -12,6 +12,12 @@ teleop = dict(
     # delta: existing baseline. reference: migrated frontend target generation.
     # --observe reads controller feedback but never starts/sends/stops motion.
     control_mode='delta', observe_only=False,
+    # Optional one-run controller percentage (1..100); None leaves it unchanged.
+    # Applied/read back before follower start; restored only after confirmed stop.
+    controller_speed_percent=None,
+    # Used only in reference mode. Offline-selected initial values, not hardware acceptance.
+    # Outer half of each budget gradually slows outward reference progress.
+    reference_options=dict(max_reference_lead_m=.02, max_reference_lead_rad=.12),
     # Old mapping stays the default. New mode requires control_mode='reference'.
     pose_mapping='anchor_relative',  # or 'calibrated_absolute'
     # Tracking space -> robot base still requires an intentional reference pose.

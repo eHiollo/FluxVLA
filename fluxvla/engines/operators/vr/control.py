@@ -115,6 +115,9 @@ class ReferenceConfig:
     max_angular_accel_rad_s2: float = .96
     position_gain: float = 6.
     rotation_gain: float = 4.8
+    # None preserves the original C++ parity path. Config opts into soft lead limits.
+    max_reference_lead_m: float | None = None
+    max_reference_lead_rad: float | None = None
     release_position_tolerance_m: float = .002
     release_rotation_tolerance_rad: float = .02
     release_settle_s: float = .1
@@ -122,11 +125,17 @@ class ReferenceConfig:
 
     def __post_init__(self):
         for name, value in vars(self).items():
+            if name in ('max_reference_lead_m', 'max_reference_lead_rad') and value is None:
+                continue
             if name == 'limit_acceleration':
                 if type(value) is not bool:
                     raise ValueError('limit_acceleration must be bool')
             elif isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be positive and finite')
+        for lead, hard in ((self.max_reference_lead_m, self.max_tracking_error_m),
+                           (self.max_reference_lead_rad, self.max_tracking_error_rad)):
+            if lead is not None and lead >= hard:
+                raise ValueError('Reference lead limit must be smaller than the tracking fault limit')
 
 
 class AnchorState:
@@ -231,11 +240,37 @@ class ReferenceGovernor:
         self.reference = None
         self.frozen_s = 0.
         self.tracking_error_m = self.tracking_error_rad = 0.
+        self.position_progress_scale = self.rotation_progress_scale = 1.
+
+    @staticmethod
+    def _progress_scale(distance, limit):
+        """Taper outward progress in the outer half of the lead budget.
+
+        Search along the proposed continuous step, never snap to feedback.
+        If feedback moved outside the budget, inward steps remain available.
+        """
+        if limit is None:
+            return 1.
+        start, end = distance(0.), distance(1.)
+        if end <= start:
+            return 1.
+        scale = float(np.clip(2. * (limit - start) / limit, 0., 1.))
+        if distance(scale) <= limit:
+            return scale
+        low, high = 0., scale
+        for _ in range(24):
+            mid = (low + high) / 2.
+            if distance(mid) <= limit:
+                low = mid
+            else:
+                high = mid
+        return low
 
     def engage(self, actual):
         self.reference = pose(actual)
         self.state, self.frozen_s = 'tracking', 0.
         self.tracking_error_m = self.tracking_error_rad = 0.
+        self.position_progress_scale = self.rotation_progress_scale = 1.
 
     def release(self, actual):
         self.engage(actual)
@@ -252,6 +287,7 @@ class ReferenceGovernor:
         if self.state not in ('tracking', 'frozen'):
             return self.state
         cfg, ref = self.config, self.reference
+        self.position_progress_scale = self.rotation_progress_scale = 0.
         rotation = Rotation.from_quat(ref[3:])
         self.tracking_error_m = float(np.linalg.norm(ref[:3] - actual[:3]))
         self.tracking_error_rad = float((rotation.inv() * Rotation.from_quat(actual[3:])).magnitude())
@@ -268,6 +304,15 @@ class ReferenceGovernor:
         translation = clamp_vector(target[:3] - ref[:3], cfg.max_linear_speed_m_s * dt_s)
         rotvec = (rotation.inv() * Rotation.from_quat(target[3:])).as_rotvec()
         rotvec = clamp_vector(rotvec, cfg.max_angular_speed_rad_s * dt_s)
+        self.position_progress_scale = self._progress_scale(
+            lambda s: np.linalg.norm(ref[:3] + s * translation - actual[:3]),
+            cfg.max_reference_lead_m)
+        actual_rotation = Rotation.from_quat(actual[3:])
+        self.rotation_progress_scale = self._progress_scale(
+            lambda s: (actual_rotation.inv() * rotation * Rotation.from_rotvec(s * rotvec)).magnitude(),
+            cfg.max_reference_lead_rad)
+        translation *= self.position_progress_scale
+        rotvec *= self.rotation_progress_scale
         self.reference = np.r_[ref[:3] + translation,
                                (rotation * Rotation.from_rotvec(rotvec)).as_quat()]
         self.state = 'tracking'
@@ -334,6 +379,8 @@ class VRPoseController:
                     tracking_error_m=self.governor.tracking_error_m,
                     tracking_error_rad=self.governor.tracking_error_rad,
                     frozen_s=self.governor.frozen_s,
+                    reference_progress_scale=dict(position=self.governor.position_progress_scale,
+                                                  rotation=self.governor.rotation_progress_scale),
                     linear_velocity_m_s=self.linear_velocity.tolist(),
                     angular_velocity_rad_s=self.angular_velocity.tolist())
 
@@ -423,8 +470,12 @@ class VRPoseController:
         if error_m > self.config.max_tracking_error_m or error_rad > self.config.max_tracking_error_rad:
             self.fault_reason = 'command_tracking_error'
             self.governor.force_fault(actual)
-            return self._result('fault', stop=True, packet=packet)
-        return self._result(state, packet=packet)
+            result = self._result('fault', stop=True, packet=packet)
+            result.update(command_tracking_error_m=float(error_m), command_tracking_error_rad=float(error_rad))
+            return result
+        result = self._result(state, packet=packet)
+        result.update(command_tracking_error_m=float(error_m), command_tracking_error_rad=float(error_rad))
+        return result
 
     def step_released(self, actual, dt_s, *, feedback_age_s=0., has_error=False):
         """Bound command deceleration, then hold its endpoint (dual clutch).
@@ -506,6 +557,8 @@ def replay_main(argv=None):
     parser.add_argument('--fps', type=float, default=30., help='日志缺少时间时使用的离线名义频率，默认 30')
     parser.add_argument('--max-steps', type=int, help='最多回放多少帧')
     parser.add_argument('--no-acceleration-limit', action='store_true', help='关闭新增的前端加速度整形作对照')
+    parser.add_argument('--max-reference-lead-m', type=float, help='可选平移 reference 超前上限（米）')
+    parser.add_argument('--max-reference-lead-rad', type=float, help='可选姿态 reference 超前上限（弧度）')
     parser.add_argument('--pose-mapping', choices=['anchor_relative', 'calibrated_absolute'],
                         default='anchor_relative', help='目标映射方式，默认保留原锚点相对映射')
     parser.add_argument('--pose-calibration', type=Path,
@@ -520,7 +573,9 @@ def replay_main(argv=None):
     feedback_source = args.feedback_source or ('synthetic-follow' if args.demo else 'recorded')
     if args.demo and feedback_source == 'recorded':
         parser.error('demo 没有真实反馈，请使用 synthetic-follow 或 synthetic-hold')
-    config = ReferenceConfig(limit_acceleration=not args.no_acceleration_limit)
+    config = ReferenceConfig(limit_acceleration=not args.no_acceleration_limit,
+                             max_reference_lead_m=args.max_reference_lead_m,
+                             max_reference_lead_rad=args.max_reference_lead_rad)
     calibration = None if args.pose_calibration is None else json.loads(args.pose_calibration.read_text())
     if isinstance(calibration, dict) and calibration.get('kind') == 'vr_pose_calibration':
         calibration = calibration.get('pose_calibration')
@@ -543,7 +598,10 @@ def replay_main(argv=None):
             for index, line in enumerate(stream, 1):
                 if line.strip():
                     try:
-                        yield json.loads(line)
+                        row = json.loads(line)
+                        if row.get('event') == 'controller_speed_override':
+                            continue  # Lifecycle metadata has no hand/robot sample.
+                        yield row
                     except json.JSONDecodeError as error:
                         raise ValueError(f'输入第 {index} 行不是有效 JSON') from error
 
@@ -642,6 +700,8 @@ def replay_main(argv=None):
                    fault_frames=dict(fault_frames), first_fault=first_fault,
                    nominal_time_frames=nominal_time_frames, input_lowpass_enabled=False,
                    acceleration_limit=config.limit_acceleration,
+                   max_reference_lead_m=config.max_reference_lead_m,
+                   max_reference_lead_rad=config.max_reference_lead_rad,
                    output=None if args.output is None else str(args.output))
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

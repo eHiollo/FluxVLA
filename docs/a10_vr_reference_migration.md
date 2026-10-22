@@ -865,3 +865,74 @@ TCP 字段来自控制器 `motion_msg.pq`，没有独立外部测量；其内部
    区分手停仍按键、松开侧键、断流三种情况。复核滤波历史重置、角度连续性和接管时坐标基准。
 
 本轮验证方式是现有 JSONL 离线统计、源码对照和远端只读检查；没有进行新的实机运动测试。
+
+## 2026-10-22：单次倍率参数与 reference 超前限制实现
+
+### 范围
+
+按审核后的两项方案在 `kaanh_follower_vr` 实现；没有访问控制器或启动实机运动。
+本轮不修改松手、接管、SDK 停止和后端滤波行为。正常松手仍沿用原单臂 stop_follower 流程。
+没有改动 `kaanh_follower` 分支或提交用户的压缩包、私有源码、日志产物。
+
+### 实现内容
+
+1. `A10Operator` 增加 `get_speed_override()` / `set_speed_override(percent, expected_mode=...)`。
+   Manual 读取 `motion_msg.jog_vel`，设置 `set_jog_vel --vel_percent=...`；Auto 读取
+   `program_msg.vel`，设置 `set_pgm_vel --vel_percent=...`。未知模式或缺失倍率不猜测。
+   设置要求 allow_motion、无故障、Stopped、follower inactive、模式一致；ACK 后继续 GET 回读，
+   不一致或超时即失败。不会使能、切换模式或修改 XML。
+2. `teleop.controller_speed_percent` 默认 None；显式传入 1～100 整数才修改此次运行倍率。
+   runtime 在 follower 启动前保存旧值并设置；失败阻止运行。退出后只有连接有效且确认健康、停止、
+   模式一致才恢复原值。断线、停止未确认、现场改了模式/倍率时不重连重试、不覆盖现场设置，记录恢复未确认。
+   None 不增加倍率命令；VR-only、observe、preview 均不设置。标定/检查入口也不使用运动倍率流程。
+3. `ReferenceConfig` 增加可选 `max_reference_lead_m` / `max_reference_lead_rad`。
+   纯算法默认 None 保留原 C++ 对照行为；单臂配置开启 **0.02 m / 0.12 rad**。
+   delta 不启用；双臂配置显式维持 None，不改变之前双臂默认行为。
+4. reference 在正常预算内侧半径保持原推进速度，外侧一半逐渐减小向外推进比例；
+   沿本帧原有步进方向限制推进，不把 reference 突然投影/重置到反馈。
+   向反馈靠近的动作可以正常返回；反馈移动导致暂时超出预算时，禁止继续拉远，但仍允许靠近。
+   平移距离用欧氏距离，姿态距离用四元数相对旋转角，分别计算。
+5. 原 50 mm / 0.35 rad 硬保护与反馈时效保护继续保留；软预算必须小于相应硬阈值。
+   最终 command 仍经过原加速度整形，并单独检查实际误差；reference 软预算不能保证 command
+   或真实制动距离严格受同一预算约束。没有裁剪 command 位置或清零命令速度来伪造连续性。
+6. JSONL 每帧增加倍率状态、reference 推进比例、正常计算帧的 command 实际误差；
+   倍率设置/退出恢复另写 `event=controller_speed_override`，无手柄或机器人采样字段。
+   离线回放明确跳过这类事件，并新增 `--max-reference-lead-m` / `--max-reference-lead-rad` 参数。
+   快查文档⑤补充了使用方法；修改倍率不会自动修改前端速度上限。
+
+### 超前范围选择：已有日志离线对照
+
+使用上一节会话的记录输入与反馈，按原 await_fresh_sample 事件重建每段控制器，
+以相邻 `feedback.received_monotonic_s` 差值推进，共计算 326 个活动/末次故障帧。
+保持原输入、反馈、速度和加速度参数，只改变正常超前预算：
+
+| 平移预算 / 姿态预算 | 最大 reference 位置差 | 最大 command 位置差 | 故障帧数 | 平移推进比例中位数 |
+| --- | ---: | ---: | ---: | ---: |
+| None / None，旧逻辑 | 53.81 mm | 43.19 mm | 1 | 1.000 |
+| 10 mm / 0.12 rad | 9.98 mm | 9.56 mm | 0 | 0.254 |
+| **20 mm / 0.12 rad** | **19.14 mm** | **16.67 mm** | **0** | **0.699** |
+| 30 mm / 0.12 rad | 28.00 mm | 25.03 mm | 0 | 1.000 |
+
+20 mm 作为首版离线选择，比 10 mm 减少持续限速程度，并比 30 mm 留出更多硬保护余量。
+0.12 rad 配置的回放最大姿态差约 0.110 rad。结果不表示新命令下实机会产生原日志中同样的反馈，
+也不是 SDK 仿真或实机验收；这是固定历史反馈上的算法对照，现场仍需确认响应和拖尾。
+
+### 验证与限制
+
+新增测试覆盖：静止/慢速反馈、平移及旋转预算、返回方向、反馈外移不跳变、命令加速度连续性、
+硬误差和过期反馈保护、倍率 Manual/Auto 回环协议、只读权限、活动/故障状态禁止设置、
+ACK 无有效回读、命令拒绝、正常恢复、断线和未停稳不盲目恢复、现场改倍率不覆盖，以及日志事件回放兼容。
+
+控制器基础限速未通过 API 动态读取。本轮 XML 的 200 mm/s、30°/s 是前次调查结果，
+不是代码内置的硬件能力承诺；现场应核对有效倍率与这些配置，不能把前端向量限速和后端逐分量限速直接等同。
+新参数只负责显式设置百分比，不自动拉高倍率或调整前端速度。原生 SDK 停止问题仍在，不能把此修改当作停车修复。
+
+最终相关回归 **157 项通过，22.460 秒**，仅离线算法和本机回环 WS/UDP：
+
+```bash
+PYTHONPATH=test:test/test_runners /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+  test_vr_lead_speed test_vr_control test_vr_reference_runtime test_vr_native_entry \
+  test_vr_dual_runtime test_vr_operator test_a10_operator
+```
+
+`git diff --check` 无错误；测试与临时回放输出保留在本机 `/tmp`，不提交产物。

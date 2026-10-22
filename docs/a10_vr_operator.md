@@ -440,7 +440,7 @@ follower 使用同样参数。协议迁移完成后，仍需现场比较运动�
 | 第 3～4 页：Cartesian 跟随最新位置，下发增量位姿，单位米／弧度，支持 pq 与 Euler 格式 | 通用接口保留 pq；2026-10-19 起 VR 配置使用带符号的 `type=321, pe`。位姿仍相对固定启动锚点，非每包重复累加的帧增量 |
 | 第 3～4 页：最大跟随速度由点动笛卡尔设置的速度与速度百分比决定 | 实际速度由控制器配置和百分比约束；VR 的位置缩放与单帧／跟踪误差限值不能代替控制器速度设置 |
 | 第 4 页：关节使用 `jp --motor_pos=[...]`，绝对位置，旋转轴单位度 | `send_joints` 单独接入关节 follower，不能把该关节绝对位置格式用于 VR 位姿 |
-| 第 5 页：`set_jog_vel --vel_percent=60`、`set_pgm_vel --vel_percent=60` | 在控制器原生终端／前端按当前运行模式显式设置；当前 `a10_control.py` shell 未提供这两个命令，VR 也不自动修改百分比 |
+| 第 5 页：`set_jog_vel --vel_percent=60`、`set_pgm_vel --vel_percent=60` | 原生终端可设置；VR 现可显式配置 `teleop.controller_speed_percent`，默认 None 不修改；当前 `a10_control.py` shell 仍未开放这两个命令 |
 
 PDF 中 `start_follower`、`stop_follower`、`follower_cart`、`follower_aj`
 分别列为控制指令，但未要求启动时必须连续发送两条指令。附件

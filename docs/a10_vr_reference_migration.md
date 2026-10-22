@@ -627,3 +627,48 @@ VR-only、预览和控制器状态检查，注明旧观察/标定入口的区别
   不加载绝对姿态标定文件，不等同旧 C++ TCP follower 或最早 delta 累积路径。
 - 补充从只读验证切回实机时刷新头显输入页、人工使能前提和释放/退出停止请求的区别。
 - 本轮只改操作文档，使用 `--preview` 核对完整命令可构造正确模式；不连接设备、不运行运动、不改算法或速度参数。
+
+## 2026-10-22：实现单控制器单／双臂笛卡尔通信底座
+
+### 本轮完成
+
+- 仅在 `kaanh_follower_vr` 修改现有 A10Operator；没有修改 BaseOperator、VR 算法、
+  录制、标定、模型推理或远端 A10_new。没有新增 RobotOperator 或设备管理目录。
+- 新增 `arms` 显式映射和 `cartesian_target_order`。一个 host、一套控制器会话及全局
+  follower 生命周期；每臂分别保存关节/TCP 与 Euler 编码缓存。
+- 新增 A10ArmState / A10State.arms；get_frame 提供命名 arms。单臂旧字段兼容，
+  双臂平铺 joints/tcp/qpos 为 None，不截取第一臂或伪造14维模型数据。
+- 支持按 group/index 显式选择反馈；也支持同一12轴反馈组中分别选择0～5/6～11。
+  额外辅助 TCP 不被自动当作机械臂；配置重叠、索引不存在及反馈不齐全会拒绝。
+- 双臂 send_eepose 接收完整命名目标，按控制器行顺序一次发 pq 或321/pe包，保留
+  现有40字节消息头和启动基准语义。所有校验/编码通过且发送成功后才提交各臂缓存。
+- 启动前及启动确认检查全组反馈；get 观测故障或模型反馈丢失会撤销目标发送许可。
+  没有增加自动使能、自动接管、运动重发或后台自动停机逻辑。
+- 双臂关节启动、send_joints、execute_trajectory 和夹爪调用明确拒绝；原单臂行为保留。
+- 新增 `configs/a10/a10_dual_arm_operator.py`：基于历史 kaanh_lab.xml 的双臂模板，
+  默认禁止运动，左右物理对应/反馈布局均标注待确认；0.125 当前单臂配置不能直接使用。
+- 控制台新增 --config；原 --host 用法兼容。双臂 get/joints 分臂显示、启停作用于全组；
+  旧单臂目标命令在双臂模式拒绝。配置权限不会因进入 shell 被自动打开。
+- 更新命令速查第⑥项和 follower 协议核查文档，记录原生双臂配置与当前六轴自定义
+  关节 follower 的区别。报文 id 不作为机械臂选择器，tg/ee 关系不新增猜测命令参数。
+
+### 验证
+
+以下均为本地模拟／假设备，不访问实机或修改控制器：
+
+```bash
+PYTHONPATH=test:test/test_runners /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+  test_a10_operator test_a10_control test_vr_reference_runtime test_vr_operator \
+  test_vr_control test_vr_calibration test_vr_native_entry test_vr_calibration_view \
+  test_a10_inference_runner test_a10_integration test_camera_operator test_gripper_operator
+```
+
+综合 **220 项通过，57.200 秒**。本轮新增14项双臂专项测试，覆盖配置冲突、真实 UDP
+字节、显式行顺序、独立 Euler 状态、全包失败不发送、不完整反馈拒绝启动、同一 follower
+启停、后台反馈映射、故障撤权、控制台只读与单臂命令拒绝。
+
+### 剩余边界
+
+这次完成的是基本配置和通信接口，不代表双臂 VR 已接通。双臂机械模型/末端编号/
+物理左右/反馈布局/实际发包执行尚需控制器部署及现场验收；当前关节 follower 源码只接受六轴，
+本轮未开放双臂关节。双臂夹爪、录制、VR 标定与模型适配后续独立安排。

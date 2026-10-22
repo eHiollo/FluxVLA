@@ -504,3 +504,67 @@ TCP 六轴与 WS 按度→弧度转换后的反馈最大差约 `3.63e-5 rad`（�
 - 本轮未修改、编译、启动或重启控制器。前端 reference 模式、只读观察和本机模拟收发已接入，
   真实反馈与原生 UDP 的平滑/缓存/断流行为继续待验证。不能因 UDP 监听存在就绕过 WS 状态确认。
 - 具体实现、命令与阶段边界见 [VR 控制算法迁移记录](a10_vr_reference_migration.md#六阶段-3前端接入只读调查与模拟收发2026-10-16)。
+## 2026-10-22：单控制器双臂笛卡尔接口
+
+### 协议依据与当前现场边界
+
+只读核对 0.125 的 A10_new 后确认：历史 `kaanh_lab.xml` 配置两个六轴模型、12 个电机、
+两个末端，Cartesian 组 `tg_id=1 / ee_ids={0,1}`。`client.cpp` 同一包构造两行 pe，
+`id=id++` 是示例报文编号，不用于选择物理左右臂。当前运行目录
+`build/follower-dev/run-streaming-20261022` 的 XML 仍是单臂；自定义关节 follower 的
+`parse_jp` 只接受六个值。本轮没有修改控制器、切换 XML 或验证双臂实机运动。
+
+FluxVLA 据此实现的是协议组织和本地模拟收发，不代表控制器已部署双臂。
+
+### 配置与接口
+
+模板：`configs/a10/a10_dual_arm_operator.py`。只有一个 host、控制连接、状态连接及 UDP 端口组。
+
+| 配置 | 含义 |
+| --- | --- |
+| `arms.名称.ee_id` | 控制器末端编号，记录逻辑名称与末端的对应；不会额外塞进每帧 JSON |
+| `arms.名称.joint_group` | get 的 actual_pos / motor_pos 中选择哪一组（索引从0开始） |
+| `arms.名称.joint_indices` | 从该组提取哪六个关节，默认 `[0,1,2,3,4,5]` |
+| `arms.名称.tcp_index` | get 的 pq 中选择哪一行；不假定第二行一定是另一条臂 |
+| `cartesian_target_order` | 下发 pe/pq 的行顺序，双臂必须显式配置，与实际控制器 XML 组顺序一致 |
+
+模板 left→0、right→1 及反馈分组只是待核对示例，不能据模型排列认定物理左右。
+如果 get 把12轴放在同一组，两臂可使用相同 joint_group，并分别配置0～5和6～11的 joint_indices。
+重复 ee_id、重复 TCP 行、重叠关节映射、非法索引或不完整目标顺序会被拒绝。
+对一条臂显式配置也受支持；旧 host/arm_name 写法不需要改动，仍保持严格单臂解析。
+
+`get_state()` 返回控制器级 A10State，新增 `state.arms[name]`（A10ArmState）：
+ee_id、actual_joints_rad、target_joints_rad、tcp_pq_raw、tcp_pq_m、received_monotonic_s。
+所有臂来自同一状态回复、共用一次客户端接收时间，不冒充控制器采样时间或硬件同步。
+使能、运动、故障、follower 状态属于控制器整体；不会伪造每条臂独立的 follower 状态。
+
+`get_frame()` 新增 `arms` 字典。单臂仍提供原 joints/tcp_pq_m/qpos；双臂这些平铺数值为 None，
+不能被旧推理/VR 误当作第一条臂或14维模型输入。缺失反馈保持 None，不补零。
+
+调用 `send_eepose({'left': pose0, 'right': pose1})`，每个 pose 为相对 follower 启动基准的
+`[x,y,z,qx,qy,qz,qw]`，米/单位 xyzw，保持现有 A10 接口语义，不是逐帧累加增量。
+按 cartesian_target_order 一次发送一个带现有40字节 ARIS 消息头的 UDP 包：
+
+- pq：`{"type":"pq","pq":[pose0,pose1]}`。
+- pe321：将两臂各自编码为米/ZYX弧度的六维行，`{"type":"321","pe":[pe0,pe1]}`。
+
+字典插入顺序不决定发包顺序。各臂独立保存 Euler 连续性缓存；全部位姿和分支检查通过、
+UDP 整包发送成功后才更新缓存。缺臂/未知臂/非法四元数/任一臂分支跳变不会发送或更新部分缓存。
+
+`start_follower('cartesian') / stop_follower()` 管理整个控制组，仍检查本连接归属并回读确认。
+启动前和启动确认时要求所有配置臂的关节/TCP 反馈齐全。观测到故障或反馈缺失会撤销发送许可；
+此接口不是后台自动停机 watchdog，调用者仍负责状态检查、停止请求及现场确认。
+
+双臂的 start_follower('joint')、send_joints、execute_trajectory、send_gripper 明确拒绝，
+不发送任何此类命令；也不允许把单臂 USB 夹爪配置附加到双臂。原单臂接口继续保留。
+本轮没有改 BaseOperator、VR 算法、模型推理、录制、标定或新夹爪驱动。
+
+### 控制台
+
+现有 `scripts/a10_control.py` 新增 `--config`，读取上述 operator 字典；原 `--host` 用法继续可用。
+配置中的 allow_motion 保持有效，不因进入 shell 自动变成 True。
+`--read-only` 强制禁止运动、过滤附件/后台轮询；配置模式默认使用 status_ws_port，
+显式 --ws-port 可覆盖。原 --host 模式端口行为保持兼容。
+
+双臂 get/joints 显示各臂，跟随启停显示控制组语义；旧 pq、joints --deg、g_move、follower_aj
+在双臂下明确拒绝。本轮双臂目标由公开 operator 接口和模拟器测试验证，不增加复杂的终端发包语法。

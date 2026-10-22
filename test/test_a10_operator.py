@@ -172,6 +172,7 @@ class FakeController:
         self.active_after_rejection = False
         self.recovery_fault = None
         self.get_reply_delay_s = 0.
+        self.motion_override = None
         self.lock = threading.Lock()
 
     def __enter__(self):
@@ -235,6 +236,8 @@ class FakeController:
                         del reply['ret_context']['motion_msg']['pq']
                     if self.driver_fault:
                         reply['ret_context']['driver_msg']['driver_err_code'][0] = 8
+                    if self.motion_override is not None:
+                        reply['ret_context']['motion_msg'].update(self.motion_override)
                     reply['ret_context']['test_gripper'] = {'actual_mm': 42.5}
                     reply['ret_context'] = json.dumps(reply['ret_context'])
                     if self.fault == 'timeout':
@@ -818,6 +821,187 @@ class NetworkTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
             self.assertNotIn('stop_follower', controller.commands)
+
+
+DUAL_ARMS = {
+    'left': dict(ee_id=0, joint_group=0, tcp_index=0),
+    'right': dict(ee_id=1, joint_group=1, tcp_index=1),
+}
+
+
+def dual_motion():
+    return dict(actual_pos=[[0, 10, 20, 30, 40, 50], [60, 70, 80, 90, 100, 110]],
+                motor_pos=[[1, 11, 21, 31, 41, 51], [61, 71, 81, 91, 101, 111]],
+                pq=[[100, 200, 300, 0, 0, 0, 1], [400, 500, 600, 0, 0, 0, 1]])
+
+
+class DualArmTest(unittest.TestCase):
+    def settings(self, **extra):
+        return dict(arms=DUAL_ARMS, cartesian_target_order=['left', 'right'],
+                    feedback_position_unit='mm', **extra)
+
+    def test_config_validation_before_network(self):
+        import copy
+        for field in ('ee_id', 'tcp_index', 'joint_group'):
+            bad = copy.deepcopy(DUAL_ARMS)
+            bad['right'][field] = 0
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                A10Operator('127.0.0.1', arms=bad, cartesian_target_order=['left', 'right'])
+        for order in (None, ['left'], ['left', 'left'], ['left', 'unknown']):
+            with self.subTest(order=order), self.assertRaises(ValueError):
+                A10Operator('127.0.0.1', arms=DUAL_ARMS, cartesian_target_order=order)
+        for spec in (dict(ee_id=True, joint_group=0, tcp_index=0),
+                     dict(ee_id=0, joint_group=-1, tcp_index=0),
+                     dict(ee_id=0, joint_group=0, tcp_index=0, joint_indices=[0]*6),
+                     dict(ee_id=0, joint_group=0),
+                     dict(ee_id=0, joint_group=0, tcp_index=0, host='other-controller')):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                A10Operator('127.0.0.1', arms={'left': spec})
+        with self.assertRaises(NotImplementedError):
+            A10Operator('127.0.0.1', **self.settings(command_mode='joint'))
+        with self.assertRaises(NotImplementedError):
+            A10Operator('127.0.0.1', **self.settings(gripper_transport='usb', gripper={'port': '/never/open'}))
+
+    def test_feedback_named_models_units_and_aux_tcp(self):
+        reply = status_reply()
+        reply['ret_context']['motion_msg'].update(dual_motion())
+        # Explicit mappings distinguish two robot TCPs from an auxiliary entry.
+        reply['ret_context']['motion_msg']['pq'].append([0, 0, 0, 0, 0, 0, 1])
+        state = parse(reply, arms=DUAL_ARMS, position_unit='mm')
+        self.assertIsNone(state.actual_joints_rad)
+        self.assertIsNone(state.tcp_pq_m)
+        self.assertIsNone(state.qpos)
+        self.assertIs(state.raw, reply)
+        np.testing.assert_allclose(state.arms['right'].actual_joints_rad, np.deg2rad([60,70,80,90,100,110]))
+        np.testing.assert_allclose(state.arms['left'].tcp_pq_m[:3], [.1,.2,.3])
+        np.testing.assert_allclose(state.arms['right'].tcp_pq_m[:3], [.4,.5,.6])
+        self.assertEqual(state.arms['left'].received_monotonic_s, state.received_monotonic_s)
+        self.assertEqual(state.arms['right'].received_monotonic_s, state.received_monotonic_s)
+        with self.assertRaises(TypeError):
+            state.arms['left'] = state.arms['right']
+
+    def test_flat_joint_feedback_explicit_slices_and_single_named_compatibility(self):
+        reply = status_reply()
+        reply['ret_context']['motion_msg'].update(dual_motion())
+        motion = reply['ret_context']['motion_msg']
+        motion['actual_pos'] = [motion['actual_pos'][0] + motion['actual_pos'][1]]
+        motion['motor_pos'] = [motion['motor_pos'][0] + motion['motor_pos'][1]]
+        arms = {'left': dict(ee_id=0, joint_group=0, tcp_index=0, joint_indices=list(range(6))),
+                'right': dict(ee_id=1, joint_group=0, tcp_index=1, joint_indices=list(range(6,12)))}
+        state = parse(reply, arms=arms, position_unit='mm')
+        self.assertAlmostEqual(state.arms['right'].actual_joints_rad[0], np.pi/3)
+        selected = parse(reply, arms={'tool': arms['right']}, position_unit='mm')
+        np.testing.assert_array_equal(selected.actual_joints_rad, state.arms['right'].actual_joints_rad)
+        self.assertEqual(tuple(selected.arms), ('tool',))
+
+    def test_one_session_whole_packet_order_and_single_stop(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings())
+            op.start_follower()
+            # Explicit row order must win over both dictionary insertion orders.
+            targets = {'right': [.04,.05,.06,0,0,0,1], 'left': [.01,.02,.03,0,0,0,1]}
+            op.send_eepose(targets)
+            packet = c.udp.recv(65535)
+            self.assertEqual(int.from_bytes(packet[:4], 'little'), len(packet)-40)
+            self.assertEqual(packet[4:40], bytes(36))
+            self.assertEqual(json.loads(packet[40:]), {'type':'pq', 'pq':[targets['left'],targets['right']]})
+            with self.assertRaises(TimeoutError):
+                c.udp.recv(65535)
+            frame = op.get_frame()
+            self.assertEqual(set(frame['arms']), {'left', 'right'})
+            self.assertIsNone(frame['qpos'])
+            self.assertEqual(op.capabilities, frozenset({'relative_cartesian_follower'}))
+            op.stop_follower()
+            self.assertEqual([x for x in c.commands if x != 'get'], ['follower_cart','stop_follower'])
+
+    def test_per_arm_euler_encoding_and_atomic_validation(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings(cartesian_wire_format='pe321'))
+            op.start_follower()
+            left = [0,0,0,*Rotation.from_euler('z', -.2).as_quat()]
+            right = [0,0,0,*Rotation.from_euler('x', .3).as_quat()]
+            op.send_eepose({'left': left, 'right': right})
+            payload = json.loads(c.udp.recv(65535)[40:])
+            np.testing.assert_allclose(payload['pe'][0][3:], [-.2,0,0], atol=1e-12)
+            np.testing.assert_allclose(payload['pe'][1][3:], [0,0,.3], atol=1e-12)
+            previous = {k:v.copy() for k,v in op._cartesian_eulers.items()}
+            for targets in ({'left':left}, {'left':left,'unknown':right},
+                            {'left':left,'right':[0]*7},
+                            {'left':[0,0,0,*Rotation.from_euler('z', -.3).as_quat()],
+                             'right':[0,0,0,*Rotation.from_euler('z', 2.5).as_quat()]}):
+                with self.assertRaises(ValueError):
+                    op.send_eepose(targets)
+                for name in previous:
+                    np.testing.assert_array_equal(previous[name], op._cartesian_eulers[name])
+            with self.assertRaises(TimeoutError):
+                c.udp.recv(65535)
+            op.stop_follower()
+
+    def test_feedback_mismatch_refused_before_follower_start(self):
+        for override in (None, dict(dual_motion(), pq=[[0,0,0,0,0,0,1]]),
+                         dict(dual_motion(), actual_pos=None)):
+            with self.subTest(override=override), FakeController() as c:
+                c.motion_override = override
+                op = c.operator(**self.settings())
+                with self.assertRaises(A10ProtocolError):
+                    op.start_follower()
+                self.assertTrue(all(x == 'get' for x in c.commands))
+                with self.assertRaises(TimeoutError):
+                    c.udp.recv(65535)
+
+    def test_unsupported_operations_have_no_network_side_effects(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings())
+            for method, args in ((op.start_follower, ('joint',)),
+                                 (op.send_joints, ({'left':[0]*6,'right':[0]*6},)),
+                                 (op.execute_trajectory, ({'left':[[0]*6],'right':[[0]*6]},)),
+                                 (op.send_gripper, ({'left':0,'right':0},))):
+                with self.assertRaises(NotImplementedError):
+                    method(*args)
+            self.assertEqual(c.commands, [])
+            with self.assertRaises(TimeoutError):
+                c.joint_udp.recv(4096)
+
+    def test_background_monitor_uses_same_explicit_mapping(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings(status_poll_interval_s=.01,
+                                            status_ws_port=c.server.socket.getsockname()[1]))
+            self.assertEqual(set(op.get_frame()['arms']), {'left','right'})
+            self.assertEqual(set(op._recent_state().arms), {'left','right'})
+            self.assertTrue(all(x == 'get' for x in c.commands))
+
+    def test_explicit_row_order_and_mapping_do_not_depend_on_ids_or_names(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            settings = self.settings()
+            settings['cartesian_target_order'] = ['right', 'left']
+            op = c.operator(**settings)
+            op.start_follower()
+            left, right = [.01,0,0,0,0,0,1], [.02,0,0,0,0,0,1]
+            op.send_eepose({'left':left,'right':right})
+            self.assertEqual(json.loads(c.udp.recv(65535)[40:])['pq'], [right,left])
+            op.stop_follower()
+
+    def test_observed_global_fault_or_missing_model_revokes_target_permission(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing), FakeController() as c:
+                c.motion_override = dual_motion()
+                op = c.operator(**self.settings())
+                op.start_follower()
+                if missing:
+                    c.motion_override['actual_pos'] = None
+                else:
+                    c.driver_fault = True
+                op.get_state()
+                with self.assertRaises(RuntimeError):
+                    op.send_eepose({'left':[0,0,0,0,0,0,1],'right':[0,0,0,0,0,0,1]})
+                with self.assertRaises(TimeoutError):
+                    c.udp.recv(65535)
+                op.stop_follower()
 
 
 if __name__ == '__main__':

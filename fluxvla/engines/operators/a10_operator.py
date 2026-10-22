@@ -1,4 +1,4 @@
-"""A10 single-arm operator for the KAANH WebSocket / UDP follower protocol.
+"""A10 single-controller operator for KAANH single/dual Cartesian followers.
 
 Wire layout follows the user-supplied robot.7z reference. Controller-side
 planning stays on the controller. This module does not open connections at
@@ -16,7 +16,8 @@ import struct
 import threading
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Mapping
 
 import numpy as np
@@ -27,7 +28,7 @@ from .base_operator import BaseOperator
 from .camera_operator import CameraOperator
 from .gripper_operator import GripperOperator
 
-__all__ = ['A10Operator', 'A10State', 'A10ProtocolError', 'A10ControllerError']
+__all__ = ['A10Operator', 'A10State', 'A10ArmState', 'A10ProtocolError', 'A10ControllerError']
 
 _HEADER = struct.Struct('<IIQqqq')
 _MAX_PAYLOAD = 1024 * 1024
@@ -123,6 +124,18 @@ def _optional_bool(value, field):
 
 
 @dataclass(frozen=True)
+class A10ArmState:
+    """One explicitly mapped six-axis model; global faults stay on A10State."""
+
+    ee_id: int
+    actual_joints_rad: np.ndarray | None
+    target_joints_rad: np.ndarray | None
+    tcp_pq_raw: np.ndarray | None
+    tcp_pq_m: np.ndarray | None
+    received_monotonic_s: float
+
+
+@dataclass(frozen=True)
 class A10State:
     """Parsed feedback. None means unavailable, never a synthetic zero.
 
@@ -140,6 +153,7 @@ class A10State:
     has_error: bool
     received_monotonic_s: float
     raw: dict
+    arms: Mapping[str, A10ArmState] = field(default_factory=dict)
 
     @property
     def qpos(self):
@@ -148,10 +162,89 @@ class A10State:
         return np.concatenate((self.actual_joints_rad, [self.gripper_mm]))
 
 
-def _parse_state(reply, *, joint_unit, position_unit, gripper_feedback_path):
+def _normalize_arms(arms, arm_name, order):
+    if arms is None:
+        if order is not None:
+            raise ValueError('cartesian_target_order requires explicit arms')
+        return None, (arm_name,)
+    if not isinstance(arms, Mapping) or len(arms) not in (1, 2):
+        raise ValueError('arms must configure one or two A10 arms')
+    normalized, ee_ids, tcp_indices, joints = {}, set(), set(), set()
+    for name, spec in arms.items():
+        if not isinstance(name, str) or not name or not isinstance(spec, Mapping):
+            raise ValueError('Arm names must be nonempty and arm settings must be mappings')
+        required = {'ee_id', 'joint_group', 'tcp_index'}
+        if not required <= set(spec) or set(spec) - required - {'joint_indices'}:
+            raise ValueError('Each arm requires ee_id, joint_group, tcp_index; optional joint_indices')
+        values = {key: spec[key] for key in required}
+        if any(type(v) is not int or v < 0 for v in values.values()):
+            raise ValueError('Arm IDs and feedback indices must be nonnegative integers')
+        indices = spec.get('joint_indices', range(6))
+        if (not isinstance(indices, (list, tuple, range)) or len(indices) != 6
+                or any(type(v) is not int or v < 0 for v in indices) or len(set(indices)) != 6):
+            raise ValueError('joint_indices must contain six distinct nonnegative integers')
+        joint_keys = {(values['joint_group'], index) for index in indices}
+        if values['ee_id'] in ee_ids or values['tcp_index'] in tcp_indices or joints & joint_keys:
+            raise ValueError('Duplicate ee_id, TCP mapping or overlapping joint feedback')
+        ee_ids.add(values['ee_id'])
+        tcp_indices.add(values['tcp_index'])
+        joints.update(joint_keys)
+        normalized[name] = MappingProxyType(dict(values, joint_indices=tuple(indices)))
+    if order is None:
+        if len(arms) != 1:
+            raise ValueError('Dual arms require explicit cartesian_target_order matching controller XML')
+        order = tuple(arms)
+    if (not isinstance(order, (list, tuple)) or any(not isinstance(x, str) for x in order)
+            or len(order) != len(arms) or set(order) != set(arms)):
+        raise ValueError('cartesian_target_order must list every configured arm exactly once')
+    return MappingProxyType(normalized), tuple(order)
+
+
+def _feedback_group(value, index, field_name):
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise A10ProtocolError(f'{field_name} must contain feedback groups')
+    groups = value if isinstance(value[0], list) else [value]
+    if index >= len(groups):
+        raise A10ProtocolError(f'{field_name} has no configured feedback group {index}')
+    group = groups[index]
+    if not isinstance(group, list) or not group:
+        raise A10ProtocolError(f'{field_name}[{index}] is not a numeric group')
+    return _vector(group, len(group), f'{field_name}[{index}]')
+
+
+def _parse_state(reply, *, joint_unit, position_unit, gripper_feedback_path,
+                 arms=None, arm_name='right'):
     context = reply.get('ret_context')
     if not isinstance(context, dict) or not isinstance(context.get('motion_msg'), dict):
         raise A10ProtocolError('Status reply is missing motion_msg')
+    if arms is not None:
+        motion, parsed, stamp = context['motion_msg'], {}, time.monotonic()
+        first = None
+        for name, spec in arms.items():
+            selected = dict(motion)
+            indices = spec.get('joint_indices', range(6))
+            for key in ('actual_pos', 'motor_pos'):
+                values = _feedback_group(motion.get(key), spec['joint_group'], key)
+                if values is not None and max(indices) >= len(values):
+                    raise A10ProtocolError(f'{key} cannot supply six configured joints for {name}')
+                selected[key] = None if values is None else values[list(indices)].tolist()
+            values = _feedback_group(motion.get('pq'), spec['tcp_index'], 'pq')
+            selected['pq'] = None if values is None else values.tolist()
+            nested = dict(reply, ret_context=dict(context, motion_msg=selected))
+            state = _parse_state(nested, joint_unit=joint_unit, position_unit=position_unit,
+                                 gripper_feedback_path=gripper_feedback_path, arm_name=name)
+            if first is None:
+                first = state
+            parsed[name] = A10ArmState(spec['ee_id'], state.actual_joints_rad, state.target_joints_rad,
+                                       state.tcp_pq_raw, state.tcp_pq_m, stamp)
+        single = first if len(parsed) == 1 else None
+        return A10State(single.actual_joints_rad if single else None,
+                        single.target_joints_rad if single else None,
+                        single.tcp_pq_raw if single else None, single.tcp_pq_m if single else None,
+                        single.gripper_mm if single else None, first.follower_active,
+                        first.follower_mode, first.has_error, stamp, reply, MappingProxyType(parsed))
     motion = context['motion_msg']
     groups = {}
     for key in ('follower_msg', 'robot_msg', 'driver_msg', 'log_msg'):
@@ -200,9 +293,11 @@ def _parse_state(reply, *, joint_unit, position_unit, gripper_feedback_path):
     mode = follower.get('follower_mode')
     if mode is not None and not isinstance(mode, str):
         raise A10ProtocolError('follower_mode must be a string')
+    stamp = time.monotonic()
+    arm = A10ArmState(0, actual, target, pose, converted, stamp)
     return A10State(actual, target, pose, converted, gripper,
                     _optional_bool(follower.get('running_state'), 'running_state'),
-                    mode, bool(has_error), time.monotonic(), reply)
+                    mode, bool(has_error), stamp, reply, MappingProxyType({arm_name: arm}))
 
 
 class _FollowerConnection:
@@ -309,6 +404,14 @@ class A10Operator(BaseOperator):
     Motion commands require allow_motion=True. close() closes network resources
     only; call stop_follower() explicitly to request and confirm mode exit. Mode
     exit is not a physical emergency stop. No automatic motor enable or login.
+
+    Explicit ``arms`` maps logical names to controller ee_id, joint_group,
+    joint_indices (six entries) and tcp_index. ``cartesian_target_order`` is
+    the XML control-group row order, not inferred from left/right or ee_id.
+    Two arms share one connection/follower; all targets must be supplied in
+    one call. Dual joint, gripper and trajectory commands are unsupported.
+    A10State.arms / get_frame()['arms'] expose named model feedback. Legacy
+    flat fields remain available only for a single configured arm.
     """
 
     capabilities = frozenset({'relative_cartesian_follower', 'absolute_joint_follower',
@@ -324,7 +427,7 @@ class A10Operator(BaseOperator):
                  trajectory_feedback_timeout_s=0.1,
                  trajectory_max_lateness_s=None, status_poll_interval_s=None,
                  status_max_age_s=0.5, status_ws_port=5888,
-                 cartesian_wire_format='pq'):
+                 cartesian_wire_format='pq', arms=None, cartesian_target_order=None):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -341,6 +444,16 @@ class A10Operator(BaseOperator):
             raise ValueError('timeout_s must be positive and finite')
         if type(allow_motion) is not bool or not isinstance(arm_name, str) or not arm_name:
             raise ValueError('allow_motion must be bool and arm_name must be nonempty')
+        self._arm_specs, self.cartesian_target_order = _normalize_arms(arms, arm_name, cartesian_target_order)
+        self.arm_names = tuple(self._arm_specs) if self._arm_specs is not None else (arm_name,)
+        self.is_multi_arm = len(self.arm_names) > 1
+        if self.is_multi_arm and command_mode != 'cartesian':
+            raise NotImplementedError('Dual-arm joint follower is not supported by the current controller')
+        if self.is_multi_arm and (gripper is not None or gripper_transport != 'controller'
+                                  or gripper_feedback_path is not None):
+            raise NotImplementedError('Dual-arm gripper routing is not configured; use Cartesian arm targets only')
+        if self.is_multi_arm:
+            self.capabilities = frozenset({'relative_cartesian_follower'})
         if feedback_joint_unit not in ('deg', 'rad'):
             raise ValueError('feedback_joint_unit must be deg or rad')
         if feedback_position_unit not in (None, 'mm', 'm'):
@@ -356,7 +469,7 @@ class A10Operator(BaseOperator):
             raise ValueError('USB gripper requires explicit gripper settings')
         if gripper_transport == 'controller' and gripper is not None:
             raise ValueError('USB settings require gripper_transport="usb"')
-        reserved = {'qpos', 'joints', 'gripper_mm', 'tcp_pq_m', 'follower_active',
+        reserved = {'arms', 'qpos', 'joints', 'gripper_mm', 'tcp_pq_m', 'follower_active',
                     'follower_mode', 'has_error', 'received_monotonic_s',
                     'gripper_received_monotonic_s', 'camera_received_monotonic_s'}
         if cameras is not None and (not isinstance(cameras, dict)
@@ -389,7 +502,8 @@ class A10Operator(BaseOperator):
         self._trajectory_lock = threading.Lock()
         self._trajectory_owner = None
         self.last_trajectory = None
-        self.allow_motion, self.arm_name = allow_motion, arm_name
+        self.allow_motion = allow_motion
+        self.arm_name = self.arm_names[0] if not self.is_multi_arm else None
         self.feedback_joint_unit = feedback_joint_unit
         self.feedback_position_unit = feedback_position_unit
         self.gripper_feedback_path = gripper_feedback_path
@@ -397,6 +511,7 @@ class A10Operator(BaseOperator):
         self.command_mode = command_mode
         self.cartesian_wire_format = cartesian_wire_format
         self._cartesian_euler = np.zeros(3)
+        self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
         self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s,
                                                joint_udp_port)
         self._status_connection = None
@@ -421,6 +536,25 @@ class A10Operator(BaseOperator):
         """This session sent a start that hasn't been confirmed inactive yet."""
         return self._started_here
 
+    def _parse_feedback(self, reply):
+        return _parse_state(reply, joint_unit=self.feedback_joint_unit,
+                            position_unit=self.feedback_position_unit,
+                            gripper_feedback_path=self.gripper_feedback_path,
+                            arms=self._arm_specs, arm_name=self.arm_name)
+
+    def _reset_cartesian_encoding(self):
+        self._cartesian_euler = np.zeros(3)
+        self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
+
+    def _require_single_arm(self, operation):
+        if self.is_multi_arm:
+            raise NotImplementedError(f'Dual-arm {operation} is not supported; no command was sent')
+
+    def _has_model_feedback(self, state, mode):
+        return (set(state.arms) == set(self.arm_names) and
+                all(arm.actual_joints_rad is not None and
+                    (mode != 'Cart' or arm.tcp_pq_raw is not None) for arm in state.arms.values()))
+
     def connect(self):
         with self._io_lock:
             if not self.is_connected:
@@ -443,10 +577,7 @@ class A10Operator(BaseOperator):
                         # Bootstrap on the monitor port too. Control-port GET
                         # must not prevent the status monitor from starting.
                         reply = self._status_connection.request('get', status=True)
-                        self._latest_state = _parse_state(
-                            reply, joint_unit=self.feedback_joint_unit,
-                            position_unit=self.feedback_position_unit,
-                            gripper_feedback_path=self.gripper_feedback_path)
+                        self._latest_state = self._parse_feedback(reply)
                         self._status_stop.clear()
                         self._status_thread = threading.Thread(
                             target=self._poll_status, name='a10-status', daemon=True)
@@ -467,7 +598,7 @@ class A10Operator(BaseOperator):
             self._confirmed_active = self._started_here = False
             self._start_confirmed = False
             self._follower_mode = None
-            self._cartesian_euler = np.zeros(3)
+            self._reset_cartesian_encoding()
             errors = []
             closers = [self._connection.close]
             if self.camera_operator is not None:
@@ -486,9 +617,7 @@ class A10Operator(BaseOperator):
         while not self._status_stop.is_set():
             try:
                 reply = self._status_connection.request('get', status=True)
-                state = _parse_state(reply, joint_unit=self.feedback_joint_unit,
-                                     position_unit=self.feedback_position_unit,
-                                     gripper_feedback_path=self.gripper_feedback_path)
+                state = self._parse_feedback(reply)
                 with self._status_lock:
                     if (self._latest_state is None or state.received_monotonic_s
                             >= self._latest_state.received_monotonic_s):
@@ -519,15 +648,14 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             try:
                 reply = self._connection.request('get', status=True, timeout_s=timeout_s)
-                state = _parse_state(reply, joint_unit=self.feedback_joint_unit,
-                                     position_unit=self.feedback_position_unit,
-                                     gripper_feedback_path=self.gripper_feedback_path)
+                state = self._parse_feedback(reply)
                 self._confirmed_active = (self._started_here
                                           and self._start_confirmed
                                           and state.follower_active is True
                                           and state.follower_mode == self._follower_mode
                                           and state.raw['ret_context'].get('robot_msg', {}).get('activate') == 'Enabled'
-                                          and not state.has_error)
+                                          and not state.has_error
+                                          and self._has_model_feedback(state, self._follower_mode))
                 if self.status_poll_interval_s is not None:
                     with self._status_lock:
                         if (self._latest_state is None or state.received_monotonic_s
@@ -556,6 +684,10 @@ class A10Operator(BaseOperator):
                              follower_active=state.follower_active,
                              follower_mode=state.follower_mode, has_error=state.has_error,
                              received_monotonic_s=state.received_monotonic_s)
+                frame['arms'] = {name: dict(ee_id=arm.ee_id, joints=arm.actual_joints_rad,
+                                            target_joints=arm.target_joints_rad, tcp_pq_m=arm.tcp_pq_m,
+                                            received_monotonic_s=arm.received_monotonic_s)
+                                 for name, arm in state.arms.items()}
                 if self.gripper_operator is not None:
                     grip = self.gripper_operator.read_state()
                     width = grip.position_mm
@@ -610,6 +742,8 @@ class A10Operator(BaseOperator):
                     raise A10ControllerError('Controller reports a fault')
                 if active and state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled':
                     raise A10ControllerError('Follower running but motion permission is not confirmed')
+                if active and not self._has_model_feedback(state, self._follower_mode):
+                    raise A10ProtocolError('Follower running but configured model feedback is missing')
                 if active:
                     self._start_confirmed = self._confirmed_active = True
                 return state
@@ -688,6 +822,8 @@ class A10Operator(BaseOperator):
         mode = self.command_mode if mode is None else mode
         if mode not in _FOLLOWER_MODES:
             raise ValueError('mode must be cartesian or joint')
+        if mode == 'joint':
+            self._require_single_arm('joint follower')
         command, feedback_mode = _FOLLOWER_MODES[mode]
         with self._io_lock:
             self._require_motion()
@@ -698,7 +834,7 @@ class A10Operator(BaseOperator):
                 raise A10ControllerError('Controller reports a fault')
             if state.follower_active is not False:
                 raise RuntimeError('Follower is active or its state is unknown; refusing takeover')
-            if state.actual_joints_rad is None or (mode == 'cartesian' and state.tcp_pq_raw is None):
+            if not self._has_model_feedback(state, feedback_mode):
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
             info = state.raw['ret_context'].get('robot_msg', {})
             if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
@@ -715,7 +851,7 @@ class A10Operator(BaseOperator):
             self._confirmed_active = False
             self._follower_mode = feedback_mode
             self.command_mode = mode
-            self._cartesian_euler = np.zeros(3)
+            self._reset_cartesian_encoding()
             try:
                 self._connection.send_command(command)
                 return self._wait_mode(True)
@@ -755,27 +891,31 @@ class A10Operator(BaseOperator):
         KAANH 2.5.7's pq receiver maps negative yaw/roll to near 2*pi before
         scalar filtering/planning. The 321/pe receiver preserves signed angles.
         """
-        if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
-            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
-        pose = _pose(arm_targets[self.arm_name])
+        if not isinstance(arm_targets, Mapping) or set(arm_targets) != set(self.arm_names):
+            raise ValueError(f'Expected the complete arm group: {self.cartesian_target_order}')
+        poses = {name: _pose(arm_targets[name]) for name in self.cartesian_target_order}
         with self._io_lock:
-            euler = None
-            data = {'type': 'pq', 'pq': [pose.tolist()]}
+            eulers = {}
+            data = {'type': 'pq', 'pq': [value.tolist() for value in poses.values()]}
             if self.cartesian_wire_format == 'pe321':
-                with warnings.catch_warnings():
-                    warnings.filterwarnings('error', message='Gimbal lock detected.*', category=UserWarning)
-                    euler = Rotation.from_quat(pose[3:]).as_euler('ZYX')
-                # Preserve yaw/roll continuity across +/-pi. Ambiguous Euler
-                # branch changes must stop rather than command a large turn.
-                delta = (euler - self._cartesian_euler + np.pi) % (2 * np.pi) - np.pi
-                if np.max(np.abs(delta)) > np.pi / 2:
-                    raise ValueError('Cartesian Euler branch jump exceeds pi/2; refusing target')
-                euler = self._cartesian_euler + delta
-                data = {'type': '321', 'pe': [np.r_[pose[:3], euler].tolist()]}
+                rows = []
+                for name, value in poses.items():
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('error', message='Gimbal lock detected.*', category=UserWarning)
+                        euler = Rotation.from_quat(value[3:]).as_euler('ZYX')
+                    previous = self._cartesian_eulers[name]
+                    delta = (euler - previous + np.pi) % (2 * np.pi) - np.pi
+                    if np.max(np.abs(delta)) > np.pi / 2:
+                        raise ValueError(f'Cartesian Euler branch jump exceeds pi/2 for {name}; refusing target')
+                    eulers[name] = previous + delta
+                    rows.append(np.r_[value[:3], eulers[name]].tolist())
+                data = {'type': '321', 'pe': rows}
             payload = json.dumps(data, separators=(',', ':'), allow_nan=False).encode('utf-8')
             self._send_follower_target(_pack(payload, command=False), 'Cart')
-            if euler is not None:
-                self._cartesian_euler = euler.copy()
+            if eulers:
+                self._cartesian_eulers.update(eulers)
+                if not self.is_multi_arm:
+                    self._cartesian_euler = eulers[self.arm_name].copy()
 
     def _send_follower_target(self, packet, mode):
         with self._io_lock:
@@ -795,6 +935,7 @@ class A10Operator(BaseOperator):
 
     def send_gripper(self, gripper_targets, wait=False):
         """Explicit USB or controller route; only USB can wait for actual arrival."""
+        self._require_single_arm('gripper commands')
         if not isinstance(gripper_targets, Mapping) or set(gripper_targets) != {self.arm_name}:
             raise ValueError(f'Expected exactly one gripper: {self.arm_name}')
         position = float(_vector([gripper_targets[self.arm_name]], 1, 'gripper mm')[0])
@@ -805,6 +946,7 @@ class A10Operator(BaseOperator):
         return self._send_gripper_target(position, wait=wait)
 
     def _send_gripper_target(self, position, *, wait=False, check_state=True):
+        self._require_single_arm('gripper commands')
         with self._io_lock:
             self._require_target_owner()
             self._require_motion()
@@ -848,6 +990,7 @@ class A10Operator(BaseOperator):
         abort, with no retry, interpolation, catch-up burst or ROS dependency.
         Caller owns follower start/stop (the runner stops in its finally).
         """
+        self._require_single_arm('joint trajectories')
         if async_exec is not False:
             raise NotImplementedError('A10 trajectories support async_exec=False only')
         if head_trajectory is not None:
@@ -967,6 +1110,7 @@ class A10Operator(BaseOperator):
         No gripper, implicit hold, interpolation, retry, or arrival ACK. Client
         targets must match controller joint order; controller plans motion.
         """
+        self._require_single_arm('joint targets')
         if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
             raise ValueError(f'Expected exactly one arm: {self.arm_name}')
         radians = _vector(arm_targets[self.arm_name], 6, 'joint targets in radians')

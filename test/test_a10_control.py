@@ -6,12 +6,13 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import tempfile
 import sys
 import unittest
 from unittest.mock import patch
 
 from scripts.a10_control import main, parse_command, CommandError
-from test_a10_operator import FakeController
+from test_a10_operator import FakeController, DUAL_ARMS, dual_motion
 
 
 class ConsoleTest(unittest.TestCase):
@@ -348,6 +349,76 @@ class ConsoleTest(unittest.TestCase):
         self.assertEqual(parse_command(['joints','--deg','-1e-3','0','0','0','0','0']).targets[0],-.001)
         with self.assertRaises(CommandError):
             parse_command(['set_jog_coordinate','--to'])
+
+
+class DualConsoleTest(unittest.TestCase):
+    def run_config(self, controller, commands, *, read_only=False):
+        settings = dict(type='A10Operator', host='127.0.0.1',
+                        ws_port=controller.server.socket.getsockname()[1],
+                        status_ws_port=controller.server.socket.getsockname()[1],
+                        udp_port=controller.udp.getsockname()[1],
+                        joint_udp_port=controller.joint_udp.getsockname()[1],
+                        timeout_s=.3, allow_motion=not read_only,
+                        feedback_position_unit='mm', arms=DUAL_ARMS,
+                        cartesian_target_order=['left','right'])
+        output, lines = [], iter(commands)
+        def read(_):
+            try:
+                return next(lines)
+            except StopIteration:
+                raise EOFError
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'dual.py'
+            path.write_text('operator = ' + repr(settings))
+            args = ['--config', str(path)]
+            if read_only:
+                args.append('--read-only')
+            result = main([*args, 'shell'], operator_factory=lambda **kw: controller.operator(**kw),
+                          input_fn=read, output=output.append)
+        return result, '\n'.join(output)
+
+    def test_dual_get_joints_global_lifecycle_and_incomplete_commands(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, [
+                'get','joints','follower_cart','pq 0 0 0 0 0 0 1',
+                'joints --deg 0 0 0 0 0 0','g_move --pos=10','follower_aj','exit'])
+            self.assertEqual(result, 0)
+            self.assertIn('left（ee_id=0）', output)
+            self.assertIn('right（ee_id=1）', output)
+            self.assertIn('整个双臂控制组', output)
+            self.assertIn('双臂模式拒绝', output)
+            self.assertNotIn('可复制为目标', output)
+            self.assertEqual([x for x in c.commands if x!='get'], ['follower_cart','stop_follower'])
+            for sock in (c.udp,c.joint_udp):
+                with self.assertRaises(TimeoutError):
+                    sock.recv(65535)
+
+    def test_readonly_config_queries_only_even_with_start_requested(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, ['get','follower_cart','manual_en','exit'], read_only=True)
+            self.assertEqual(result, 0)
+            self.assertIn('allow_motion is false', output)
+            self.assertEqual(set(c.commands), {'get'})
+
+    def test_single_controller_cannot_bootstrap_dual_config_or_send_start(self):
+        with FakeController() as c:
+            result, output = self.run_config(c, ['follower_cart','exit'])
+            self.assertEqual(result, 0)
+            self.assertIn('configured feedback group', output)
+            self.assertTrue(all(x=='get' for x in c.commands))
+
+    def test_bad_config_type_does_not_construct_or_connect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wrong.py'
+            path.write_text("operator = dict(type='OtherOperator', host='127.0.0.1')")
+            def never(**_):
+                self.fail('invalid operator type constructed')
+            output = []
+            result = main(['--config',str(path),'get'],operator_factory=never,output=output.append)
+            self.assertEqual(result,1)
+            self.assertIn('必须使用 A10Operator','\n'.join(output))
 
 
 if __name__ == '__main__':

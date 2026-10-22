@@ -22,6 +22,7 @@ conda activate fluxvla
 | ③ 只检查配置能否加载 | `--preview` | 否 | 否 |
 | ④ 只检查机器人状态和通信 | `--inspect-controller` | 只读状态 | 否 |
 | **⑤ 用旧锚点相对算法遥操作实机** | **`control_mode=reference` + `pose_mapping=anchor_relative`** | 是 | **是** |
+| ⑥ 查询双臂控制器的基础状态 | `a10_control.py --config … --read-only get` | 只读状态 | 否 |
 | 重新记录一份标定 | `--calibrate-pose` | 只读状态 | 否；会保存标定文件 |
 | 调试 reference 的计算过程（旧观察入口） | `--observe` | 只读状态 | 否；静止时可能触发追踪误差 |
 
@@ -106,6 +107,20 @@ python scripts/teleoperate.py \
   不是切回旧 C++ TCP follower，也不是最早的 `control_mode=delta` 逐帧累积路径。
 - 该命令会真实控制机械臂，不能加 `--observe` 或 `--verify-calibration` 当作执行开关。
   程序不自动使能或回零；初次小幅操作，现场确认停止，切回旧映射不会修复已发现的控制器奇异点/停止问题。
+
+## ⑥ 双臂基础状态查询：控制器部署双臂后使用
+
+```bash
+python scripts/a10_control.py \
+  --config configs/a10/a10_dual_arm_operator.py \
+  --read-only get
+```
+
+模板中左右编号、反馈位置和单位须按实际双臂配置核对。**0.125 当前运行的是单臂 XML**，
+此时用双臂模板查询会报告反馈组不匹配，这是预期保护，不会自动切换控制器配置。
+想连续查询可将末尾 `get` 换为 `shell`，输入 `get`、`joints`，退出输入 `exit`。
+模板默认禁止运动；双臂启停作用于整个控制组。本轮未接通双臂 VR、录制、标定和模型推理，
+也未开放双臂关节、夹爪和旧控制台单臂目标发送。⑤仍是原单臂 VR 命令。
 
 ## 少量常用参数
 

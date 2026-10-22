@@ -36,6 +36,8 @@ pq 的 xyz 单位是米，四元数顺序是 xyzw，须为单位四元数。
 关节目标是六个绝对角度，单位度，顺序为关节1到6；不包含夹爪。
 关节跟随与末端跟随不能混发；切换前先 stop_follower。
 UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场核对。
+双臂配置：get/joints 显示各臂；follower_cart/stop_follower 作用于整个控制组。
+本轮双臂不提供控制台目标发送；pq、joints --deg、g_move、follower_aj 会明确拒绝。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
 断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
 清错仍使用现场控制器界面，本控制台不透传任意控制器命令。
@@ -104,7 +106,17 @@ def show_state(state, output=print):
                ('robot_msg', 'log_msg', 'driver_msg')}, ensure_ascii=False))
     if state.actual_joints_rad is not None:
         output('实际关节（弧度）：' + str(state.actual_joints_rad.tolist()))
-    output(f'实际夹爪（毫米）：{state.gripper_mm if state.gripper_mm is not None else "暂无反馈"}')
+    if len(getattr(state, 'arms', {})) > 1:
+        output('控制器级状态以上显示；双臂共用一个 follower。')
+        for name, arm in state.arms.items():
+            output(f'{name}（ee_id={arm.ee_id}）实际关节（弧度）：' +
+                   ('暂无反馈' if arm.actual_joints_rad is None else str(arm.actual_joints_rad.tolist())))
+            output(f'{name} TCP（米/xyzw）：' +
+                   ('暂无已确认单位的反馈' if arm.tcp_pq_m is None else str(arm.tcp_pq_m.tolist())))
+    if len(getattr(state, 'arms', {})) > 1:
+        output('双臂夹爪：本轮未适配。')
+    else:
+        output(f'实际夹爪（毫米）：{state.gripper_mm if state.gripper_mm is not None else "暂无反馈"}')
 
 
 class A10Console:
@@ -143,6 +155,9 @@ class A10Console:
     def execute(self, args):
         """Execute parsed commands via public operator methods only."""
         robot, out, cmd = self.robot, self.output, args.command
+        if getattr(robot, 'is_multi_arm', False) and (
+                cmd in ('pq', 'g_move', 'follower_aj') or (cmd == 'joints' and args.targets)):
+            raise CommandError('双臂模式拒绝单臂目标、夹爪和关节跟随指令；请使用完整控制组的 operator 笛卡尔接口。')
         if cmd == 'help':
             out(HELP)
         elif cmd == 'exit':
@@ -168,11 +183,19 @@ class A10Console:
         elif cmd in ('follower_cart', 'follower_aj'):
             mode = 'joint' if cmd == 'follower_aj' else 'cartesian'
             state = self.observe(robot.start_follower(mode=mode))
+            if getattr(robot, 'is_multi_arm', False):
+                out('本次启用整个双臂控制组，不是独立启动某一臂。')
             out(('六轴关节' if mode == 'joint' else '笛卡尔') +
                 '跟随已启动（反馈已确认）；尚未发送 UDP 目标。')
             show_state(state, out)
         elif cmd == 'joints':
             state = self.observe(robot.get_state())
+            if getattr(robot, 'is_multi_arm', False):
+                for name, arm in state.arms.items():
+                    values = ('暂无实际反馈' if arm.actual_joints_rad is None else
+                              ' '.join(format(math.degrees(float(v)), '.17g') for v in arm.actual_joints_rad))
+                    out(f'{name}（ee_id={arm.ee_id}）六轴实际角度（度）：{values}')
+                return True
             if args.targets:
                 robot.send_joints({robot.arm_name: [math.radians(v) for v in args.targets]})
                 out('六轴绝对角度目标已通过 UDP 发送；没有接收确认，尚未确认运动或到位。')
@@ -248,14 +271,17 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     parser = argparse.ArgumentParser(description='A10 真机通信控制台',
                                      epilog='例如：--host 192.168.110.124 shell',
                                      allow_abbrev=False)
-    parser.add_argument('--host', required=True, help='工控机 IP 或主机名')
-    parser.add_argument('--ws-port', type=int, default=5999)
-    parser.add_argument('--udp-port', type=int, default=9998)
-    parser.add_argument('--joint-udp-port', type=int, default=9999)
-    parser.add_argument('--timeout', type=float, default=5.0, help='命令确认超时秒数')
+    parser.add_argument('--config', type=Path, help='包含 operator 字典的 Python 配置文件')
+    parser.add_argument('--host', help='工控机 IP 或主机名；也可由 --config 提供')
+    parser.add_argument('--ws-port', type=int)
+    parser.add_argument('--udp-port', type=int)
+    parser.add_argument('--joint-udp-port', type=int)
+    parser.add_argument('--timeout', type=float, help='命令确认超时秒数；默认 5')
     parser.add_argument('--read-only', action='store_true', help='只读；禁止设置和控制命令')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='shell 或单次指令；默认 shell')
     args = parser.parse_args(argv)
+    if not args.host and args.config is None:
+        parser.error('请提供 --host 或 --config')
     tokens = args.command or ['shell']
     interactive = tokens == ['shell']
     try:
@@ -277,9 +303,26 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
         if operator_factory is None:
             from fluxvla.engines.operators.a10_operator import A10Operator
             operator_factory = A10Operator
-        robot = operator_factory(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
-                                 joint_udp_port=args.joint_udp_port,
-                                 timeout_s=args.timeout, allow_motion=not args.read_only)
+        if args.config is not None:
+            from mmengine import Config
+            settings = dict(Config.fromfile(str(args.config))['operator'])
+            if settings.pop('type', 'A10Operator') != 'A10Operator':
+                raise CommandError('控制台配置必须使用 A10Operator')
+        else:
+            settings = dict(timeout_s=5., allow_motion=True)
+        overrides = dict(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
+                         joint_udp_port=args.joint_udp_port, timeout_s=args.timeout)
+        settings.update({key: value for key, value in overrides.items() if value is not None})
+        if args.read_only:
+            settings['allow_motion'] = False
+            # Monitor-only, with no accessory opens or extra background socket.
+            if args.config is not None and args.ws_port is None:
+                settings['ws_port'] = settings.get('status_ws_port', 5888)
+            settings.pop('status_poll_interval_s', None)
+            for key in ('cameras', 'gripper', 'gripper_feedback_path'):
+                settings.pop(key, None)
+            settings['gripper_transport'] = 'controller'
+        robot = operator_factory(**settings)
         console = A10Console(robot, output)
         if interactive:
             try:

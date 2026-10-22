@@ -617,3 +617,13 @@ J5 最后回传值约 -13.20°；奇异点由控制器明确报告，不仅是�
 按用户追加需求，新增精简入口 `docs/a10_command_cheatsheet.md`，集中区分只读标定验证、
 VR-only、预览和控制器状态检查，注明旧观察/标定入口的区别；使用说明顶部增加链接。
 速查表优先展示当前需要的只读命令，避免把未验收的实机绝对控制命令当作默认流程。
+
+## 2026-10-22：补齐旧锚点遥操作实机命令
+
+- 根据用户反馈，在 `docs/a10_command_cheatsheet.md` 新增第⑤项完整命令：
+  `control_mode=reference`、`pose_mapping=anchor_relative`、`vr_only=False`、
+  `observe_only=False`、`allow_motion=True`，连接现场 0.125 控制器。
+- 明确它是旧锚点相对位姿映射，保留 reference 限速/平滑、仍走 UDP follower；
+  不加载绝对姿态标定文件，不等同旧 C++ TCP follower 或最早 delta 累积路径。
+- 补充从只读验证切回实机时刷新头显输入页、人工使能前提和释放/退出停止请求的区别。
+- 本轮只改操作文档，使用 `--preview` 核对完整命令可构造正确模式；不连接设备、不运行运动、不改算法或速度参数。

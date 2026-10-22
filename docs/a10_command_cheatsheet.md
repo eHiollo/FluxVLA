@@ -1,6 +1,6 @@
 # A10 常用命令速查
 
-**现在检查标定方向，选第 ① 条。** 其他命令按用途查，不需要每条都执行。
+**用旧锚点算法调试实机，选第 ⑤ 条；检查标定方向，选第 ① 条。** 不需要每条都执行。
 
 ## 先进入正确目录
 
@@ -21,6 +21,7 @@ conda activate fluxvla
 | ② 只确认 VR 能连接、按键和手柄数据正常 | `teleop.vr_only=True` | 否 | 否 |
 | ③ 只检查配置能否加载 | `--preview` | 否 | 否 |
 | ④ 只检查机器人状态和通信 | `--inspect-controller` | 只读状态 | 否 |
+| **⑤ 用旧锚点相对算法遥操作实机** | **`control_mode=reference` + `pose_mapping=anchor_relative`** | 是 | **是** |
 | 重新记录一份标定 | `--calibrate-pose` | 只读状态 | 否；会保存标定文件 |
 | 调试 reference 的计算过程（旧观察入口） | `--observe` | 只读状态 | 否；静止时可能触发追踪误差 |
 
@@ -79,6 +80,33 @@ python scripts/teleoperate.py \
 默认读取 10 次状态，输出结果后退出；不会启动 VR 服务或运动。
 需要保存检查结果时，加 `--report work_dirs/a10/vr/controller_check.json`。
 
+## ⑤ 旧锚点相对算法：VR 控制实机
+
+控制器 follower 服务应已启动，电机为 Enabled、机械臂为 Stopped。
+在上面的 VR 工作目录和 `fluxvla` 环境中执行：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.control_mode=reference \
+    teleop.pose_mapping=anchor_relative \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0
+```
+
+- 头显打开终端打印的 **VR 输入网址**。从只读验证切过来时刷新输入页，确认不再显示“只读标定验证”。
+- 按住右手侧键，以接管时的手柄和机械臂姿态为起点，跟随手柄的**相对平移和相对旋转**。
+  不会主动对齐手柄绝对朝向；不读取本地姿态标定文件。松开侧键和前扳机后请求停止跟随。
+- `reference` 保留限速/平滑，`anchor_relative` 选择旧位姿映射；仍由 FluxVLA 通过 UDP follower 下发，
+  不是切回旧 C++ TCP follower，也不是最早的 `control_mode=delta` 逐帧累积路径。
+- 该命令会真实控制机械臂，不能加 `--observe` 或 `--verify-calibration` 当作执行开关。
+  程序不自动使能或回零；初次小幅操作，现场确认停止，切回旧映射不会修复已发现的控制器奇异点/停止问题。
+
 ## 少量常用参数
 
 | 参数 | 通俗解释 |
@@ -99,6 +127,6 @@ python scripts/teleoperate.py \
 
 - 网页、头显和控制器地址是不同的：网页用**本机局域网 IP**，控制器用 `192.168.0.125`。
 - 一次运行一个 VR 命令；原终端保持打开。换命令先按 `Ctrl+C` 退出，避免网页端口被占用。
-- `Ctrl+C` 关闭这里的只读程序；**不能把它当作机械臂急停**。
-- 当前标定方向、奇异点及停止过程还在核实，因此本速查不把实机运动命令作为默认操作。
+- ①～④不下发运动；⑤为实机模式，退出会请求停止跟随，应确认控制器已停止。**`Ctrl+C` 不是机械臂急停**。
+- 新绝对姿态标定、奇异点及停止过程仍在核实；⑤沿用旧相对映射，不代表这些问题已修复。
 - 详细功能与历史命令见 [A10 VR 使用说明](a10_vr_operator.md)；人工使能、跟随和关节控制另见 [现场操作说明](a10_onsite_guide.md)。

@@ -672,3 +672,67 @@ PYTHONPATH=test:test/test_runners /home/robot/miniforge3/envs/fluxvla/bin/python
 这次完成的是基本配置和通信接口，不代表双臂 VR 已接通。双臂机械模型/末端编号/
 物理左右/反馈布局/实际发包执行尚需控制器部署及现场验收；当前关节 follower 源码只接受六轴，
 本轮未开放双臂关节。双臂夹爪、录制、VR 标定与模型适配后续独立安排。
+
+## 2026-10-22：双臂 VR 映射与独立锚点 reference 控制
+
+### 本轮完成
+
+在 `kaanh_follower_vr` 实现；没有改动 `kaanh_follower` 工作区或远端控制器。
+沿用现有 `operators/vr` 目录、A10Operator 和 teleoperate 入口，没有新增 runner、
+RobotOperator 或 projects/a10 依赖，也没有修改 BaseOperator。
+
+- `vr_operator.py`：增加 `arm='both'` 和显式 `hand_to_arm`，一个输入服务拥有两套独立 mapper。
+  默认左手控制 left、右手控制 right；仅侧键接管，扳机只调整比例；屏蔽双臂夹爪输出和旧录制事件。
+- `vr/input.py`、`vr/monitor.py`：一把锁复制双手最新输入，分别保留各手的姿态接收时间和序号。
+  左右手一致合并部分更新，不以按键事件刷新旧姿态时间；显式松手覆盖缓存中的 squeeze 状态。
+- `vr/runtime.py`：在同一文件增加 DualVRTeleopRuntime，复用单臂连接、诊断与异常清理。
+  两臂分别拥有接管锚点、固定 follower 启动锚点、控制状态及目标；整组只启动一次 follower。
+  后接管/重新接管只处理该手；两臂目标全部检查通过后，一次调用 send_eepose 发完整组。
+- `vr/control.py`：复用原 AnchorState、ReferenceGovernor 与 reference 整形。
+  新增独立释放：丢弃旧手柄远目标和参考目标，保留当前命令连续性，按已有加速度限制将
+  线/角命令速度降为零，随后重复固定终点；不直接跳到实际反馈，不继续追赶旧用户远目标。
+  重新接管时刷新该臂实际锚点，同时保留命令连续性及 follower 启动锚点。
+- 正常单手释放不调用全局 stop；另一手继续跟随。若减速时提前重新按住侧键，该臂须在
+  保持后再次松手再接管，避免恢复减速期间积累的输入。两手释放并完成过渡后才统一停止。
+- 停止过渡检查反馈误差、变化速度与连续稳定时长；未稳定超时、活动输入断流、故障、
+  跟踪异常或不完整反馈请求全组停止。停止未确认会锁定本次会话，不能通过松手自行恢复。
+  长时间保持后出现小幅反馈变化时重新计算稳定预算，避免沿用旧超时计时造成误停。
+- 新增 `configs/a10/a10_dual_arm_vr_teleop.py`，复用原 VR 默认参数和双臂 operator 模板，
+  默认 VR-only、禁止运动、旧锚点相对映射 + reference；不加载单臂姿态标定。
+- 原单臂运行路径保留；双臂只读观察可用，控制器检查保留双臂映射并分臂输出。
+  CLI 明确拒绝双臂标定/标定网页入口，避免误套用单臂流程。
+- 更新 `docs/a10_vr_operator.md` 和 `docs/a10_command_cheatsheet.md` 第⑦项。
+  双臂 JSONL 单独保存左右手诊断、分臂反馈、reference 状态及整包发送目标；不冒充训练数据集。
+
+### 验证记录
+
+均为纯算法、合成反馈、假输入或本机回环 WS/UDP；未访问控制器、使能或移动实机。
+
+1. 原有 VR 相关 70 项回归通过。
+2. 完整回归 **239 项通过，58.376 秒**（当时新增19项双臂测试）：
+
+   ```bash
+   PYTHONPATH=test:test/test_runners /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest \
+     test_a10_operator test_a10_control test_vr_reference_runtime test_vr_operator \
+     test_vr_control test_vr_calibration test_vr_native_entry test_vr_calibration_view \
+     test_vr_dual_runtime test_a10_inference_runner test_a10_integration \
+     test_camera_operator test_gripper_operator
+   ```
+
+3. 最终双臂专项 **21 项通过**，额外覆盖双臂只读检查和长时间保持后的计时边界。
+   因此本轮共有原有220项与新增21项不同测试通过，未将重复执行次数相加。
+   专项覆盖：双手快照不串改、左右输入独立、左停右动/右停左动、延后接管、固定启动锚点、
+   释放减速度界限、减速中重按门禁、两手释放统一停止、反馈缺失/过期、停止超时锁定、
+   第二臂无效时整包不发、VR-only 无伪反馈、observe 无控制命令，以及真实字节收包的行顺序/头部。
+4. 新配置的默认 `--preview` 和 `--observe --preview` 均通过，不启动服务或连接设备。
+   `git diff --check` 无错误。测试输出仅保存在本机 `/tmp/a10_dual_vr_*.log`，不提交产物。
+
+### 待现场确认与范围
+
+前端功能完成，不代表双臂机械臂实际运动已经验收。当前配置依然是历史双臂 XML 的模板；
+需要团队先部署并确认实际双臂模型、左右编号、TCP/关节反馈布局以及笛卡尔目标行顺序。
+两臂整包发送不等于底层严格同步或逐帧到位确认，UDP 仍无执行 ACK。
+
+本次释放仅整形前端命令，不能据此证明原生 UDP follower 的内部滤波、速度规划、物理制动、
+断流处理或奇异点行为已验证。前端保持目标与容差检查也不是单臂物理急停接口。
+双臂录制、绝对姿态标定、夹爪、推理、关节轨迹和碰撞避障仍不在本轮范围内。

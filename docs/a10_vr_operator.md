@@ -468,3 +468,74 @@ PDF 中的空数组示例直接用于发送。启动锚点刷新规则与完整 
 共享流程 HTTPS/WSS 等 6 项及既有驱动／通信／推理 runner 回归。测试拦截所有
 `fluxvla.projects` 导入后，新入口预览仍通过。日志在
 `work_dirs/a10/vr_native/20261015/`。未进行实机或真实头显验证。
+
+## 双臂 VR：独立锚点与 reference（2026-10-22）
+
+使用新配置 `configs/a10/a10_dual_arm_vr_teleop.py`，原单臂配置和用法保留。
+**前端实现和模拟测试已完成；尚未进行双臂实机验收。** 上次只读调查时 0.125 加载的是单臂 XML，
+本轮没有登录控制器；实机使用前须由团队确认已部署双臂模型、左右编号、GET 反馈行及目标行顺序。
+配置继承 `a10_dual_arm_operator.py`，其中映射仍为模板，不自动识别或切换远端模型。
+
+### 操作逻辑
+
+- 一个 VR 浏览器和一个服务同时接收两只手的数据；左右手各自检查输入时间和有效性。
+- 默认 `hand_to_arm=dict(left='left', right='right')`。左右侧键分别接管对应臂；前扳机只在按住侧键时调整精细比例，不单独接管。
+- 每次接管以当前手柄和该臂的实际位姿记录锚点，平移、旋转均使用旧相对映射；不加载绝对姿态标定。
+- 每臂独立计算 reference、命令速度与跟踪误差；底层 IK、运动规划和电机控制仍在控制器。
+- 两条臂的目标全部检查通过后，`A10Operator.send_eepose()` 按显式行顺序发送一个完整 UDP 包。
+  每条臂均相对**整个 follower 启动时该臂的固定锚点**编码；单手重新接管不改变此锚点。
+
+### 松手和重新接管
+
+| 操作 | 行为 |
+| --- | --- |
+| 只按一侧侧键 | 该臂跟随，另一臂保持启动位置 |
+| 两侧均按住 | 两条臂独立跟随 |
+| 松开一侧 | 丢弃该臂旧的手柄远目标，命令速度逐步降为零，保持停止过渡的终点；另一臂继续 |
+| 该臂保持后重新按侧键 | 重新取该臂接管锚点；不重启整个 follower，也不重置另一侧 |
+| 在减速阶段提前按回侧键 | 不自动恢复；待保持后松开一次，再按住接管 |
+| 两侧均释放 | 等两臂停止过渡完成后，统一请求停止 follower，并确认 inactive + Stopped |
+| 活动输入断流、控制器故障、严重跟踪误差或停止过渡超时 | 请求全组停止；须两手新鲜释放后才允许再次接管 |
+| 全组停止未确认 | 锁定本次会话；禁止松手后自行恢复，需现场核对状态 |
+
+“保持”仍持续发送该臂的固定目标，不能漏掉这一行，也不能用最后的手柄远目标代替。
+前端停止过渡只限制**发送目标的速度/加速度**，不保证机械臂物理制动效果；本轮未验证原生
+follower 的内部滤波、插补、断流或制动行为，没有新增单臂 stop 后端协议。
+
+默认 reference 速度保持原值：`0.12 m/s`、`0.32 rad/s`，加速度 `0.4 m/s²`、`0.96 rad/s²`。
+停止过渡期间同样检查跟踪误差和单步变化；命令速度为零且实际反馈距终点不超过 2 mm / 0.02 rad、
+反馈差分速度不超过 0.01 m/s / 0.05 rad/s，并连续满足 0.1 秒后，认为前端观察到保持。
+超过 2 秒未满足则请求全组停止。这是客户端接收反馈的判定，不是底层电机速度的独立测量。
+这些停止容差和时长可通过 `teleop.reference_options.release_*` 配置，不通过放宽它们代替实机排障。
+
+### 命令与日志
+
+```bash
+# 默认只读取双手 VR，不连接机器人、不生成虚构的机器人反馈。
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
+
+# 仅构造配置，不启动网页或连接设备。
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --preview
+```
+
+控制器已确认支持双臂、机械臂已由现场人员使能且停止后：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True
+```
+
+仍打开终端打印的**本机** HTTPS 地址，不在头显中填写控制器 IP 或 `0.0.0.0`。
+双臂模式禁用旧录制摇杆事件、夹爪输出和摇杆重置；用 `Ctrl+C` 结束会话。
+`--observe` 可只读计算双臂目标，无 UDP 或启停命令；静止设备上的移动目标可能触发跟踪误差。
+本轮不开放双臂标定、采集、夹爪、模型推理、双臂关节轨迹或碰撞避障。
+
+诊断追加到 `work_dirs/a10/vr/dual_teleop_diagnostics.jsonl`：`hands` 保存左右 mapper 诊断，
+`raw_input` 分左右手，`mapped_action`、`feedback.arms`、`reference_control.arms` 和
+`sent_relative_target` 按机械臂名区分。`reengage_requires_release` 表示该臂需要重新松手再接管。
+VR-only 中反馈和发送目标为空；该日志不是训练数据集，也不能证明实际机械臂已经停止。

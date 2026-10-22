@@ -238,6 +238,9 @@ class VRTeleopRuntime:
             if self._diagnostics is not None:
                 getter = getattr(self.mapper, 'get_last_diagnostics', None)
                 record = dict(getter() or {}) if getter else {}
+                if getattr(self.teleoperator, 'is_dual', False):
+                    record = dict(hands={hand: mapper.get_last_diagnostics() for hand, mapper
+                                         in self.teleoperator.mappers.items()})
                 record.update(control_frame_index=self._frame_index,
                               raw_input=raw, mapped_action=action,
                               feedback=self.last_frame,
@@ -478,10 +481,15 @@ class VRTeleopRuntime:
                 action = self.step()
                 count += 1
                 if not self.execute and count % fps == 0:
-                    print({key: action.get(key) for key in (
-                        'ee.enabled', 'ee.delta_x', 'ee.delta_y', 'ee.delta_z',
-                        'ee.delta_rx', 'ee.delta_ry', 'ee.delta_rz',
-                        'gripper.pos')}, flush=True)
+                    if getattr(self.teleoperator, 'is_dual', False):
+                        print({arm: {'enabled': value.get('ee.enabled'),
+                                     'anchor': value.get('_xlevr.anchor_command')}
+                               for arm, value in action.items()}, flush=True)
+                    else:
+                        print({key: action.get(key) for key in (
+                            'ee.enabled', 'ee.delta_x', 'ee.delta_y', 'ee.delta_z',
+                            'ee.delta_rx', 'ee.delta_ry', 'ee.delta_rz',
+                            'gripper.pos')}, flush=True)
                 time.sleep(max(0., 1. / fps - (time.monotonic() - started)))
             return count
         except KeyboardInterrupt:
@@ -525,11 +533,205 @@ class VRTeleopRuntime:
                             self._diagnostics = None
 
 
+class DualVRTeleopRuntime(VRTeleopRuntime):
+    """Two independent clutches/controllers, one whole-group transport/lifecycle.
+
+    No dual calibration, gripper, IK or collision avoidance. A normal per-arm
+    release shapes a bounded command stop; faults stop the entire group.
+    """
+
+    def __init__(self, vr, robot=None, *, gripper=None, **settings):
+        from .control import VRPoseController
+        if (not getattr(vr, 'is_dual', False) or settings.get('control_mode') != 'reference'
+                or settings.get('pose_mapping', 'anchor_relative') != 'anchor_relative'
+                or gripper is not None):
+            raise ValueError('Dual VR requires both hands, reference, anchor_relative and no gripper')
+        self.arm_names = tuple(vr.hand_to_arm.values())
+        if robot is not None and (not getattr(robot, 'is_multi_arm', False)
+                                  or set(robot.arm_names) != set(self.arm_names)):
+            raise ValueError('VR bindings must match the complete dual A10 arm group')
+        super().__init__(vr, robot=robot, gripper=None, **settings)
+        if not self.reference_control.config.limit_acceleration:
+            raise ValueError('Dual release requires acceleration limiting')
+        self._arms = {arm: dict(hand=hand, mapper=vr.mappers[hand],
+                               control=VRPoseController(self.reference_control.config),
+                               state='holding', blocked=False, key=None, target=None)
+                      for hand, arm in vr.hand_to_arm.items()}
+        self._dual_time = None
+        self._dual_require_release = False
+        self._dual_stop_failed = False
+
+    def _checked_frame(self, *, require_active):
+        from .control import pose
+        frame = self.robot.get_frame()
+        self.last_frame = frame
+        now = time.monotonic()
+        if not isinstance(frame, dict) or frame.get('has_error') is not False:
+            raise RuntimeError('Dual A10 feedback is missing or reports a fault')
+        stamp = frame.get('received_monotonic_s')
+        if (not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
+                or not 0 <= now - stamp <= self.max_feedback_age_s):
+            raise RuntimeError('Dual A10 feedback is stale')
+        if require_active and (frame.get('follower_active') is not True
+                               or frame.get('follower_mode') != 'Cart'):
+            raise RuntimeError('Dual Cartesian follower is not confirmed active')
+        arms = frame.get('arms')
+        if not isinstance(arms, dict) or set(arms) != set(self.arm_names):
+            raise RuntimeError('Dual A10 feedback must contain the complete configured arm group')
+        poses = {}
+        for name in self.arm_names:
+            arm_stamp = arms[name].get('received_monotonic_s')
+            if (not isinstance(arm_stamp, (int, float)) or not math.isfinite(arm_stamp)
+                    or not 0 <= now - arm_stamp <= self.max_feedback_age_s):
+                raise RuntimeError(f'Dual A10 feedback is stale for {name}')
+            poses[name] = pose(arms[name].get('tcp_pq_m'))
+        return poses
+
+    def _stop_reference(self):
+        try:
+            super()._stop_reference()
+        except BaseException:
+            self._dual_stop_failed = True
+            raise
+        finally:
+            self._dual_time = None
+            self._dual_require_release = True
+            self.teleoperator.reset_reference()
+
+    def _input_state(self, raw, action):
+        requested, fresh = {}, {}
+        for arm, context in self._arms.items():
+            hand_raw = raw[context['hand']]
+            age = hand_raw.get('xlevr.sample_age_s')
+            requested[arm] = bool(hand_raw.get('xlevr.enabled'))
+            fresh[arm] = (isinstance(age, (int, float)) and math.isfinite(age)
+                          and 0 <= age + max(0., time.monotonic() - self._input_read_time)
+                          <= min(context['mapper'].stale_timeout_s,
+                                 context['control'].config.max_input_age_s))
+            if hand_raw.get('xlevr.reset_arm') or action[arm].get('_xlevr.reset_arm'):
+                raise RuntimeError('Dual VR live reset is unsupported; release the side keys')
+            if requested[arm] or (self._dual_time is not None and context['state'] == 'tracking'):
+                if not fresh[arm]:
+                    raise RuntimeError(f'Dual VR {arm}: input_stale')
+                command = action[arm].get('_xlevr.anchor_command', {})
+                if requested[arm] and command.get('active') is not True:
+                    raise RuntimeError(f'Dual VR {arm}: mapper_input_rejected')
+        return requested, fresh
+
+    def _step(self, raw, action):
+        from .control import follower_relative
+        if not self.execute and not self.observe_only:
+            return action  # VR-only maps both hands, never fabricates feedback.
+        if self._dual_stop_failed:
+            raise RuntimeError('Dual follower stop is unconfirmed; do not restart this session')
+        if set(raw) != {'left', 'right'} or set(action) != set(self.arm_names):
+            raise ValueError('Dual VR requires complete hand input and arm actions')
+        if self._dual_require_release:
+            # Latched after a shared stop/fault: no automatic restart with held keys.
+            released = all(not raw[c['hand']].get('xlevr.enabled') and
+                           isinstance(raw[c['hand']].get('xlevr.sample_age_s'), (float, int)) and
+                           0 <= raw[c['hand']]['xlevr.sample_age_s'] <= c['mapper'].stale_timeout_s
+                           for c in self._arms.values())
+            if released:
+                self._dual_require_release = False
+                self.teleoperator.reset_reference()
+            self.last_reference_result = dict(state='release_required', arms={})
+            return action
+        requested, fresh = self._input_state(raw, action)
+        poses = self._checked_frame(require_active=self.execute and self._started_follower)
+        if self._dual_time is None:
+            starters = [name for name in self.arm_names if requested[name]
+                        and action[name].get('ee.enabled')]
+            if not starters:
+                self.last_reference_result = dict(state='idle', arms={})
+                return action
+            for name in starters:
+                self._arms[name]['control'].validate_command(
+                    action[name]['_xlevr.anchor_command'], poses[name])
+            if self.execute:
+                self.robot.set_tool_coordinate()
+                self._reference_stop_attempted = False
+                self.last_stop_status = None
+                self.robot.start_follower('cartesian')
+                self._started_follower = True
+                poses = self._checked_frame(require_active=True)
+            targets = {}
+            for name, context in self._arms.items():
+                context.update(state='holding', blocked=False, key=None, target=poses[name].copy())
+                context['control'].start(poses[name])
+                targets[name] = follower_relative(poses[name], poses[name])
+            self.teleoperator.reset_reference()  # Discard input predating blocking WS setup.
+            self._dual_time = time.monotonic()
+            self.last_reference_result = dict(state='await_fresh_sample', arms={}, transmitted=False)
+            if self.execute:
+                self.robot.send_eepose(targets)
+                self.last_relative_target = targets
+                self.last_reference_result['transmitted'] = True
+            return action
+        now = time.monotonic()
+        dt = now - self._dual_time
+        feedback_age = now - self.last_frame['received_monotonic_s']
+        targets, results = {}, {}
+        for name, context in self._arms.items():
+            control = context['control']
+            command = action[name]['_xlevr.anchor_command']
+            active = requested[name] and command.get('active') is True and action[name].get('ee.enabled')
+            key = (command.get('session_id'), command.get('anchor_id'))
+            if context['state'] == 'tracking' and requested[name]:
+                if key != context['key']:
+                    raise RuntimeError(f'Dual VR {name}: anchor_changed_while_engaged')
+            if context['state'] == 'tracking' and not requested[name]:
+                context['state'] = 'releasing'
+            if context['state'] == 'releasing' and requested[name]:
+                context['blocked'] = True  # Must release again after stopping, never auto-resume.
+            if context['state'] == 'holding' and fresh[name] and not requested[name]:
+                context['blocked'] = False
+            if active and context['state'] != 'releasing' and not context['blocked']:
+                age = raw[context['hand']]['xlevr.sample_age_s'] + max(0., now - self._input_read_time)
+                result = control.step(command, poses[name], dt, sample_age_s=age,
+                                      feedback_age_s=feedback_age, continuous_reanchor=True)
+                context.update(state='tracking', key=key)
+            else:
+                result = control.step_released(poses[name], dt, feedback_age_s=feedback_age)
+                if context['state'] == 'releasing' and result['state'] == 'holding':
+                    context['mapper'].reset()  # Re-clutch only this hand; preserve the other.
+                if context['state'] == 'releasing':
+                    context['state'] = result['state']
+            results[name] = result
+            result.update(hand=context['hand'], reengage_requires_release=context['blocked'])
+            self.last_reference_result = dict(state='running', arms=results, transmitted=False)
+            if result['stop_requested']:
+                raise RuntimeError(f"Dual VR {name}: {result['fault_reason']}")
+            target = np.asarray(result['command_pose'])
+            self._check_tracking(poses[name], target)
+            previous = context['target']
+            if (np.linalg.norm(target[:3] - previous[:3]) > self.max_position_step_m
+                    or (Rotation.from_quat(previous[3:]).inv()
+                        * Rotation.from_quat(target[3:])).magnitude() > self.max_rotation_step_rad):
+                raise ValueError(f'Dual VR {name}: reference step limit exceeded')
+            targets[name] = result['relative_target']
+            context['target'] = target.copy()
+        # Validate BOTH arms first: never transmit a partially valid group.
+        if self.execute:
+            self.robot.send_eepose(targets)
+            self.last_relative_target = targets
+            self.last_reference_result['transmitted'] = True
+        self._dual_time = now
+        if not any(requested.values()) and all(r['state'] == 'holding' for r in results.values()):
+            if self.execute:
+                self._stop_reference()
+            else:
+                self._dual_time = None
+                self.teleoperator.reset_reference()
+            self.last_reference_result['state'] = 'stopped'
+        return action
+
+
 def _read_only_robot(operator_cfg):
     """Whitelist status transport only; never inherit accessories or polling."""
     from ..a10_operator import A10Operator
     allowed = ('host', 'timeout_s', 'udp_port', 'joint_udp_port',
-               'feedback_joint_unit', 'feedback_position_unit')
+               'feedback_joint_unit', 'feedback_position_unit', 'arms', 'cartesian_target_order')
     options = {key: operator_cfg[key] for key in allowed if key in operator_cfg}
     options.update(ws_port=operator_cfg.get('status_ws_port', 5888), allow_motion=False)
     return A10Operator(**options)
@@ -731,7 +933,16 @@ def build_runtime(cfg):
             gripper = GripperOperator(**dict(robot_cfg.pop('gripper')))
             robot_cfg['gripper_transport'] = 'controller'
         robot = build_operator_from_cfg(robot_cfg)
-    return VRTeleopRuntime(vr, robot=robot, execute=not vr_only and not observe_only,
+    if getattr(vr, 'is_dual', False):
+        from ..a10_operator import A10Operator
+        # Validate device topology even for VR-only/preview; do not connect it.
+        topology = robot or A10Operator(**{k: v for k, v in robot_cfg.items() if k != 'type'})
+        if not topology.is_multi_arm or set(topology.arm_names) != set(vr.hand_to_arm.values()):
+            raise ValueError('Dual VR bindings must match the dual operator configuration')
+    elif robot is not None and getattr(robot, 'is_multi_arm', False):
+        raise ValueError('Dual A10 requires a both-hands VR configuration')
+    runtime_class = DualVRTeleopRuntime if getattr(vr, 'is_dual', False) else VRTeleopRuntime
+    return runtime_class(vr, robot=robot, execute=not vr_only and not observe_only,
                           gripper=gripper, **settings)
 
 
@@ -784,6 +995,12 @@ def inspect_controller(operator_cfg, *, samples=10, interval_s=.1):
                              actual_joints_rad=None if state.actual_joints_rad is None else state.actual_joints_rad.tolist(),
                              tcp_pq_raw=None if state.tcp_pq_raw is None else state.tcp_pq_raw.tolist(),
                              tcp_pq_m=None if state.tcp_pq_m is None else state.tcp_pq_m.tolist()))
+            if robot.is_multi_arm:
+                rows[-1]['arms'] = {name: dict(ee_id=arm.ee_id,
+                    received_monotonic_s=arm.received_monotonic_s,
+                    actual_joints_rad=None if arm.actual_joints_rad is None else arm.actual_joints_rad.tolist(),
+                    tcp_pq_m=None if arm.tcp_pq_m is None else arm.tcp_pq_m.tolist())
+                    for name, arm in state.arms.items()}
             if index + 1 < samples:
                 time.sleep(interval_s)
     except Exception as exc:

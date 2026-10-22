@@ -33,6 +33,9 @@ def main(argv=None):
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
+    if cfg.teleop.input.get('arm') == 'both' and (
+            args.calibrate_pose or args.verify_calibration or args.pose_calibration):
+        parser.error('双臂模式本轮仅支持锚点相对控制，未开放双臂标定或标定验证界面')
     if args.pose_calibration:
         cfg.teleop.pose_calibration_path = str(args.pose_calibration.expanduser().resolve())
         if not args.calibrate_pose:

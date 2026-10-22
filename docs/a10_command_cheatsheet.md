@@ -23,6 +23,7 @@ conda activate fluxvla
 | ④ 只检查机器人状态和通信 | `--inspect-controller` | 只读状态 | 否 |
 | **⑤ 用旧锚点相对算法遥操作实机** | **`control_mode=reference` + `pose_mapping=anchor_relative`** | 是 | **是** |
 | ⑥ 查询双臂控制器的基础状态 | `a10_control.py --config … --read-only get` | 只读状态 | 否 |
+| ⑦ 双臂 VR 独立接管/释放 | `a10_dual_arm_vr_teleop.py` | 默认不连接；实机需显式开启 | 默认否 |
 | 重新记录一份标定 | `--calibrate-pose` | 只读状态 | 否；会保存标定文件 |
 | 调试 reference 的计算过程（旧观察入口） | `--observe` | 只读状态 | 否；静止时可能触发追踪误差 |
 
@@ -119,14 +120,43 @@ python scripts/a10_control.py \
 模板中左右编号、反馈位置和单位须按实际双臂配置核对。**0.125 当前运行的是单臂 XML**，
 此时用双臂模板查询会报告反馈组不匹配，这是预期保护，不会自动切换控制器配置。
 想连续查询可将末尾 `get` 换为 `shell`，输入 `get`、`joints`，退出输入 `exit`。
-模板默认禁止运动；双臂启停作用于整个控制组。本轮未接通双臂 VR、录制、标定和模型推理，
-也未开放双臂关节、夹爪和旧控制台单臂目标发送。⑤仍是原单臂 VR 命令。
+模板默认禁止运动；控制台启停作用于整个控制组。双臂 VR 独立接管见⑦，尚未实机验收；
+录制、标定、模型推理、双臂关节和夹爪未开放。⑤仍是原单臂 VR 命令。
+
+## ⑦ 双臂 VR：左手控左臂，右手控右臂
+
+先看双手输入，不连接机器人：
+
+```bash
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
+```
+
+头显打开终端打印的网址；按侧键观察终端与双手日志。仅检查配置可加 `--preview`。
+日志：`work_dirs/a10/vr/dual_teleop_diagnostics.jsonl`，不等于数据集录制。
+
+**以下实机命令仅在团队确认双臂 XML、左右编号与反馈布局后使用，不能用于现有单臂控制器。**
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True
+```
+
+- 左右侧键分别接管对应臂；松开一侧，该臂减速保持，另一臂继续。
+- 减速尚未完成就按回侧键，需要等保持后松开一次，再重新按住。
+- 两手释放并完成停止过渡后，全组退出 follower；故障也请求全组停止。
+- 不录制、不控制夹爪、不加载姿态标定；摇杆事件禁用，用 `Ctrl+C` 结束。
+- 停止效果仍待实机确认。原生 follower 的制动、断流和双臂碰撞行为未在模拟测试中验收。
 
 ## 少量常用参数
 
 | 参数 | 通俗解释 |
 | --- | --- |
-| `--config …` | 选用哪份配置；上面的命令均使用 A10 VR 配置 |
+| `--config …` | 选用单臂或双臂配置；⑤单臂，⑦双臂 |
 | `--cfg-options …` | 仅对这次运行修改配置，不改配置文件 |
 | `teleop.operator.host=192.168.0.125` | 机器人控制器的地址 |
 | `teleop.input.network.host_ip=0.0.0.0` | 允许头显从局域网连接本机；**头显里不填写 `0.0.0.0`** |
@@ -142,6 +172,6 @@ python scripts/a10_control.py \
 
 - 网页、头显和控制器地址是不同的：网页用**本机局域网 IP**，控制器用 `192.168.0.125`。
 - 一次运行一个 VR 命令；原终端保持打开。换命令先按 `Ctrl+C` 退出，避免网页端口被占用。
-- ①～④不下发运动；⑤为实机模式，退出会请求停止跟随，应确认控制器已停止。**`Ctrl+C` 不是机械臂急停**。
+- ①～④不下发运动；⑤及⑦的实机命令会下发运动，退出会请求停止跟随，应确认控制器已停止。**`Ctrl+C` 不是机械臂急停**。
 - 新绝对姿态标定、奇异点及停止过程仍在核实；⑤沿用旧相对映射，不代表这些问题已修复。
 - 详细功能与历史命令见 [A10 VR 使用说明](a10_vr_operator.md)；人工使能、跟随和关节控制另见 [现场操作说明](a10_onsite_guide.md)。

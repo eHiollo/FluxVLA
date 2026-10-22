@@ -6,6 +6,7 @@ Bridge to XLeVR's VRMonitor with a configurable project path.
 from __future__ import annotations
 
 import asyncio
+import copy
 import http.server
 import logging
 import os
@@ -287,7 +288,8 @@ class VRMonitorBridge:
             goal.metadata = metadata
 
             if goal.arm == "left":
-                self.left_goal = goal
+                self.left_goal = self._merge_goal(self.left_goal, goal)
+                goal = self.left_goal
             elif goal.arm == "right":
                 self.right_goal = self._merge_goal(self.right_goal, goal)
                 goal = self.right_goal
@@ -317,12 +319,16 @@ class VRMonitorBridge:
         if not cur_meta.get("reset_target_to_current"):
             merged_meta.pop("reset_target_to_current", None)
 
-        if not cur_meta.get("buttons") and prev_meta.get("buttons"):
+        if "buttons" not in cur_meta and prev_meta.get("buttons"):
             merged_meta["buttons"] = prev_meta["buttons"]
         if "trigger" not in cur_meta and "trigger" in prev_meta:
             merged_meta["trigger"] = prev_meta["trigger"]
         if "grip_active" not in cur_meta and "grip_active" in prev_meta:
             merged_meta["grip_active"] = prev_meta["grip_active"]
+        elif "grip_active" in cur_meta:
+            # An explicit release must override a cached squeeze button too.
+            merged_meta['buttons'] = dict(merged_meta.get('buttons') or {})
+            merged_meta['buttons']['squeeze'] = bool(cur_meta['grip_active'])
         current.metadata = merged_meta
         return current
 
@@ -342,6 +348,11 @@ class VRMonitorBridge:
                 "has_right": self.right_goal is not None,
                 "has_headset": self.headset_goal is not None,
             }
+
+    def get_hand_snapshot(self):
+        """Copy both latest hands under one lock; timestamps remain per hand."""
+        with self._goal_lock:
+            return copy.deepcopy({'left': self.left_goal, 'right': self.right_goal})
 
     def get_status(self) -> dict[str, Any]:
         """Return VR server / client connectivity snapshot."""

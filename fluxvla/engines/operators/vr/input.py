@@ -149,6 +149,9 @@ class VRInput:
         guide = (
             '  只读标定验证：手柄转动只改变网页目标；侧键仅记录平移锚点，不控制机械臂或夹爪'
             if self.calibration_view is not None else
+            '  双臂：左/右侧键分别接管左/右臂；松开仅对应臂减速保持；Ctrl+C 结束\n'
+            '  本模式不启用录制、夹爪或摇杆重置'
+            if self.config.arm == 'both' else
             '  右手 squeeze=粗调，前扳机=精调，右手摇杆 x 控制夹爪\n'
             '  左手摇杆：上=重置参考，下=停止；右/左的录制事件由录制流程处理'
         )
@@ -184,6 +187,16 @@ class VRInput:
             reset_arm = self._vr_event_handler.take_reset_arm()
 
         goal = self._vr_monitor.get_latest_goal_nowait(self.config.arm)
+        return self._goal_action(goal, reset_arm=reset_arm)
+
+    def get_hand_actions(self):
+        """Read a paired snapshot from one server; never refresh a stale pose."""
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        return {hand: self._goal_action(goal) for hand, goal in
+                self._vr_monitor.get_hand_snapshot().items()}
+
+    def _goal_action(self, goal, *, reset_arm=False):
         if goal is None:
             idle = self._idle_action()
             idle["xlevr.reset_arm"] = reset_arm

@@ -115,6 +115,10 @@ class ReferenceConfig:
     max_angular_accel_rad_s2: float = .96
     position_gain: float = 6.
     rotation_gain: float = 4.8
+    release_position_tolerance_m: float = .002
+    release_rotation_tolerance_rad: float = .02
+    release_settle_s: float = .1
+    release_timeout_s: float = 2.
 
     def __post_init__(self):
         for name, value in vars(self).items():
@@ -300,6 +304,8 @@ class VRPoseController:
         self.angular_velocity = np.zeros(3)
         self.input_age_s = math.inf
         self.fault_reason = None
+        self._release_elapsed_s = self._release_settled_s = 0.
+        self._release_previous_actual = None
 
     def _new_anchor(self):
         return (CalibratedAnchorState(self.pose_calibration)
@@ -331,7 +337,8 @@ class VRPoseController:
                     linear_velocity_m_s=self.linear_velocity.tolist(),
                     angular_velocity_rad_s=self.angular_velocity.tolist())
 
-    def step(self, command, actual, dt_s, *, sample_age_s=0., feedback_age_s=0., has_error=False):
+    def step(self, command, actual, dt_s, *, sample_age_s=0., feedback_age_s=0., has_error=False,
+             continuous_reanchor=False):
         if self.startup_anchor is None:
             raise RuntimeError('Call start() with an explicit follower startup pose')
         actual = pose(actual)
@@ -362,10 +369,13 @@ class VRPoseController:
                 packet = self.anchor.update(command, actual)
                 self.input_age_s = sample_age_s
                 if packet == 'anchored':
-                    self.governor.engage(actual)
-                    self.command_pose = actual.copy()
-                    self.linear_velocity.fill(0.)
-                    self.angular_velocity.fill(0.)
+                    self.governor.engage(self.command_pose if continuous_reanchor else actual)
+                    if not continuous_reanchor:
+                        self.command_pose = actual.copy()
+                        self.linear_velocity.fill(0.)
+                        self.angular_velocity.fill(0.)
+                    self._release_elapsed_s = self._release_settled_s = 0.
+                    self._release_previous_actual = None
                 elif packet == 'inactive':
                     self.governor.release(actual)
                     self.linear_velocity.fill(0.)
@@ -415,6 +425,68 @@ class VRPoseController:
             self.governor.force_fault(actual)
             return self._result('fault', stop=True, packet=packet)
         return self._result(state, packet=packet)
+
+    def step_released(self, actual, dt_s, *, feedback_age_s=0., has_error=False):
+        """Bound command deceleration, then hold its endpoint (dual clutch).
+
+        Discards the old user/reference target, not the continuous command pose.
+        This shapes frontend setpoints, not actual motor braking. The other arm
+        can keep tracking; only faults request the shared follower to stop.
+        """
+        if self.startup_anchor is None:
+            raise RuntimeError('Call start() before releasing an arm')
+        actual = pose(actual)
+        if (not math.isfinite(dt_s) or dt_s <= 0 or not math.isfinite(feedback_age_s)
+                or feedback_age_s < 0 or type(has_error) is not bool):
+            raise ValueError('Invalid release timing or fault flag')
+        reason = (self.fault_reason or ('controller_fault' if has_error else
+                  'control_gap' if dt_s > self.config.max_dt_s else
+                  'feedback_stale' if feedback_age_s > self.config.max_feedback_age_s else None))
+        if reason:
+            self.fault_reason = reason
+            return self._result('fault', stop=True)
+        self.anchor.active = False
+        self.anchor.target = None
+        self.governor.reference = None
+        self._release_elapsed_s += dt_s
+        self.linear_velocity -= clamp_vector(self.linear_velocity,
+                                             self.config.max_linear_accel_m_s2 * dt_s)
+        self.angular_velocity -= clamp_vector(self.angular_velocity,
+                                              self.config.max_angular_accel_rad_s2 * dt_s)
+        rotation = Rotation.from_quat(self.command_pose[3:])
+        self.command_pose = np.r_[self.command_pose[:3] + self.linear_velocity * dt_s,
+                                  (rotation * Rotation.from_rotvec(self.angular_velocity * dt_s)).as_quat()]
+        error_m = float(np.linalg.norm(self.command_pose[:3] - actual[:3]))
+        error_rad = float((Rotation.from_quat(actual[3:]).inv()
+                           * Rotation.from_quat(self.command_pose[3:])).magnitude())
+        self.governor.tracking_error_m, self.governor.tracking_error_rad = error_m, error_rad
+        if (error_m > self.config.max_tracking_error_m
+                or error_rad > self.config.max_tracking_error_rad):
+            self.fault_reason = 'release_tracking_error'
+        stopped_command = (np.linalg.norm(self.linear_velocity) < 1e-10
+                           and np.linalg.norm(self.angular_velocity) < 1e-10)
+        quiet = False
+        if self._release_previous_actual is not None:
+            previous = self._release_previous_actual
+            quiet = (np.linalg.norm(actual[:3] - previous[:3]) <= .01 * dt_s
+                     and (Rotation.from_quat(previous[3:]).inv()
+                          * Rotation.from_quat(actual[3:])).magnitude() <= .05 * dt_s)
+        self._release_previous_actual = actual.copy()
+        settled = (stopped_command and quiet
+                   and error_m <= self.config.release_position_tolerance_m
+                   and error_rad <= self.config.release_rotation_tolerance_rad)
+        self._release_settled_s = self._release_settled_s + dt_s if settled else 0.
+        held = self._release_settled_s >= self.config.release_settle_s
+        if not held and self._release_elapsed_s > self.config.release_timeout_s:
+            self.fault_reason = self.fault_reason or 'release_settle_timeout'
+        if self.fault_reason:
+            return self._result('fault', stop=True)
+        if held:
+            self._release_elapsed_s = 0.  # A later disturbance gets its own settle budget.
+        result = self._result('holding' if held else 'releasing')
+        result['relative_target'] = follower_relative(self.startup_anchor, self.command_pose).tolist()
+        result['release_elapsed_s'] = self._release_elapsed_s
+        return result
 
 
 def replay_main(argv=None):

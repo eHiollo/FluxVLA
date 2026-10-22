@@ -131,6 +131,17 @@ teleop.controller_speed_percent=25
 制动距离也在 20 mm 内。原 50 mm / 0.35 rad 异常保护保留。**本次没有改松手停止流程，也没有修复 SDK 停止语义。**
 需要旧 reference 对照时，把两个 `max_reference_lead_*` 都设为 `None`。
 
+**2026-10-22 实机速度对照**（在⑤的 `--cfg-options` 中覆盖；后者尚待实机验证）：
+
+| 参数 | 本轮已测试，用户反馈顺滑 | 下一轮提速候选 |
+| --- | ---: | ---: |
+| `teleop.controller_speed_percent` | 25 | 50 |
+| `teleop.reference_options.max_linear_speed_m_s` | 0.04 | 0.08 |
+| `teleop.reference_options.max_angular_speed_rad_s` | 0.10 | 0.20 |
+
+两组均保持 20 mm / 0.12 rad 超前范围。上一轮退出是 `input_stale`（VR 新姿态停更超过 250 ms），
+提速不会解决输入停更，也不应放宽输入过期保护来掩盖它。
+
 ## ⑥ 双臂基础状态查询：控制器部署双臂后使用
 
 ```bash

@@ -27,6 +27,9 @@ HELP = """可用指令：
   joints --deg q1 q2 q3 q4 q5 q6 发送六轴绝对角度目标（仅 shell）
   stop_follower                 停止本连接启动的跟随（仅 shell）
   pq x y z qx qy qz qw          发送一个 UDP 目标（仅 shell）
+  jog left x 5                  左臂沿本次开始时工具 X 轴移动 5 mm（双臂 shell）
+  jog right rz 1                右臂绕本次开始时工具 Z 轴旋转 1 度
+  jog left x 5 right x 5        两臂各沿自身工具 X 轴移动 5 mm
   g_move --pos=毫米数            发送夹爪目标，范围 0..100 mm
   help                          显示帮助
   exit                          停止本次跟随后关闭连接，不自动掉使能
@@ -37,12 +40,15 @@ pq 的 xyz 单位是米，四元数顺序是 xyzw，须为单位四元数。
 关节跟随与末端跟随不能混发；切换前先 stop_follower。
 UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场核对。
 双臂配置：get/joints 显示各臂；follower_cart/stop_follower 作用于整个控制组。
-本轮双臂不提供控制台目标发送；pq、joints --deg、g_move、follower_aj 会明确拒绝。
+双臂 jog：轴 x/y/z 单位毫米，rx/ry/rz 单位度；单次最多 10 mm / 5 度。
+先确认 ee_id 的物理左右对应，再 manual_en、set_jog_coordinate --tool、follower_cart、jog。
+未选择的臂保持；连续 jog 保留累计量；到位检查失败会请求停止整个控制组。
+双臂 pq、joints --deg、g_move、follower_aj 仍拒绝；jog 与原始 pq 不能混用。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
 断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
 清错仍使用现场控制器界面，本控制台不透传任意控制器命令。
 """
-SESSION_COMMANDS = {'follower_cart', 'follower_aj', 'stop_follower', 'pq', 'reconnect'}
+SESSION_COMMANDS = {'follower_cart', 'follower_aj', 'stop_follower', 'pq', 'reconnect', 'jog'}
 
 
 class CommandError(ValueError):
@@ -72,6 +78,8 @@ def parse_command(tokens):
     joints.add_argument('targets', nargs='*', type=float)
     pose = subs.add_parser('pq', add_help=False, allow_abbrev=False)
     pose.add_argument('pose', nargs=7, type=float)
+    jog = subs.add_parser('jog', add_help=False, allow_abbrev=False)
+    jog.add_argument('moves', nargs='+')
     gripper = subs.add_parser('g_move', add_help=False, allow_abbrev=False)
     gripper.add_argument('--pos', type=float, required=True)
     # pq has only positional numbers. argparse otherwise mistakes -1e-3 for
@@ -80,7 +88,28 @@ def parse_command(tokens):
         tokens = ['pq', '--', *tokens[1:]]
     if tokens[:2] == ['joints', '--deg'] and tokens[2:3] != ['--']:
         tokens = ['joints', '--deg', '--', *tokens[2:]]
+    if tokens and tokens[0] == 'jog' and tokens[1:2] != ['--']:
+        tokens = ['jog', '--', *tokens[1:]]
     args = parser.parse_args(tokens)
+    if args.command == 'jog':
+        if len(args.moves) not in (3, 6):
+            raise CommandError('用法：jog left x 5 或 jog left x 5 right x 5')
+        args.deltas = {}
+        for i in range(0, len(args.moves), 3):
+            name, axis, value = args.moves[i:i+3]
+            if name in args.deltas or axis not in ('x', 'y', 'z', 'rx', 'ry', 'rz'):
+                raise CommandError('每臂只能出现一次，轴为 x/y/z/rx/ry/rz')
+            try:
+                value = float(value)
+            except ValueError as exc:
+                raise CommandError('移动量必须是数字') from exc
+            rotation = axis.startswith('r')
+            if not math.isfinite(value) or abs(value) > (5 if rotation else 10):
+                raise CommandError('单次移动量须有限，且不超过 10 mm / 5 度')
+            delta = [0.] * 6
+            delta[('x', 'y', 'z', 'rx', 'ry', 'rz').index(axis)] = (
+                math.radians(value) if rotation else value / 1000)
+            args.deltas[name] = delta
     if args.command == 'joints' and (args.targets or args.deg):
         if not args.deg or len(args.targets) != 6:
             raise CommandError('发送关节目标请使用 joints --deg 加六个绝对角度；查询只输入 joints。')
@@ -217,6 +246,11 @@ class A10Console:
             self.observe(robot.get_state())
             robot.send_eepose({robot.arm_name: args.pose})
             out('UDP 目标已发送；没有接收确认，尚未确认运动或到位。')
+        elif cmd == 'jog':
+            out('执行小幅移动：' + ' '.join(args.moves) + '；方向取各臂本次开始时的工具坐标系。')
+            state = self.observe(robot.jog_tool(args.deltas))
+            out('本次目标的双臂反馈已连续 3 次落入容差（1 mm / 0.02 rad）；follower 仍运行。')
+            show_state(state, out)
         elif cmd == 'g_move':
             robot.send_gripper({robot.arm_name: args.pos})
             out('夹爪命令已收到成功回复；尚未确认夹爪到位。')
@@ -277,7 +311,9 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     parser.add_argument('--udp-port', type=int)
     parser.add_argument('--joint-udp-port', type=int)
     parser.add_argument('--timeout', type=float, help='命令确认超时秒数；默认 5')
-    parser.add_argument('--read-only', action='store_true', help='只读；禁止设置和控制命令')
+    access = parser.add_mutually_exclusive_group()
+    access.add_argument('--read-only', action='store_true', help='只读；禁止设置和控制命令')
+    access.add_argument('--allow-motion', action='store_true', help='显式开启配置中的控制权限；不自动使能')
     parser.add_argument('command', nargs=argparse.REMAINDER, help='shell 或单次指令；默认 shell')
     args = parser.parse_args(argv)
     if not args.host and args.config is None:
@@ -313,11 +349,13 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
         overrides = dict(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
                          joint_udp_port=args.joint_udp_port, timeout_s=args.timeout)
         settings.update({key: value for key, value in overrides.items() if value is not None})
+        if args.allow_motion:
+            settings['allow_motion'] = True
         if args.read_only:
             settings['allow_motion'] = False
             # Monitor-only, with no accessory opens or extra background socket.
             if args.config is not None and args.ws_port is None:
-                settings['ws_port'] = settings.get('status_ws_port', 5888)
+                settings['ws_port'] = settings.get('status_ws_port', settings.get('ws_port', 5999))
             settings.pop('status_poll_interval_s', None)
             for key in ('cameras', 'gripper', 'gripper_feedback_path'):
                 settings.pop(key, None)

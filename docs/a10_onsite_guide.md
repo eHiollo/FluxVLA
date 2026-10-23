@@ -1,5 +1,98 @@
 # A10 现场接入操作说明
 
+## 双 A10 控制台最小验证（2026-10-23，不需要 VR）
+
+当前目录 `/home/robot/VLA/FluxVLA_vr`，分支 `kaanh_follower_vr`。
+这次增加的是控制台通信和小幅移动，旧单臂命令、单臂配置、VR 运行代码保持原样。
+
+**进度：离线回环测试已通过；实机未验收。** 本轮只读 SSH 复查时，
+`192.168.0.150` 上没有运行 `kaanhbin`，5867/5999/5888/9998/9999 未监听。
+先由控制器维护同事启动正确工程并提供可用 WS 入口；不要重复启动已运行的服务。
+只知道磁盘 XML，不据此认定正在运行的程序版本或真实反馈格式已通过验证。
+
+### 先只读连接
+
+```bash
+cd /home/robot/VLA/FluxVLA_vr
+conda activate fluxvla
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --read-only get --raw
+```
+
+配置按新 XML 使用 WS 5867、笛卡尔 UDP 9998、关节 UDP 9999；只用一个 WS 连接，
+不打开后台状态连接。若 5867 被其他控制界面占用，先与控制器同事确认入口，不能强制抢占。
+若团队提供其他命令端口，可在 `get`/`shell` 前加 `--ws-port 实际端口`。
+
+核对反馈与示教器：配置暂定 `left=ee0/TCP第0行/关节第0组`，
+`right=ee1/TCP第1行/关节第1组`，每组6轴，反馈毫米/度。
+**这只是待现场确认的映射，不能凭名称认定物理左右。** 如果反馈不符，调整该双臂配置中的
+`arms` 字段；`cartesian_target_order` 必须按 XML 控制组的 ee 顺序对应。
+XML 笛卡尔组是 tg=2、ee_ids={0,1}，无需向 JSON 自行添加 tg/id 字段。
+
+### 打开可控制的控制台
+
+确认单位、左右映射、工具轴方向和运动范围后执行：
+
+```bash
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --allow-motion shell
+```
+
+打开只会连接并读取状态。配置默认 `allow_motion=False`，`--allow-motion` 显式允许你输入控制命令，
+不会自动使能。`--read-only` 和 `--allow-motion` 不能同时使用。
+
+出现 `a10>` 后，每次输入一条，确认返回结果后再执行下一条：
+
+```text
+get
+manual_en
+set_jog_coordinate --tool
+follower_cart
+```
+
+随后选择一个小幅运动，**不要将以下全部命令一次粘贴执行**：
+
+| 命令 | 含义 |
+| --- | --- |
+| `jog left x 3` | left 沿本次开始时工具 X 轴移动 3 mm，right 保持 |
+| `jog left x -3` | left 沿本次开始时工具 X 轴反向移动 3 mm |
+| `jog right z 3` | right 沿本次开始时工具 Z 轴移动 3 mm，left 保持 |
+| `jog right rz 2` | right 绕本次开始时工具 Z 轴旋转 2 度，left 保持 |
+| `jog left x 3 right x 3` | 两臂分别沿自身工具 X 轴移动 3 mm |
+| `get` / `joints` | 分别查看两臂状态 / 六轴角度（度） |
+| `stop_follower` | 停止整个控制组，并确认 inactive + Stopped |
+| `manual_ds` | 手动掉使能，不是急停 |
+| `exit` | 请求停止本次 follower 后关闭连接，不自动掉使能 |
+
+`x/y/z` 用毫米，`rx/ry/rz` 用度；每次每臂只能指定一个轴，最大 10 mm / 5 度。
+方向采用各臂本次开始时的**计划工具朝向**，不是机器人基坐标轴、屏幕方向或 VR 方向。
+连续命令沿上一目标继续，不把滞后的反馈重新当作累计指令零点；开始前检查实际反馈接近上一目标。
+
+内部以平滑起止的小步发送，标称30Hz；前端计划速度上限约5 mm/s、0.05 rad/s，
+控制器速度倍率保持现场设置，不自动改成50%。每步先读取反馈，读取较慢会拉长运动时间，不追赶补发。
+这不是高频实时遥操作入口，也不是关节速度或避碰保护。
+
+每个 UDP 包有两行 `[x,y,z,rz,ry,rx]`，线性量米、角度弧度；使用 SDK 工具累计增量语义。
+未选择的臂继续发送保持值；重复发送末值不会重复累计移动。包头沿用40字节ARIS格式。
+
+终端提示“连续3次落入容差”表示两臂 TCP 反馈都在目标的 **1 mm / 0.02 rad** 范围内，
+不代表完全静止，也不是UDP确认；小于容差的命令不能用于证明实际运动。
+运动中超出20 mm / 0.15 rad 跟踪误差、反馈异常、Ctrl+C 或最终5秒内未确认到位，
+会请求停止本次整个控制组。若未确认停止，终端会说明；需现场检查，不能继续盲目发送。
+正常小步完成后 follower 仍运行；不要让会话长期闲置，验证完成后输入 `stop_follower` 和 `exit`。
+
+本轮不提供双臂关节、夹爪、VR控制适配；双臂 `pq`、`joints --deg`、`follower_aj`、`g_move` 继续拒绝。
+`follower_cart` / `stop_follower` 是公共启停；指定单臂 jog 不等于独立启动该臂的 follower。
+
+### 实现与验证记录
+
+- `a10_operator.py`：保留单臂 SDK 接口；双臂独立计算、按配置行序一次发送；先校验全部行，
+  发送成功后统一提交累计状态。发送失败禁止在同次 follower 内重新建零点；必须停止后重新启动。
+- `scripts/a10_control.py`：新增双臂 `jog` 和 `--allow-motion`；只读配置无独立状态端口时沿用其命令端口。
+- 测试覆盖单臂原报文、双臂行序、保持、连续命令、工具坐标方向、旋转、错误数据、发送失败、
+  未到位、故障、Ctrl+C、停止确认与只读权限。使用回环 WS/UDP 和理想工具增量积分接收端，不能替代实机验收。
+- 回归结果：`PYTHONPATH=.:test python -m unittest test_a10_operator test_a10_sdk_adapter test_a10_control`，101项全部通过；`git diff --check` 通过。
+- 未修改远端文件、启动服务或发送机器人运动指令；未修改 VR runtime 或旧单臂配置。
+
+
 **VR 当前入口**：在 `/home/robot/VLA/FluxVLA_vr` 使用
 `python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py`。
 默认 VR-only；详细配置和新布局见 [VR 说明](a10_vr_operator.md)。

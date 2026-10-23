@@ -1,5 +1,33 @@
 # A10 常用命令速查
 
+## 双臂控制台：先不用 VR（2026-10-23）
+
+```bash
+cd /home/robot/VLA/FluxVLA_vr
+conda activate fluxvla
+# 先只读查看新控制器；需要现场控制服务已运行、5867入口可用
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --read-only get --raw
+# 核对左右映射、单位及工具轴后，打开控制台（连接本身不会使能）
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --allow-motion shell
+```
+
+在 `a10>` 中逐条输入：`manual_en` → `set_jog_coordinate --tool` → `follower_cart`。
+之后按需选择一个：
+
+| 指令 | 用途 |
+| --- | --- |
+| `get` / `joints` | 查看双臂状态 / 角度 |
+| `jog left x 3` | left 工具 X 方向移动3毫米，right保持 |
+| `jog right rz 2` | right 工具 Z 轴旋转2度，left保持 |
+| `jog left x 3 right x 3` | 两臂各沿自身工具 X 移动3毫米 |
+| `stop_follower` → `exit` | 确认整个控制组停止后退出 |
+
+`left=ee0`、`right=ee1` 仍须现场确认物理对应；平移方向不是基坐标轴。
+单次限制10毫米/5度。正常到位后可连续输入 jog，不会清零累计量；完成验证后停止 follower。
+**离线已验证，实机待验收；本轮SSH查看时控制服务未运行。** 单臂旧命令继续使用原配置。
+完整步骤、容差和异常处理见 [现场说明：双臂最小验证](a10_onsite_guide.md)。
+
+
 **用旧锚点算法调试实机，选第 ⑤ 条；检查标定方向，选第 ① 条。** 不需要每条都执行。
 
 ## SDK 工具坐标适配试验（2026-10-22）

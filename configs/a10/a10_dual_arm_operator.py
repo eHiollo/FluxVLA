@@ -1,14 +1,15 @@
-"""Single-controller dual Cartesian TEMPLATE; no confirmed physical left/right.
+"""192.168.0.150 dual A10: Cartesian tg 2 / ee_ids {0,1}, joint tg 1.
 
-Based on A10_new/kaanh_lab.xml: tg 1 / ee_ids {0,1}. The controller currently
-runs a SINGLE-arm XML. Do not enable this template until the team deploys and
-confirms the dual model, physical sides, feedback layout and target order.
+XML inspected 2026-10-23. Physical left/right and live GET groups/units still
+require onsite confirmation. 5867 must be made available by the controller team.
+Use one command/status WS connection; no background polling connection.
 No recording, VR calibration, gripper or dual joint trajectory support here.
 """
 
 operator = dict(
-    type='A10Operator', host='192.168.0.125',
-    ws_port=5999, status_ws_port=5888, udp_port=9998, joint_udp_port=9999,
+    type='A10Operator', host='192.168.0.150',
+    ws_port=5867, status_ws_port=5867, udp_port=9998, joint_udp_port=9999,
+    status_poll_interval_s=None, timeout_s=2.,
     allow_motion=False, command_mode='cartesian', cartesian_wire_format='pe321',
     feedback_joint_unit='deg', feedback_position_unit='mm',
     # TEMPLATE mappings, to verify against actual dual-controller GET replies.

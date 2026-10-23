@@ -352,7 +352,7 @@ class ConsoleTest(unittest.TestCase):
 
 
 class DualConsoleTest(unittest.TestCase):
-    def run_config(self, controller, commands, *, read_only=False):
+    def run_config(self, controller, commands, *, read_only=False, extra=()):
         settings = dict(type='A10Operator', host='127.0.0.1',
                         ws_port=controller.server.socket.getsockname()[1],
                         status_ws_port=controller.server.socket.getsockname()[1],
@@ -360,6 +360,7 @@ class DualConsoleTest(unittest.TestCase):
                         joint_udp_port=controller.joint_udp.getsockname()[1],
                         timeout_s=.3, allow_motion=not read_only,
                         feedback_position_unit='mm', arms=DUAL_ARMS,
+                        cartesian_wire_format='pe321',
                         cartesian_target_order=['left','right'])
         output, lines = [], iter(commands)
         def read(_):
@@ -373,9 +374,69 @@ class DualConsoleTest(unittest.TestCase):
             args = ['--config', str(path)]
             if read_only:
                 args.append('--read-only')
+            args.extend(extra)
             result = main([*args, 'shell'], operator_factory=lambda **kw: controller.operator(**kw),
                           input_fn=read, output=output.append)
         return result, '\n'.join(output)
+
+    def test_jog_parser_units_bounds_and_session_only(self):
+        import math
+        args = parse_command(['jog','left','x','-1e-3','right','rz','1'])
+        self.assertEqual(args.deltas['left'], [-.000001,0,0,0,0,0])
+        self.assertEqual(args.deltas['right'][-1], math.radians(1))
+        for moves in (['left','x','nan'], ['left','x','11'], ['left','rx','6'],
+                      ['left','xx','1'], ['left','x','1','left','y','1'], ['left','x']):
+            with self.assertRaises(CommandError): parse_command(['jog',*moves])
+        with patch('socket.socket', side_effect=AssertionError('unexpected network')):
+            self.assertEqual(main(['--host','example','jog','left','x','1'], output=lambda _:None), 2)
+
+    def test_dual_jog_full_console_zero_hold_and_stop(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, ['follower_cart', 'jog left x 0 right x 0',
+                                                'stop_follower', 'exit'])
+            self.assertEqual(result, 0)
+            self.assertNotIn('操作未完成', output)
+            self.assertIn('连续 3 次落入容差', output)
+            packet = c.udp.recv(4096)
+            self.assertEqual(json.loads(packet[40:]), {'type':'321', 'pe':[[0]*6,[0]*6]})
+            self.assertEqual([x for x in c.commands if x!='get'], ['follower_cart','stop_follower'])
+
+    def test_dual_jog_readonly_cannot_start_or_send(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, ['jog left x 1','exit'], read_only=True)
+            self.assertEqual(result, 0)
+            self.assertIn('allow_motion is false', output)
+            self.assertEqual(set(c.commands), {'get'})
+            with self.assertRaises(socket.timeout): c.udp.recv(4096)
+
+    def test_allow_motion_explicitly_overrides_safe_config(self):
+        with FakeController() as c, tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'safe.py'
+            path.write_text("operator = dict(type='A10Operator', host='127.0.0.1', allow_motion=False)")
+            captured = []
+            def factory(**settings):
+                captured.append(settings)
+                return c.operator(**settings)
+            result = main(['--config',str(path),'--allow-motion','manual_en'],
+                          operator_factory=factory, output=lambda _:None)
+            self.assertEqual(result,0)
+            self.assertTrue(captured[0]['allow_motion'])
+
+    def test_readonly_config_without_status_port_uses_its_command_port(self):
+        with FakeController() as c, tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'single_ws.py'
+            port = c.server.socket.getsockname()[1]
+            path.write_text(f"operator = dict(type='A10Operator', host='127.0.0.1', ws_port={port})")
+            captured=[]
+            def factory(**settings):
+                captured.append(settings)
+                return c.operator(**settings)
+            result=main(['--config',str(path),'--read-only','get'],operator_factory=factory,output=lambda _:None)
+            self.assertEqual(result,0)
+            self.assertEqual(captured[0]['ws_port'],port)
+            self.assertEqual(set(c.commands),{'get'})
 
     def test_dual_get_joints_global_lifecycle_and_incomplete_commands(self):
         with FakeController() as c:

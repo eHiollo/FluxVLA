@@ -549,6 +549,7 @@ class A10Operator(BaseOperator):
         self.command_mode = command_mode
         self.cartesian_wire_format = cartesian_wire_format
         self._sdk_tool_adapter = None
+        self._sdk_tool_adapters = None
         self._cartesian_raw_used = False
         self._cartesian_euler = np.zeros(3)
         self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
@@ -584,6 +585,7 @@ class A10Operator(BaseOperator):
 
     def _reset_cartesian_encoding(self):
         self._sdk_tool_adapter = None
+        self._sdk_tool_adapters = None
         self._cartesian_raw_used = False
         self._cartesian_euler = np.zeros(3)
         self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
@@ -779,7 +781,10 @@ class A10Operator(BaseOperator):
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
-            if state.follower_active is active and (not active or state.follower_mode == self._follower_mode):
+            stopped = (active or not self.is_multi_arm or
+                       state.raw['ret_context'].get('robot_msg', {}).get('motion') == 'Stopped')
+            if (state.follower_active is active and stopped
+                    and (not active or state.follower_mode == self._follower_mode)):
                 if active and state.has_error:
                     raise A10ControllerError('Controller reports a fault')
                 if active and state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled':
@@ -793,6 +798,8 @@ class A10Operator(BaseOperator):
                 raise A10ControllerError('Controller reports a fault')
             time.sleep(min(.02, max(0., deadline - time.monotonic())))
         self._confirmed_active = False
+        if not active and self.is_multi_arm:
+            raise TimeoutError('Dual follower stop requires inactive + Stopped feedback')
         raise TimeoutError('Follower mode change was not confirmed')
 
     @staticmethod
@@ -962,6 +969,7 @@ class A10Operator(BaseOperator):
         self._traj_stop_event.set()
         with self._io_lock:
             self._sdk_tool_adapter = None
+            self._sdk_tool_adapters = None
             self._require_motion()
             if not self._started_here:
                 raise RuntimeError('This connection did not start the follower')
@@ -974,14 +982,13 @@ class A10Operator(BaseOperator):
             return state
 
     def begin_sdk_tool_trajectory(self, startup_pose):
-        """Initialize once after a confirmed fresh single-arm Tool follower start."""
+        """Initialize after a fresh Tool start; dual input is a complete pose map."""
         with self._io_lock:
-            self._require_single_arm('SDK tool adapter')
             self._require_target_owner()
             self._require_motion()
             if (not self._started_here or not self._confirmed_active
                     or self._follower_mode != 'Cart' or self._sdk_tool_adapter is not None
-                    or self._cartesian_raw_used):
+                    or self._sdk_tool_adapters is not None or self._cartesian_raw_used):
                 raise RuntimeError('SDK adapter requires a fresh confirmed Cartesian follower')
             if self.cartesian_wire_format != 'pe321':
                 raise ValueError('SDK adapter requires cartesian_wire_format=pe321')
@@ -989,7 +996,14 @@ class A10Operator(BaseOperator):
             if state.has_error or state.follower_active is not True or state.raw[
                     'ret_context']['motion_msg'].get('jog_coordinate') != 'Tool':
                 raise RuntimeError('SDK adapter requires healthy active Tool feedback')
-            self._sdk_tool_adapter = SDKToolCumulativeAdapter(startup_pose)
+            if self.is_multi_arm:
+                if not isinstance(startup_pose, Mapping) or set(startup_pose) != set(self.arm_names):
+                    raise ValueError('SDK adapter requires the complete arm group')
+                self._sdk_tool_adapters = {
+                    name: SDKToolCumulativeAdapter(startup_pose[name])
+                    for name in self.cartesian_target_order}
+            else:
+                self._sdk_tool_adapter = SDKToolCumulativeAdapter(startup_pose)
 
     def send_sdk_tool_pose(self, target, *, max_position_step_m, max_rotation_step_rad):
         """Send a base-frame planned pose as cumulative local 321 components.
@@ -997,6 +1011,8 @@ class A10Operator(BaseOperator):
         No actual-error integral or application ACK is implied by this method.
         """
         with self._io_lock:
+            if self.is_multi_arm:
+                return self._send_sdk_tool_poses(target, max_position_step_m, max_rotation_step_rad)
             adapter = self._sdk_tool_adapter
             if adapter is None:
                 raise RuntimeError('SDK tool adapter is not initialized')
@@ -1017,6 +1033,136 @@ class A10Operator(BaseOperator):
                         planned_pose_m=target.tolist(), local_send_success=True,
                         execution_confirmed=False)
 
+    def _send_sdk_tool_poses(self, targets, position_limit, rotation_limit):
+        adapters = self._sdk_tool_adapters
+        if adapters is None:
+            raise RuntimeError('SDK tool adapters are not initialized')
+        if not isinstance(targets, Mapping) or set(targets) != set(self.arm_names):
+            raise ValueError('SDK adapter requires the complete arm group')
+        candidates = {name: adapters[name].propose(
+            targets[name], max_position_step_m=position_limit,
+            max_rotation_step_rad=rotation_limit) for name in self.cartesian_target_order}
+        payload = json.dumps(dict(type='321', pe=[candidate[1].tolist()
+                             for candidate in candidates.values()]),
+                             separators=(',', ':'), allow_nan=False).encode('utf-8')
+        try:
+            self._send_follower_target(_pack(payload, command=False), 'Cart')
+        except BaseException:
+            self._sdk_tool_adapters = None
+            self._confirmed_active = False
+            self._cartesian_raw_used = True  # Block reinitialization until stop/start.
+            raise
+        for name, (pose, cumulative) in candidates.items():
+            adapters[name].commit(pose, cumulative)
+        return dict(arms={name: dict(planned_pose_m=pose.tolist(),
+                                    cumulative_pe321=cumulative.tolist())
+                          for name, (pose, cumulative) in candidates.items()},
+                    local_send_success=True, execution_confirmed=False)
+
+    def jog_tool(self, arm_deltas):
+        """Bounded dual-arm console move in each arm's command-start tool axes.
+
+        Deltas are [dx,dy,dz,rx,ry,rz] (metres / rotation-vector radians).
+        Requires an explicitly started follower. Unselected arms hold their
+        previous planned pose. No automatic enable, restart, or error integral.
+        GET and UDP are serialized for this low-speed diagnostic operation.
+        """
+        if not self.is_multi_arm:
+            raise ValueError('jog_tool requires a dual-arm configuration')
+        if (not isinstance(arm_deltas, Mapping) or not arm_deltas
+                or not set(arm_deltas).issubset(self.arm_names)):
+            raise ValueError(f'Expected selected arms from {self.arm_names}')
+        deltas = {name: _vector(delta, 6, 'tool delta') for name, delta in arm_deltas.items()}
+        if any(np.linalg.norm(d[:3]) > .01 or np.linalg.norm(d[3:]) > math.radians(5)
+               for d in deltas.values()):
+            raise ValueError('Each jog is limited to 10 mm translation / 5 degrees rotation')
+        self._require_motion()
+        if not self._started_here or not self._start_confirmed or self._follower_mode != 'Cart':
+            raise RuntimeError('Start this console\'s Cartesian follower before jogging')
+        if not self._trajectory_lock.acquire(blocking=False):
+            raise RuntimeError('A trajectory already owns the target stream')
+        self._trajectory_owner = threading.get_ident()
+        self._traj_stop_event.clear()
+        try:
+            state, actual = self._jog_feedback()
+            if self._sdk_tool_adapters is None:
+                self.begin_sdk_tool_trajectory(actual)
+            starts = {name: adapter.previous_pose.copy()
+                      for name, adapter in self._sdk_tool_adapters.items()}
+            # Never rebase the cumulative stream to delayed feedback between commands.
+            if not self._jog_pose_matches(actual, starts, .002, .03):
+                raise RuntimeError('Previous jog has not reached its target; refusing a new jog')
+            goals = {name: pose.copy() for name, pose in starts.items()}
+            duration = 1.
+            for name, delta in deltas.items():
+                rotation = Rotation.from_quat(starts[name][3:])
+                goals[name][:3] += rotation.apply(delta[:3])
+                goals[name][3:] = (rotation * Rotation.from_rotvec(delta[3:])).as_quat()
+                duration = max(duration, 2 * np.linalg.norm(delta[:3]) / .005,
+                               2 * np.linalg.norm(delta[3:]) / .05)
+            count = math.ceil(duration * 30)
+            previous = starts
+            for index in range(count + 1):
+                tick = time.monotonic()
+                _, actual = self._jog_feedback()
+                if not self._jog_pose_matches(actual, previous, .02, .15):
+                    raise RuntimeError('Jog tracking error exceeds 20 mm / 0.15 rad')
+                u = index / count
+                blend = u**3 * (10 - 15*u + 6*u*u)
+                targets = {name: pose.copy() for name, pose in starts.items()}
+                for name, delta in deltas.items():
+                    targets[name][:3] += blend * (goals[name][:3] - starts[name][:3])
+                    targets[name][3:] = (Rotation.from_quat(starts[name][3:]) *
+                                        Rotation.from_rotvec(blend * delta[3:])).as_quat()
+                self.send_sdk_tool_pose(targets, max_position_step_m=.001,
+                                        max_rotation_step_rad=.01)
+                previous = targets
+                # Slow feedback stretches the move; never send a catch-up burst.
+                time.sleep(max(0., 1/30 - (time.monotonic() - tick)))
+            deadline, settled = time.monotonic() + 5., 0
+            while time.monotonic() < deadline:
+                state, actual = self._jog_feedback()
+                if not self._jog_pose_matches(actual, goals, .02, .15):
+                    raise RuntimeError('Jog tracking error exceeds 20 mm / 0.15 rad')
+                settled = settled + 1 if self._jog_pose_matches(actual, goals, .001, .02) else 0
+                # Repeat the final cumulative value, never accumulate the jog twice.
+                self.send_sdk_tool_pose(goals, max_position_step_m=.001,
+                                        max_rotation_step_rad=.01)
+                if settled >= 3:
+                    return state
+                time.sleep(.05)
+            raise TimeoutError('Jog arrival not confirmed within 5 s (1 mm / 0.02 rad)')
+        except BaseException:
+            if self.follower_stop_pending:
+                try:
+                    self.stop_follower()
+                except BaseException as stop_error:
+                    warnings.warn(f'Jog stop unconfirmed: {stop_error}; check the controller', RuntimeWarning)
+            raise
+        finally:
+            self._trajectory_owner = None
+            self._trajectory_lock.release()
+
+    def _jog_feedback(self):
+        self._require_target_owner()
+        state = self.get_state()
+        context = state.raw['ret_context']
+        if (state.has_error or not self._confirmed_active or state.follower_mode != 'Cart'
+                or context['motion_msg'].get('jog_coordinate') != 'Tool'
+                or context.get('robot_msg', {}).get('activate') != 'Enabled'):
+            raise RuntimeError('Jog requires healthy, Enabled, active Tool follower feedback')
+        poses = {name: _pose(arm.tcp_pq_m) for name, arm in state.arms.items()}
+        if set(poses) != set(self.arm_names):
+            raise A10ProtocolError('Jog requires actual poses for the complete arm group')
+        return state, poses
+
+    @staticmethod
+    def _jog_pose_matches(actual, targets, position_tolerance, rotation_tolerance):
+        return all(np.linalg.norm(actual[name][:3] - target[:3]) <= position_tolerance
+                   and (Rotation.from_quat(actual[name][3:]).inv() *
+                        Rotation.from_quat(target[3:])).magnitude() <= rotation_tolerance
+                   for name, target in targets.items())
+
     def send_eepose(self, arm_targets):
         """Accept metres/xyzw; optionally encode signed, continuous Euler 321.
 
@@ -1027,7 +1173,7 @@ class A10Operator(BaseOperator):
             raise ValueError(f'Expected the complete arm group: {self.cartesian_target_order}')
         poses = {name: _pose(arm_targets[name]) for name in self.cartesian_target_order}
         with self._io_lock:
-            if self._sdk_tool_adapter is not None:
+            if self._sdk_tool_adapter is not None or self._sdk_tool_adapters is not None:
                 raise RuntimeError("Cannot mix legacy packets with SDK tool adapter")
             eulers = {}
             data = {'type': 'pq', 'pq': [value.tolist() for value in poses.values()]}

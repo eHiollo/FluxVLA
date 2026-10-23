@@ -1,6 +1,7 @@
 """A10 reference protocol tests. All endpoints are loopback or in-memory."""
 
 import json
+import math
 import socket
 import threading
 import time
@@ -849,6 +850,135 @@ def dual_motion():
     return dict(actual_pos=[[0, 10, 20, 30, 40, 50], [60, 70, 80, 90, 100, 110]],
                 motor_pos=[[1, 11, 21, 31, 41, 51], [61, 71, 81, 91, 101, 111]],
                 pq=[[100, 200, 300, 0, 0, 0, 1], [400, 500, 600, 0, 0, 0, 1]])
+
+
+class DualSDKConsoleTest(unittest.TestCase):
+    def robot(self, controller, **extra):
+        controller.motion_override = dual_motion()
+        return controller.operator(arms=DUAL_ARMS, cartesian_target_order=['left', 'right'],
+                                   cartesian_wire_format='pe321', feedback_position_unit='mm', **extra)
+
+    def start(self, controller):
+        robot = self.robot(controller)
+        robot.start_follower()
+        poses = {name: arm.tcp_pq_m.copy() for name, arm in robot.get_state().arms.items()}
+        robot.begin_sdk_tool_trajectory(poses)
+        return robot, poses
+
+    def test_rows_order_hold_continuity_and_fresh_restart(self):
+        with FakeController() as c:
+            robot, poses = self.start(c)
+            limits = dict(max_position_step_m=.001, max_rotation_step_rad=.01)
+            robot.send_sdk_tool_pose(dict(reversed(list(poses.items()))), **limits)
+            np.testing.assert_allclose(json.loads(c.udp.recv(4096)[40:])['pe'], np.zeros((2, 6)))
+            poses['left'][0] += .0005
+            robot.send_sdk_tool_pose(poses, **limits)
+            first = json.loads(c.udp.recv(4096)[40:])['pe']
+            np.testing.assert_allclose(first, [[.0005,0,0,0,0,0], [0]*6])
+            poses['right'][2] -= .0005
+            robot.send_sdk_tool_pose(poses, **limits)
+            np.testing.assert_allclose(json.loads(c.udp.recv(4096)[40:])['pe'],
+                                       [[.0005,0,0,0,0,0], [0,0,-.0005,0,0,0]])
+            with self.assertRaises(RuntimeError):
+                robot.send_eepose(poses)
+            robot.stop_follower(); robot.start_follower()
+            robot.begin_sdk_tool_trajectory(poses)
+            robot.send_sdk_tool_pose(poses, **limits)
+            np.testing.assert_allclose(json.loads(c.udp.recv(4096)[40:])['pe'], np.zeros((2, 6)))
+            robot.stop_follower()
+
+    def test_invalid_second_row_and_send_failure_are_transactional(self):
+        with FakeController() as c:
+            robot, poses = self.start(c)
+            adapters = robot._sdk_tool_adapters
+            poses['left'][0] += .0005
+            poses['right'][0] += 1
+            limits = dict(max_position_step_m=.001, max_rotation_step_rad=.01)
+            with self.assertRaises(ValueError): robot.send_sdk_tool_pose(poses, **limits)
+            with self.assertRaises(ValueError): robot.send_sdk_tool_pose({'left': poses['left']}, **limits)
+            for adapter in adapters.values(): np.testing.assert_array_equal(adapter.cumulative_pe, np.zeros(6))
+            with self.assertRaises(socket.timeout): c.udp.recv(4096)
+            poses['right'] = adapters['right'].previous_pose.copy()
+            with patch.object(robot, '_send_follower_target', side_effect=OSError('send lost')):
+                with self.assertRaises(OSError): robot.send_sdk_tool_pose(poses, **limits)
+            self.assertIsNone(robot._sdk_tool_adapters)
+            for adapter in adapters.values(): np.testing.assert_array_equal(adapter.cumulative_pe, np.zeros(6))
+            with self.assertRaises(RuntimeError): robot.send_sdk_tool_pose(poses, **limits)
+            robot.get_state()
+            with self.assertRaises(RuntimeError): robot.begin_sdk_tool_trajectory(poses)
+            robot.stop_follower()
+
+    def test_dual_stop_requires_inactive_and_stopped_feedback(self):
+        with FakeController() as c:
+            robot = self.robot(c, timeout_s=.05)
+            robot.start_follower()
+            c.motion = 'Moving'
+            with self.assertRaises(TimeoutError): robot.stop_follower()
+            self.assertTrue(robot.follower_stop_pending)
+            c.motion = 'Stopped'
+            robot.stop_follower()
+            self.assertFalse(robot.follower_stop_pending)
+
+    def test_bounded_jog_uses_tool_axes_holds_other_arm_and_accumulates(self):
+        with FakeController() as c:
+            robot = self.robot(c)
+            c.motion_override['pq'][0][3:] = Rotation.from_euler('z', 90, degrees=True).as_quat().tolist()
+            robot.start_follower()
+            packets, previous = [], np.zeros((2, 6))
+            send = robot._send_follower_target
+            def execute(packet, mode):
+                nonlocal previous
+                send(packet, mode)
+                wire = c.udp.recv(4096)
+                self.assertEqual(wire[:40], struct.pack('<IIQqqq', len(wire)-40, 0,0,0,0,0))
+                rows = np.array(json.loads(wire[40:])['pe'])
+                packets.append(rows)
+                # Independent ideal Tool follower: integrate packet differences.
+                for i, delta in enumerate(rows - previous):
+                    pose = c.motion_override['pq'][i]
+                    rotation = Rotation.from_quat(pose[3:])
+                    xyz = np.array(pose[:3]) + rotation.apply(delta[:3]) * 1000
+                    quat = (rotation * Rotation.from_euler('ZYX', delta[3:])).as_quat()
+                    c.motion_override['pq'][i] = np.r_[xyz, quat].tolist()
+                previous = rows
+            with patch.object(robot, '_send_follower_target', side_effect=execute):
+                state = robot.jog_tool({'left': [.003,0,0,0,0,0]})
+                np.testing.assert_allclose(state.arms['left'].tcp_pq_m[:3], [.1,.203,.3], atol=1e-8)
+                np.testing.assert_allclose(state.arms['right'].tcp_pq_m[:3], [.4,.5,.6])
+                robot.jog_tool({'left': [-.003,0,0,0,0,0], 'right': [0,0,.002,0,0,0]})
+                np.testing.assert_allclose(packets[-1], [[0]*6,[0,0,.002,0,0,0]], atol=1e-10)
+                robot.jog_tool({'right': [0,0,0,0,0,math.radians(1)]})
+                np.testing.assert_allclose(packets[-1][1], [0,0,.002,math.radians(1),0,0], atol=1e-10)
+            self.assertTrue(c.active)
+            robot.stop_follower()
+
+    def test_jog_limits_readonly_and_unstarted_have_no_targets(self):
+        with FakeController() as c:
+            robot = self.robot(c)
+            for delta in ({'left':[.011,0,0,0,0,0]}, {'missing':[0]*6}, {'left':[float('nan')]*6}):
+                with self.assertRaises(ValueError): robot.jog_tool(delta)
+            with self.assertRaises(RuntimeError): robot.jog_tool({'left':[.001,0,0,0,0,0]})
+            robot.allow_motion = False
+            with self.assertRaises(PermissionError): robot.jog_tool({'left':[.001,0,0,0,0,0]})
+            self.assertTrue(all(x == 'get' for x in c.commands))
+            with self.assertRaises(socket.timeout): c.udp.recv(4096)
+
+    def test_jog_fault_interrupt_and_no_arrival_request_stop(self):
+        for fault in ('fault', 'interrupt', 'no_arrival'):
+            with self.subTest(fault=fault), FakeController() as c:
+                robot = self.robot(c); robot.start_follower()
+                send = robot._send_follower_target
+                def execute(packet, mode):
+                    send(packet, mode)
+                    c.udp.recv(4096)
+                    if fault == 'fault': c.driver_fault = True
+                    if fault == 'interrupt': raise KeyboardInterrupt
+                expected = KeyboardInterrupt if fault == 'interrupt' else (TimeoutError if fault == 'no_arrival' else RuntimeError)
+                with patch.object(robot, '_send_follower_target', side_effect=execute):
+                    with self.assertRaises(expected): robot.jog_tool({'left':[.003,0,0,0,0,0]})
+                self.assertIn('stop_follower', c.commands)
+                self.assertFalse(c.active)
+                self.assertIsNone(robot._sdk_tool_adapters)
 
 
 class DualArmTest(unittest.TestCase):

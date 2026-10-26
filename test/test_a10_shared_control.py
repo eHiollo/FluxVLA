@@ -7,7 +7,7 @@ import unittest
 from fluxvla.engines.operators.a10_operator import A10Operator, _FollowerConnection
 from fluxvla.engines.communication.a10_shared_connection import SharedFollowerConnection
 from fluxvla.engines.communication.a10_shared_server import SharedControl, SharedControlServer, ConsoleSharedControl
-from test_a10_operator import FakeController
+from test_a10_operator import FakeController, status_reply
 
 
 class SharedControlTest(unittest.TestCase):
@@ -42,6 +42,43 @@ class SharedControlTest(unittest.TestCase):
         self.clients.append(client)
         client.connect()
         return client
+
+    def speed_controller(self):
+        values = dict(percent=40)
+        def get():
+            reply = status_reply(active=self.controller.active, mode=self.controller.mode)
+            reply['ret_context']['motion_msg']['jog_vel'] = values['percent']
+            return reply
+        self.controller.command_replies['get'] = get
+        for percent in (25, 40):
+            def set_value(percent=percent):
+                values['percent'] = percent
+                return dict(ret_code=0, ret_context={}, ret_msg='')
+            self.controller.command_replies[f'set_jog_vel --vel_percent={percent}'] = set_value
+        return values
+
+    def test_shared_speed_change_and_restore_after_owned_stop(self):
+        self.speed_controller()
+        client = self.client('inference')
+        self.assertEqual(client.get_speed_override()['percent'], 40)
+        self.assertEqual(client.set_speed_override(25, expected_mode='Manual')['percent'], 25)
+        client.start_follower()
+        with self.assertRaises(PermissionError):
+            client.set_speed_override(40, expected_mode='Manual')
+        client.stop_follower()
+        self.assertEqual(client.set_speed_override(40, expected_mode='Manual', expected_percent=25)['percent'], 40)
+        with self.assertRaises(PermissionError):
+            client._connection.request('set_jog_vel --vel_percent=25')
+
+    def test_shared_speed_restore_rejected_after_console_takeover(self):
+        self.speed_controller()
+        client, console = self.client('inference'), self.client('console')
+        client.set_speed_override(25, expected_mode='Manual')
+        client.start_follower()
+        console.start_follower()
+        console.stop_follower()
+        with self.assertRaises(PermissionError):
+            client.set_speed_override(40, expected_mode='Manual')
 
     def test_console_queries_while_inference_streams(self):
         console = self.client('console')

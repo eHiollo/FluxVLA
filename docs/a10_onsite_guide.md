@@ -18,6 +18,25 @@ python scripts/inference.py --config configs/a10/a10_remote_inference.py
 连接方式在启动或显式重连时选择；运行中不会切换连接或自动重发运动命令。
 若先启动推理并已直连，之后再打开控制台无法接管现有直连；需结束推理，先开控制台，再启动推理。
 
+### 可选：推理期间使用指定控制器速度倍率
+
+默认 `inference.controller_speed_percent=None`，保留现场倍率。需要指定本次运行倍率时：
+
+```bash
+python scripts/inference.py --config configs/a10/a10_remote_inference.py \
+  --cfg-options inference.controller_speed_percent=25
+```
+
+也可以直接修改配置文件中的 `controller_speed_percent`，取值为1～100的整数。
+这是控制器速度百分比，不是关节目标发送频率；30Hz发送节奏和每轮15个动作保持原配置。
+Manual模式发送 `set_jog_vel --vel_percent=25`，Auto模式发送 `set_pgm_vel --vel_percent=25`，不会自动切换模式。
+程序在首次启动follower前设置并回读确认，退出且确认停止后恢复原倍率。
+dry-run不修改倍率。断线、停止未确认、控制台接管、模式或倍率发生变化时，不覆盖现场设置；结果记录在
+`events.jsonl` 的 `controller_speed_override` 事件和终端日志中。
+
+直连与共享连接均支持。已有共享服务进程需要退出并重新启动控制台一次，以加载新增的倍率RPC；
+模型推理服务无需重启。
+
 ### 可选：控制台与推理共用连接
 
 机器人5999和5888端口按单连接方式共享；5867留给示教器。仅在需要控制台与推理同时使用时启用共享连接，

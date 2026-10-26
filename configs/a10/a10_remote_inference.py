@@ -12,8 +12,9 @@ For motion, configure both dry_run=False and operator.allow_motion=True,
 and set max_joint_step_rad to the verified site limit. 'p' + Enter ends the
 run after the current chunk. Ctrl+C unwinds through follower stop and close.
 This runner does not perform homing or claim physical arrival after a chunk.
-RTC guidance defaults on: condition each new prediction on the previous
-chunk's unexecuted targets, rebased to the new observation in model space.
+RTC guidance defaults off for follower debugging. When enabled, condition
+each new prediction on the previous chunk's unexecuted targets, rebased
+to the new observation in model space.
 This is synchronous chunk stitching, not asynchronous latency compensation.
 Restart the model server with --acceleration off after updating the code.
 """
@@ -30,7 +31,7 @@ inference = dict(
                   status_poll_interval_s=0.05, status_max_age_s=0.5,
                   gripper_transport='usb',
                   gripper=dict(port='/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0',
-                               max_width_mm=85., timeout=0.015),
+                               max_width_mm=85., timeout=0.1),
                   cameras=dict(
                       base_0_rgb=dict(device='/dev/v4l/by-id/usb-SYD_USB_Camera_200901010001-video-index0',
                                       width=640, height=480, fps=30),
@@ -39,10 +40,11 @@ inference = dict(
     instruction='Grasp the bottle, place it into the box beside it, close the lid, and return the robot arm to its initial position.',
     action_chunk=30,
     execute_horizon=15,
-    rtc_config=dict(enabled=True, method='guidance', prefix_len=9,  # Model steps, not UDP packets.
+    controller_speed_percent=None,  # Optional 1..100; restore after confirmed stop.
+    rtc_config=dict(enabled=False, method='guidance', prefix_len=9,  # Model steps, not UDP packets.
                     decay_end=15, schedule='exp', max_guidance_weight=5., use_vjp=False),
     action_dt=1.0 / 30.0,  # Recorded/trained targets are 30 Hz.
-    joint_target_repeat=2,  # 60 Hz UDP: send every joint target twice, 1/60 s apart.
+    joint_target_repeat=1,  # Send each original model target once (30 Hz).
     max_publish_step=3000,
     dry_run=False,
     max_joint_step_rad=0.2,  # Set a verified limit before dry_run=False.

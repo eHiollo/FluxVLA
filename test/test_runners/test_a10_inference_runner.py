@@ -19,6 +19,8 @@ class FakeOperator:
         self.events = []
         self.batches = []
         self.failure = None
+        self.is_connected = True
+        self.speed = dict(mode='Manual', percent=40)
         self.frame = dict(
             qpos=np.array([.2] * 6 + [40], dtype=np.float32),
             base_0_rgb=np.zeros((8, 8, 3), dtype=np.uint8),
@@ -47,6 +49,19 @@ class FakeOperator:
         self.events.append('stop')
         if self.failure == 'stop':
             raise ConnectionError('stop failed')
+        return SimpleNamespace(follower_active=False)
+
+    def get_speed_override(self):
+        return dict(self.speed)
+
+    def set_speed_override(self, percent, *, expected_mode, expected_percent=None):
+        self.events.append(('speed', percent))
+        if expected_mode != self.speed['mode'] or expected_percent != self.speed['percent']:
+            raise RuntimeError('site speed changed')
+        self.speed['percent'] = percent
+        if self.failure == 'speed':
+            raise TimeoutError('speed write applied but reply lost')
+        return dict(self.speed)
 
     def close(self):
         self.events.append('close')
@@ -69,6 +84,47 @@ class A10RunnerTest(unittest.TestCase):
         outputs = torch.tensor([[[.21] * 6 + [42]] * 4])
         runner._predict_action = lambda inputs: outputs
         return runner, operator
+
+    def test_speed_applied_once_before_start_and_restored_after_stop(self):
+        runner, operator = self.make_runner(dry_run=False, controller_speed_percent=25)
+        runner.run()
+        self.assertEqual(operator.speed['percent'], 40)
+        self.assertEqual(operator.events.count(('speed', 25)), 1)
+        self.assertLess(operator.events.index(('speed', 25)), operator.events.index('start'))
+        self.assertLess(operator.events.index('stop'), operator.events.index(('speed', 40)))
+        self.assertEqual(runner.speed_status['state'], 'restored')
+
+    def test_speed_dry_run_never_reads_or_writes_controller_speed(self):
+        runner, operator = self.make_runner(controller_speed_percent=25)
+        operator.get_speed_override = lambda: self.fail('dry run read speed')
+        runner.run()
+        self.assertFalse(any(isinstance(x, tuple) for x in operator.events))
+
+    def test_speed_preserves_site_changes_and_unconfirmed_stop(self):
+        for failure in ('stop', 'mode', 'percent', 'disconnect'):
+            with self.subTest(failure=failure):
+                runner, operator = self.make_runner(dry_run=False, controller_speed_percent=25)
+                runner._apply_speed_override()
+                if failure == 'mode': operator.speed['mode'] = 'Auto'
+                if failure == 'percent': operator.speed['percent'] = 30
+                if failure == 'disconnect': operator.is_connected = False
+                runner._restore_speed_override(failure != 'stop')
+                self.assertEqual(runner.speed_status['state'], 'restore_unconfirmed')
+                self.assertNotIn(('speed', 40), operator.events)
+                runner.cleanup()
+
+    def test_speed_write_timeout_does_not_start_follower(self):
+        runner, operator = self.make_runner(dry_run=False, controller_speed_percent=25)
+        operator.failure = 'speed'
+        with self.assertRaises(TimeoutError): runner.run()
+        self.assertNotIn('start', operator.events)
+        self.assertNotIn('stop', operator.events)
+        self.assertIn(('speed', 40), operator.events)
+
+    def test_invalid_controller_speed(self):
+        for value in (True, 0, 101, 25.5, '25'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.make_runner(controller_speed_percent=value)
 
     def test_registered_and_dry_run_has_no_motion(self):
         self.assertIs(RUNNERS.get('A10InferenceRunner'), A10InferenceRunner)

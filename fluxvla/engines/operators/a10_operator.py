@@ -205,6 +205,52 @@ def _parse_state(reply, *, joint_unit, position_unit, gripper_feedback_path):
                     mode, bool(has_error), time.monotonic(), reply)
 
 
+def _speed_override(state):
+    context = state.raw['ret_context']
+    mode = context.get('robot_msg', {}).get('op_mode')
+    if mode == 'Manual':
+        percent = context.get('motion_msg', {}).get('jog_vel')
+    elif mode == 'Auto':
+        percent = context.get('program_msg', {}).get('vel')
+    else:
+        raise A10ProtocolError(f'Unsupported speed override mode: {mode!r}')
+    if type(percent) not in (int, float) or not math.isfinite(percent) or not 0 <= percent <= 100:
+        raise A10ProtocolError('Controller speed percentage is missing or invalid')
+    return dict(mode=mode, percent=percent)
+
+
+def _validate_speed_override(percent, expected_mode):
+    if type(percent) not in (int, float) or not math.isfinite(percent) or not 0 <= percent <= 100:
+        raise ValueError('Speed percentage must be finite within 0..100')
+    if expected_mode not in ('Manual', 'Auto'):
+        raise ValueError('expected_mode must be Manual or Auto')
+
+
+def _set_controller_speed(connection, get_state, percent, expected_mode, timeout_s, expected_percent=None):
+    """Caller holds the direct/shared control lock for the whole transaction."""
+    _validate_speed_override(percent, expected_mode)
+    def check(state):
+        info = state.raw['ret_context'].get('robot_msg', {})
+        if (state.has_error or state.follower_active is not False
+                or info.get('motion') != 'Stopped' or info.get('op_mode') != expected_mode):
+            raise RuntimeError('Speed change requires healthy Stopped feedback, inactive follower and unchanged mode')
+    initial = get_state(timeout_s=timeout_s)
+    check(initial)
+    if expected_percent is not None and _speed_override(initial)['percent'] != expected_percent:
+        raise RuntimeError('Controller speed changed; preserving site settings')
+    command = 'set_jog_vel' if expected_mode == 'Manual' else 'set_pgm_vel'
+    connection.request(f'{command} --vel_percent={percent:g}')
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        state = get_state(timeout_s=max(.001, deadline - time.monotonic()))
+        check(state)
+        result = _speed_override(state)
+        if result['percent'] == percent:
+            return result
+        time.sleep(min(.02, max(0., deadline - time.monotonic())))
+    raise TimeoutError('Controller speed percentage readback did not match')
+
+
 class _FollowerConnection:
     """Serialized WS transactions plus a separate UDP socket; no robot logic."""
 
@@ -724,6 +770,22 @@ class A10Operator(BaseOperator):
                     return state
                 time.sleep(min(.02, max(0., deadline - time.monotonic())))
             raise TimeoutError(f'{expected} feedback was not confirmed')
+
+    def get_speed_override(self):
+        """Read the current Manual/Auto controller speed percentage."""
+        return _speed_override(self.get_state())
+
+    def set_speed_override(self, percent, *, expected_mode, expected_percent=None):
+        """Set and confirm controller speed only while stopped; never change mode."""
+        _validate_speed_override(percent, expected_mode)
+        with self._io_lock:
+            self._require_motion()
+            from ..communication.a10_shared_connection import SharedFollowerConnection
+            if isinstance(self._connection, SharedFollowerConnection):
+                return self._connection.call('speed_override', percent=percent,
+                                             expected_mode=expected_mode, expected_percent=expected_percent)
+            return _set_controller_speed(self._connection, self.get_state, percent,
+                                         expected_mode, self.timeout_s, expected_percent)
 
     def set_tool_coordinate(self):
         """Explicitly select Tool jog coordinates and verify feedback; no target sent."""

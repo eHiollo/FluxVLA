@@ -8,7 +8,7 @@ import socketserver
 import threading
 import time
 
-from ..operators.a10_operator import _FollowerConnection, _parse_state
+from ..operators.a10_operator import _FollowerConnection, _parse_state, _set_controller_speed
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class SharedControl:
         self.owner = None
         self.revoked = set()
         self.stopped = set()
+        self._speed_restore_allowed = set()
         self.recorder = None
 
     def connect(self):
@@ -74,6 +75,10 @@ class SharedControl:
             self.mode_command('stop_follower', False)
         self.owner = None
         self.stopped.add(owner)
+        if reason == 'explicit_stop':
+            self._speed_restore_allowed.add(owner)
+        else:
+            self._speed_restore_allowed.discard(owner)
         self.note('owner_stopped', session_id=owner, reason=reason, confirmed=True)
 
     def claim(self, session_id, role):
@@ -91,6 +96,7 @@ class SharedControl:
                 raise PermissionError('An unmanaged follower is active; the shared service will not take it over')
         self.revoked.discard(session_id)
         self.stopped.discard(session_id)
+        self._speed_restore_allowed.clear()
         self.owner = session_id
         self.note('owner_acquired', session_id=session_id, role=role)
 
@@ -129,6 +135,21 @@ class SharedControl:
             finally:
                 self._control_lock.release()
         with self._control_lock:
+            if op == 'speed_override':
+                if self.owner is not None or (session_id in self.revoked
+                        and session_id not in self._speed_restore_allowed):
+                    raise PermissionError('Speed change requires no follower owner and a valid session')
+                if self.control.ws is None:
+                    raise ConnectionError('Robot control connection unavailable; reconnect explicitly')
+                def get_state(*, timeout_s):
+                    reply = self.control.request('get', status=True, timeout_s=timeout_s)
+                    return _parse_state(reply, joint_unit='deg', position_unit=None,
+                                        gripper_feedback_path=None)
+                result = _set_controller_speed(self.control, get_state,
+                    request['percent'], request['expected_mode'], self.timeout_s,
+                    request.get('expected_percent'))
+                self.note('controller_speed_override', session_id=session_id, confirmed=result)
+                return result
             if op == 'lease':
                 if request['operation'] == 'acquire':
                     self.claim(session_id, role)
@@ -153,6 +174,7 @@ class SharedControl:
                 return self.read_state()
             if role != 'console':
                 raise PermissionError('Arbitrary controller commands require the console role')
+            self._speed_restore_allowed.clear()
             if self.owner is not None:
                 self.stop_owner('console_command:' + name)
             if self.control.ws is None:

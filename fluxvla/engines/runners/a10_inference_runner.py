@@ -32,7 +32,7 @@ class A10InferenceRunner(BaseInferenceRunner):
     def __init__(self, *, execute_horizon=None, action_dt=0.1, joint_target_repeat=1, dry_run=True,
                  instruction='', max_joint_step_rad=None,
                  gripper_mm_range=(0., 85.), model_from_config=False, debug_log=None,
-                 rtc_config=None, **kwargs):
+                 rtc_config=None, controller_speed_percent=None, **kwargs):
         if model_from_config and (kwargs.get('ckpt_path') is not None
                                   or kwargs.get('remote_inference') is not None):
             raise ValueError('model_from_config cannot combine with ckpt_path or remote inference')
@@ -73,6 +73,12 @@ class A10InferenceRunner(BaseInferenceRunner):
         if limits.shape != (2,) or not np.isfinite(limits).all() or not (
                 0 <= limits[0] < limits[1] <= 100):
             raise ValueError('gripper_mm_range must be an increasing range in 0..100')
+        if controller_speed_percent is not None and (
+                type(controller_speed_percent) is not int or not 1 <= controller_speed_percent <= 100):
+            raise ValueError('controller_speed_percent must be None or an integer within 1..100')
+        self.controller_speed_percent = controller_speed_percent
+        self._speed_restore = None
+        self.speed_status = dict(requested_percent=controller_speed_percent, state='unchanged')
         self.execute_horizon = horizon
         self.action_dt = float(action_dt)
         self.joint_target_repeat = joint_target_repeat
@@ -90,6 +96,7 @@ class A10InferenceRunner(BaseInferenceRunner):
         config = kwargs.get('cfg')
         metadata = dict(resolved_config=(config.to_dict() if hasattr(config, 'to_dict') else kwargs),
                         instruction=instruction, dry_run=dry_run, execute_horizon=horizon,
+                        controller_speed_percent=controller_speed_percent,
                         action_dt=action_dt, joint_target_repeat=joint_target_repeat,
                         joint_publish_hz=joint_target_repeat / action_dt, max_publish_step=maximum,
                         max_joint_step_rad=max_joint_step_rad,
@@ -248,6 +255,7 @@ class A10InferenceRunner(BaseInferenceRunner):
             return
         if not self._follower_requested:
             # Attempt stop even if start sends a command but confirmation fails.
+            self._apply_speed_override()
             self._follower_requested = True
             self.ros_operator.start_follower()
         self._last_trajectory_cycle = self._debug_cycle
@@ -337,21 +345,73 @@ class A10InferenceRunner(BaseInferenceRunner):
                                       trajectory_cycle=self._last_trajectory_cycle, error=repr(exc),
                                       traceback=traceback.format_exc(), trajectory=trajectory)
             if trajectory is not None:
-                logger.warning('A10 last trajectory send result: %s', trajectory)
+                summary = {key: trajectory.get(key) for key in (
+                    'selected', 'sent', 'joint_packets_sent', 'completed', 'phase', 'elapsed_s', 'error')}
+                logger.warning('A10 last trajectory send result: %s', summary)
             logger.warning('A10 run ended: %s: %s', type(exc).__name__, exc)
             raise
         finally:
             self.cleanup()
+
+    def _speed_event(self):
+        logger.info('A10 controller speed: %s', self.speed_status)
+        if self._recorder is not None:
+            self._recorder.record('controller_speed_override', **self.speed_status)
+
+    def _apply_speed_override(self):
+        if self.controller_speed_percent is None:
+            return
+        if self.dry_run:
+            self.speed_status['state'] = 'ignored_dry_run'
+            self._speed_event()
+            return
+        try:
+            original = self.ros_operator.get_speed_override()
+            self.speed_status.update(original=original, state='setting')
+            if original['percent'] != self.controller_speed_percent:
+                self._speed_restore = original
+            confirmed = self.ros_operator.set_speed_override(
+                self.controller_speed_percent, expected_mode=original['mode'],
+                expected_percent=original['percent'])
+            self.speed_status.update(state='confirmed', confirmed=confirmed)
+        except BaseException as exc:
+            self.speed_status.update(state='set_failed', error=repr(exc))
+            self._speed_event()
+            raise
+        self._speed_event()
+
+    def _restore_speed_override(self, stopped):
+        original, self._speed_restore = self._speed_restore, None
+        if original is None:
+            return
+        try:
+            if not stopped or not self.ros_operator.is_connected:
+                raise RuntimeError('Stop or connection unconfirmed; controller speed not restored')
+            current = self.ros_operator.get_speed_override()
+            if current['mode'] != original['mode'] or current['percent'] not in (
+                    self.controller_speed_percent, original['percent']):
+                raise RuntimeError('Controller mode or speed changed; preserving site settings')
+            confirmed = self.ros_operator.set_speed_override(
+                original['percent'], expected_mode=original['mode'],
+                expected_percent=current['percent'])
+            self.speed_status.update(state='restored', restored=confirmed)
+        except Exception as exc:
+            self.speed_status.update(state='restore_unconfirmed', restore_error=repr(exc))
+            logger.warning('A10 controller speed restoration unconfirmed: %s', exc)
+        self._speed_event()
 
     def cleanup(self):
         if self._cleaned:
             return
         self._cleaned = True
         self._ready = False
+        stopped = not self._follower_requested
         try:
             if self._follower_requested:
                 try:
                     state = self.ros_operator.stop_follower()
+                    stopped = (getattr(state, 'follower_active', None) is False
+                               or getattr(self.ros_operator, 'last_stop_confirmed', False))
                     if self._recorder is not None:
                         self._recorder.record('follower_stop',
                                               confirmed=(getattr(state, 'follower_active', None) is False
@@ -364,6 +424,7 @@ class A10InferenceRunner(BaseInferenceRunner):
                         self._recorder.record('follower_stop', confirmed=False, traceback=traceback.format_exc())
         finally:
             self._follower_requested = False
+            self._restore_speed_override(stopped)
             try:
                 self.ros_operator.close()
             finally:

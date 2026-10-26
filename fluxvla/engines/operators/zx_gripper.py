@@ -1,4 +1,4 @@
-"""ChangingTek (知行) servo-stepper gripper communication and single-move check.
+"""Independent ChangingTek (知行) gripper driver for policy position targets.
 
 Based on 执行器操作手册（伺服步进）V2.1.0. Run without FluxVLA/ROS imports::
 
@@ -7,11 +7,17 @@ Based on 执行器操作手册（伺服步进）V2.1.0. Run without FluxVLA/ROS 
     python3 fluxvla/engines/operators/zx_gripper.py --scan
     python3 fluxvla/engines/operators/zx_gripper.py --position-raw 4720
     python3 fluxvla/engines/operators/zx_gripper.py --reset-alarm
+    python3 fluxvla/engines/operators/zx_gripper.py --state
+    python3 fluxvla/engines/operators/zx_gripper.py --position 0.5 --no-wait
 
 The manual's connection example uses 115200, 8N1, ID 1. Default operation is
 read-only; --position-raw explicitly enables and triggers one temporary-area
-move. Successful moves retain torque; disconnect only closes the serial port.
-Failed/interrupted moves attempt disable (not a guaranteed emergency stop).
+move. Position arrival and torque arrival are separate completion reasons;
+torque arrival indicates resistance, not proof that an object was grasped.
+Timeout, exceptions, interruption and disconnect NEVER automatically disable
+or open the gripper. The last device target and torque limit remain in effect;
+hardware faults/power loss can still affect holding. Use disable()/--disable
+explicitly to release motor torque. A wait timeout ends host waiting only.
 Position units in the manual are inconsistent: targets/feedback are raw values,
 not millimetres or an assumed 0..1000 range. Manufacturer ROS examples use
 0..9000 for CTAG2F90/90D and different scales for other models:
@@ -21,15 +27,25 @@ alarm B=0x1000 near feedback 8993. The default software range is therefore
 0..8900, leaving margin below that boundary; this is not a model calibration.
 Use --max-position-raw only with a separately established hardware range.
 Moves use speed 10%, torque 60% (the manual recommends 60% for gripping).
-No homing or flash
-writes. Alarm reset is explicit; motion never silently clears alarms.
+No homing or flash writes. Alarm reset is explicit; motion never silently clears alarms.
 Importing or constructing the client does not open the port.
 Requires pyserial (already listed in requirements-a10.txt).
+
+Policy API: set_position_raw(id, raw) or set_position(id, value_0_to_1) returns
+after serial acknowledgements, without waiting for physical arrival. A new
+target supersedes the previous one; identical targets/parameters do not
+retrigger. read_state(id) returns measured state and a monotonic timestamp.
+0..1 means raw/max_position_raw, NOT calibrated millimetres or open/close.
+No robot/VLA config is switched by this standalone module.
 """
 
 import argparse
+from dataclasses import asdict, dataclass
+import json
 import math
+from numbers import Integral, Real
 import struct
+import threading
 import time
 
 
@@ -44,7 +60,7 @@ STATUS_FLAGS = {
     'zero_speed': 0x0004,
     'torque_reached': 0x0008,
     'ready': 0x0010,
-    'enabled': 0x8000,
+    'enabled_status_bit': 0x8000,
 }
 
 
@@ -65,6 +81,47 @@ class ZXGripperDeviceError(ZXGripperError):
         super().__init__(f'ID {device_id}: Modbus exception 0x{code:02X}')
 
 
+@dataclass(frozen=True)
+class ZXGripperState:
+    """Live measurements; target is never substituted for actual position.
+
+    enabled comes from 0x0100: this unit's 0x0401 bit 0x8000 does not reflect it.
+    Speed/current are raw percentages per manual, not mm/s or measured force.
+    """
+
+    device_id: int
+    position_raw: int
+    position: float
+    target_raw: int | None
+    status: int
+    alarm_a: int
+    alarm_b: int
+    enabled: bool
+    speed_raw: int
+    current_raw: int
+    timestamp: float
+    completion: str
+
+    @property
+    def position_reached(self):
+        return bool(self.status & 0x0001)
+
+    @property
+    def torque_reached(self):
+        return bool(self.status & 0x0008)
+
+    @property
+    def has_error(self):
+        return bool(self.alarm_a or self.alarm_b)
+
+
+def _wait_timeout(value):
+    if (isinstance(value, bool) or not isinstance(value, Real)
+            or not math.isfinite(value) or not 0 < value <= 60):
+        raise ValueError('move_timeout must be within (0, 60] seconds')
+    return value
+
+
 def crc16(data):
     """Modbus CRC16; encoded low byte first on the wire."""
     crc = 0xFFFF
@@ -76,15 +133,15 @@ def crc16(data):
 
 
 def _integer(value, name, minimum, maximum):
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, Integral):
         raise ValueError(f'{name} must be an integer')
     if not minimum <= value <= maximum:
         raise ValueError(f'{name} must be within {minimum}..{maximum}')
-    return value
+    return int(value)
 
 
 class ZXGripper:
-    """Single-threaded, exclusive Modbus RTU client."""
+    """Exclusive Modbus client; transactions and target updates are serialized."""
 
     def __init__(self, port=DEFAULT_PORT, *, baudrate=115200, timeout=0.2,
                  trace=None, max_position_raw=8900):
@@ -93,15 +150,22 @@ class ZXGripper:
         self.port = port
         self.baudrate = _integer(baudrate, 'baudrate', 1, 4000000)
         self.max_position_raw = _integer(max_position_raw, 'max_position_raw', 1, 0xFFFFFFFF)
-        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+        if (isinstance(timeout, bool) or not isinstance(timeout, Real)
                 or not math.isfinite(timeout) or not 0 < timeout <= 60):
             raise ValueError('timeout must be finite and within (0, 60] seconds')
         self.timeout = timeout
         self.trace = trace
         self._serial = None
         self._last_activity = 0.0
+        self._io_lock = threading.RLock()
+        self._commands = {}
+        self._command_sequence = 0
 
     def connect(self):
+        with self._io_lock:
+            return self._connect()
+
+    def _connect(self):
         if self._serial is None:
             import serial
             try:
@@ -114,9 +178,12 @@ class ZXGripper:
         return self
 
     def disconnect(self):
-        port, self._serial = self._serial, None
-        if port is not None:
-            port.close()
+        """Close the port only; never release a held object."""
+        with self._io_lock:
+            port, self._serial = self._serial, None
+            self._commands.clear()
+            if port is not None:
+                port.close()
 
     def __enter__(self):
         return self.connect()
@@ -162,61 +229,150 @@ class ZXGripper:
 
     def reset_alarms(self, device_id):
         """Explicit manual alarm reset (0x0110), verified by live readback."""
-        self.write_register(device_id, 0x0110, 1)
-        time.sleep(0.1)
-        alarms = self.read_registers(device_id, ALARM_REGISTER, 2)
-        if any(alarms):
-            raise ZXGripperError(f'Alarm reset did not clear: A=0x{alarms[0]:04X}, '
-                                 f'B=0x{alarms[1]:04X}')
-        return alarms
+        with self._io_lock:
+            self._commands.pop(device_id, None)
+            self.write_register(device_id, 0x0110, 1)
+            time.sleep(0.1)
+            alarms = self.read_registers(device_id, ALARM_REGISTER, 2)
+            if any(alarms):
+                raise ZXGripperError(f'Alarm reset did not clear: A=0x{alarms[0]:04X}, '
+                                     f'B=0x{alarms[1]:04X}')
+            return alarms
+
+    def read_state(self, device_id=1):
+        """Poll actual position, status, alarms, speed/current and enable register."""
+        with self._io_lock:
+            status, alarm_a, alarm_b = self.read_registers(device_id, STATUS_REGISTER, 3)
+            high, low, speed, current = self.read_registers(device_id, 0x0418, 4)
+            enabled, = self.read_registers(device_id, 0x0100)
+            raw = (high << 16) | low
+            command = self._commands.get(device_id)
+            target = command[0] if command else None
+            if alarm_a or alarm_b:
+                completion = 'fault'
+            elif not enabled:
+                completion = 'disabled'
+            elif target is None:
+                completion = 'idle'
+            elif status & 1 and abs(raw - target) <= 5:
+                completion = 'position_reached'
+            elif status & 8 and status & 4:
+                completion = 'torque_reached'
+            else:
+                completion = 'moving'
+            return ZXGripperState(device_id, raw, raw / self.max_position_raw, target,
+                                  status, alarm_a, alarm_b, bool(enabled), speed,
+                                  current, time.monotonic(), completion)
+
+    def disable(self, device_id=1):
+        """Explicit torque release; may drop an object. Never invoked by timeouts."""
+        with self._io_lock:
+            self._commands.pop(device_id, None)
+            self.write_register(device_id, 0x0100, 0)
+            self.write_register(device_id, 0x0108, 0)
+            enabled, = self.read_registers(device_id, 0x0100)
+            if enabled:
+                raise ZXGripperError('Disable was acknowledged but enable readback is nonzero')
+
+    def set_position(self, device_id, position, **options):
+        """Normalized policy target: 0 maps to raw 0, 1 to max_position_raw."""
+        if (isinstance(position, bool) or not isinstance(position, Real)
+                or not math.isfinite(position) or not 0 <= position <= 1):
+            raise ValueError('position must be finite and within 0..1')
+        return self.set_position_raw(
+            device_id, int(position * self.max_position_raw + 0.5), **options)
+
+    def set_position_raw(self, device_id, position, *, speed=10, torque=60,
+                         wait=False, move_timeout=10):
+        """Update the latest target, returning a command ID or (wait=True) state.
+
+        wait=False waits for bounded serial ACKs only, not mechanical motion.
+        Repeated identical targets retain the existing command and holding force.
+        """
+        device_id = _integer(device_id, 'device_id', 1, 247)
+        position = _integer(position, 'position', 0, self.max_position_raw)
+        speed = _integer(speed, 'speed', 1, 100)
+        torque = _integer(torque, 'torque', 1, 100)
+        if type(wait) is not bool:
+            raise ValueError('wait must be bool')
+        _wait_timeout(move_timeout)
+        with self._io_lock:
+            alarm_a, alarm_b = self.read_registers(device_id, ALARM_REGISTER, 2)
+            if alarm_a or alarm_b:
+                raise ZXGripperError(f'Motion blocked by alarms: {alarm_a:#06x}, {alarm_b:#06x}')
+            signature = (position, speed, torque)
+            previous = self._commands.get(device_id)
+            if previous is None or previous[:3] != signature:
+                # An uncertain partial write must not leave a reusable cached target.
+                self._commands.pop(device_id, None)
+                self.write_register(device_id, 0x0108, 0)
+                self.write_registers(device_id, 0x0102,
+                                     (position >> 16, position & 0xFFFF, speed, torque, 1000, 1000))
+                self.write_register(device_id, 0x0100, 1)
+                self.write_register(device_id, 0x0108, 1)
+                self._command_sequence += 1
+                self._commands[device_id] = (*signature, self._command_sequence, time.monotonic())
+            command_id = self._commands[device_id][3]
+        if wait:
+            return self.wait_for_motion(device_id, command_id=command_id, timeout=move_timeout)
+        return command_id
+
+    def wait_for_motion(self, device_id=1, *, command_id=None, timeout=10):
+        """Wait for position OR sustained torque arrival at zero speed; retain enable.
+
+        Faults fail the wait and block subsequent targets until explicit recovery.
+        Superseded commands fail their waiter instead of attributing new feedback
+        to the old target. Two successive feedback samples confirm completion.
+        """
+        _wait_timeout(timeout)
+        with self._io_lock:
+            command = self._commands.get(device_id)
+            if command is None:
+                raise ZXGripperError('No known command to wait for')
+            expected = command[3] if command_id is None else command_id
+        deadline = time.monotonic() + timeout
+        consecutive = 0
+        previous_reason = None
+        last = None
+        while time.monotonic() < deadline:
+            with self._io_lock:
+                command = self._commands.get(device_id)
+                if command is None or command[3] != expected:
+                    raise ZXGripperError('Motion wait superseded by a newer command or disable')
+                last = self.read_state(device_id)
+                if last.has_error:
+                    raise ZXGripperError(
+                        f'Alarm during motion at raw {last.position_raw}: '
+                        f'A=0x{last.alarm_a:04X}, B=0x{last.alarm_b:04X}; target={last.target_raw}')
+                if not last.enabled:
+                    raise ZXGripperError('Motor became disabled during motion')
+                # Ignore briefly lingering torque bits from the preceding target.
+                settled = time.monotonic() - command[4] >= 0.05
+                if last.completion in ('position_reached', 'torque_reached') and settled:
+                    consecutive = consecutive + 1 if previous_reason == last.completion else 1
+                    previous_reason = last.completion
+                    if consecutive >= 2:
+                        return last
+                else:
+                    consecutive = 0
+                    previous_reason = None
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+        raise ZXGripperTimeout(
+            f'Motion wait timeout after {timeout}s; last raw='
+            f'{last.position_raw if last else None}; target={command[0]}; '
+            'enable and target retained (no automatic release)')
 
     def move_raw(self, device_id, position, *, speed=10, torque=60, move_timeout=10):
-        """One temporary-area move; require live position arrival, not write ACK."""
-        _integer(device_id, 'device_id', 1, 247)
-        _integer(position, 'position', 0, self.max_position_raw)
-        _integer(speed, 'speed', 1, 100)
-        _integer(torque, 'torque', 1, 100)
-        if (isinstance(move_timeout, bool) or not isinstance(move_timeout, (int, float))
-                or not math.isfinite(move_timeout) or not 0 < move_timeout <= 60):
-            raise ValueError('move_timeout must be within (0, 60] seconds')
-        # Read before writing: faults or a broken connection must block motion.
-        alarm_a, alarm_b = self.read_registers(device_id, ALARM_REGISTER, 2)
-        if alarm_a or alarm_b:
-            raise ZXGripperError(f'Motion blocked by alarms: {alarm_a:#06x}, {alarm_b:#06x}')
-        start = self.read_position_raw(device_id)
-        print(f'Move ID {device_id}: raw {start} -> {position}; '
-              f'speed={speed}%, torque={torque}%', flush=True)
-        try:
-            self.write_register(device_id, 0x0108, 0)
-            self.write_registers(device_id, 0x0102,
-                                 (position >> 16, position & 0xFFFF, speed, torque, 1000, 1000))
-            self.write_register(device_id, 0x0100, 1)
-            self.write_register(device_id, 0x0108, 1)
-            deadline = time.monotonic() + move_timeout
-            consecutive = 0
-            while time.monotonic() < deadline:
-                status, alarm_a, alarm_b = self.read_registers(device_id, STATUS_REGISTER, 3)
-                current = self.read_position_raw(device_id)
-                print(f'Feedback: raw={current}, status=0x{status:04X}, '
-                      f'alarms=0x{alarm_a:04X}/0x{alarm_b:04X}', flush=True)
-                if alarm_a or alarm_b:
-                    raise ZXGripperError(
-                        f'Alarm during motion at raw {current}: '
-                        f'A=0x{alarm_a:04X}, B=0x{alarm_b:04X}; target={position}')
-                consecutive = consecutive + 1 if abs(current - position) <= 5 and status & 1 else 0
-                if consecutive >= 2:
-                    self.write_register(device_id, 0x0108, 0)
-                    return current
-                time.sleep(0.1)
-            raise ZXGripperTimeout(f'Move to raw {position} did not arrive within {move_timeout}s')
-        except (Exception, KeyboardInterrupt):
-            try:
-                self.write_register(device_id, 0x0100, 0)
-            except Exception as cleanup_error:
-                print(f'Disable attempt failed: {cleanup_error}', flush=True)
-            raise
+        """Compatibility blocking move: return actual position, including contact."""
+        state = self.set_position_raw(device_id, position, speed=speed, torque=torque,
+                                      wait=True, move_timeout=move_timeout)
+        return state.position_raw
 
     def _transaction(self, device_id, body, *, read_count=None):
+        with self._io_lock:
+            return self._transaction_locked(device_id, body, read_count=read_count)
+
+    def _transaction_locked(self, device_id, body, *, read_count=None):
         if self._serial is None:
             raise ZXGripperError('Disconnected; call connect() first')
         function = body[1]
@@ -285,8 +441,13 @@ def main(argv=None):
     parser.add_argument('--baudrate', type=int, default=115200)
     parser.add_argument('--id', dest='device_id', type=int, default=1)
     parser.add_argument('--timeout', type=float, default=0.2)
-    parser.add_argument('--scan', action='store_true', help='Read-only scan of IDs 1..247')
-    parser.add_argument('--position-raw', type=int, help='Enable and move once to this raw target')
+    commands = parser.add_mutually_exclusive_group()
+    commands.add_argument('--scan', action='store_true', help='Read-only scan of IDs 1..247')
+    commands.add_argument('--position-raw', type=int, help='Enable and move to this raw target')
+    commands.add_argument('--position', type=float, help='Normalized target in 0..1 (raw/max)')
+    commands.add_argument('--state', action='store_true', help='Read full live state as JSON')
+    commands.add_argument('--disable', action='store_true', help='Explicitly release motor torque')
+    parser.add_argument('--no-wait', action='store_true', help='Return after ACK, retaining target')
     parser.add_argument('--speed', type=int, default=10, help='Move speed percent (default 10)')
     parser.add_argument('--torque', type=int, default=60, help='Move torque percent (default 60)')
     parser.add_argument('--move-timeout', type=float, default=10)
@@ -295,8 +456,13 @@ def main(argv=None):
     parser.add_argument('--reset-alarm', action='store_true',
                         help='Explicitly reset alarms and verify; may precede a move')
     args = parser.parse_args(argv)
-    if args.scan and (args.position_raw is not None or args.reset_alarm):
-        parser.error('--scan cannot be combined with --position-raw or --reset-alarm')
+    has_target = args.position_raw is not None or args.position is not None
+    if args.scan and args.reset_alarm:
+        parser.error('--scan cannot be combined with --reset-alarm')
+    if args.disable and args.reset_alarm:
+        parser.error('--disable cannot be combined with --reset-alarm')
+    if args.no_wait and not has_target:
+        parser.error('--no-wait requires --position-raw or --position')
     try:
         _integer(args.device_id, 'id', 1, 247)
         print(f'Port: {args.port}; {args.baudrate} baud, 8N1; '
@@ -312,11 +478,25 @@ def main(argv=None):
             if args.reset_alarm:
                 gripper.reset_alarms(args.device_id)
                 print(f'ID {args.device_id}: alarms cleared (verified).', flush=True)
-            if args.position_raw is not None:
-                position = gripper.move_raw(args.device_id, args.position_raw,
-                                            speed=args.speed, torque=args.torque,
-                                            move_timeout=args.move_timeout)
-                print(f'Move complete: raw position={position}; torque retained.', flush=True)
+            if args.disable:
+                gripper.disable(args.device_id)
+                print('Motor disabled (verified); holding torque released.', flush=True)
+                return 0
+            if args.state:
+                state = gripper.read_state(args.device_id)
+                print(json.dumps(asdict(state), indent=2), flush=True)
+                return 1 if state.has_error else 0
+            if has_target:
+                method = gripper.set_position_raw if args.position_raw is not None else gripper.set_position
+                result = method(args.device_id,
+                                args.position_raw if args.position_raw is not None else args.position,
+                                speed=args.speed, torque=args.torque, wait=not args.no_wait,
+                                move_timeout=args.move_timeout)
+                if args.no_wait:
+                    print(f'Target acknowledged: command_id={result}; motion not awaited.', flush=True)
+                else:
+                    print(json.dumps(asdict(result), indent=2), flush=True)
+                    print(f'Motion completed: {result.completion}; torque retained.', flush=True)
                 return 0
             for device_id in (range(1, 248) if args.scan else (args.device_id,)):
                 print(f'Probing ID {device_id}', flush=True)
@@ -349,7 +529,7 @@ def main(argv=None):
         print(f'Check failed: {exc}', flush=True)
         return 1
     except KeyboardInterrupt:
-        print('Interrupted; serial port closed.', flush=True)
+        print('Interrupted; serial port closed; target retained, no automatic release.', flush=True)
         return 130
 
 

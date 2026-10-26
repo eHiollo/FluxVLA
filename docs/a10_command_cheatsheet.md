@@ -3,6 +3,70 @@
 2026-10-26：VR、双臂控制与推理已整合到 `FluxVLA` 的 `kaanh_follower`。原 VR 目录保留作回退。
 无 `--config` 的控制台沿用默认共享连接；双臂配置默认直连。不要同时启动推理与 VR 驱动同一机器人。
 
+## 旧单臂 .125 + 老夹爪 VR（2026-10-26）
+
+在 `/home/robot/VLA/FluxVLA`、`kaanh_follower` 分支使用。
+老夹爪走本机 USB 串口，机械臂仍连接 `192.168.0.125`。
+右手摇杆 X 轴控制开合，不要求按住机械臂侧键。知行夹爪用另一套协议，本入口不使用它。
+
+你现有的单臂 VR 命令，只需把配置名改为：
+
+```text
+configs/a10/a10_vr_teleop_legacy_gripper.py
+```
+
+完整命令（控制器服务应已运行，关闭占用同一夹爪串口的推理/夹爪程序）：
+
+```bash
+cd /home/robot/VLA/FluxVLA
+conda activate fluxvla
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop_legacy_gripper.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.control_mode=reference \
+    teleop.cartesian_adapter=sdk_tool_cumulative \
+    teleop.pose_mapping=anchor_relative \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0 \
+    teleop.controller_speed_percent=50 \
+    teleop.reference_options.max_linear_speed_m_s=0.08 \
+    teleop.reference_options.max_angular_speed_rad_s=0.4 \
+    teleop.reference_options.max_reference_lead_m=0.03 \
+    teleop.reference_options.max_reference_lead_rad=0.20
+```
+
+可在 `--config` 后加 `--preview` 检查配置，不连接机器人或串口。
+仅验证夹爪时，保持右手侧键和前扳机都松开，只拨右手摇杆；这时仍会连接并查询机械臂。
+不要用该方式代替硬件隔离：若按下侧键或前扳机，机械臂也会进入原有接管流程。
+
+| 操作 / 参数 | 效果 |
+| --- | --- |
+| 右手摇杆 X 正方向 | 增大开口（张开） |
+| 右手摇杆 X 负方向 | 减小开口（闭合） |
+| 摇杆回中 | 停止更新开合目标，夹爪可能继续完成最后一小步 |
+| `teleop.gripper_direction=-1` | 反转摇杆开合方向 |
+| `teleop.gripper_speed_mm_s=10` | 默认最大开口目标变化速度10毫米/秒，摇杆幅度越小越慢 |
+| `teleop.operator.gripper.port=实际串口` | 现场USB设备路径变化时覆盖 |
+
+专用配置默认：旧100mm型号的标定、开口限制0..85mm、波特率1000000、舵机ID10、
+舵机原始速度参数800、串口超时0.1秒。舵机速度800与摇杆目标变化速度10mm/s含义不同。
+串口沿用推理配置的 `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`，不用知行夹爪的FTDI串口。
+
+连接仅执行ping和读状态；初次输入不补发历史位移。输入过期时不再下发新目标，
+串口读期间输入变旧也丢弃该帧目标。退出不会自动张开或掉使能；断流不是立即取消已发出的舵机目标。
+夹爪通信异常时结束遥操作并请求停止本次机械臂跟随，停止失败会明确报错。
+正常退出可用左手摇杆向下或 Ctrl+C。默认VR-only仍不打开任何设备。
+
+`work_dirs/a10/vr/teleop_diagnostics.jsonl` 的 `gripper_command` 记录实际反馈开口、
+发送目标和 `io_elapsed_s`（秒）；`transmitted` 不代表夹爪已经到位。
+本轮现场只读检查成功：ping/初次反馈约16.2ms，后续3次读位置约2.3～2.4ms，未发送运动目标。
+因此先保留现有同步读写；遇到现场明显卡顿时结合该耗时与 `step_elapsed_s` 再判断是否需要后台线程。
+**软件与模拟串口已验证，真实VR开合方向和实际抓取待现场确认。**
+
 ## 双臂控制台：先不用 VR（2026-10-23）
 
 ```bash

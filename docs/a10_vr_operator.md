@@ -2,6 +2,23 @@
 
 **只想找运行命令：先看 [A10 常用命令速查](a10_command_cheatsheet.md)。** 本文保留功能说明与开发细节。
 
+## 旧单臂与老 USB 夹爪
+
+使用 `configs/a10/a10_vr_teleop_legacy_gripper.py`，沿用 `a10_vr_teleop.py` 的机械臂/VR流程。
+默认仍为VR-only；真实操作显式设置 `vr_only=False` 和 `operator.allow_motion=True`。
+完整命令和参数见 [速查：旧单臂 .125 + 老夹爪 VR](a10_command_cheatsheet.md)。
+
+`build_runtime()` 将USB夹爪配置交给现有 `GripperOperator`，由VR生命周期独立连接、关闭；
+机械臂operator不重复打开串口。右手摇杆控制实际开口的小步目标，松开侧键也能操作。
+`gripper_direction` 为1或-1，专用配置目标变化速度默认10mm/s、行程0..85mm。
+夹爪IO与机械臂控制暂按现有顺序串行执行，日志增加 `gripper_command` 目标/反馈/耗时字段；
+读取反馈后再检查输入是否仍新鲜，避免慢串口恢复后使用旧摇杆值继续闭合。
+
+现场只读读取耗时约2.3～2.4ms，尚未发送实机开合目标。构造、配置预览、VR-only不打开串口；
+只读观察仍拒绝USB设备配置，若需 `--observe` 请使用不带夹爪的原配置。
+停止更新目标不会立即取消最后一个舵机目标；退出不自动开爪、回零或掉使能。
+新知行夹爪保持独立驱动，后续另行接入。
+
 ## 当前分支和工作目录
 
 2026-10-26 已整合到 `kaanh_follower`，统一工作目录 `/home/robot/VLA/FluxVLA`。

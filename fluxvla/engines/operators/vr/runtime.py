@@ -23,7 +23,7 @@ class VRTeleopRuntime:
     def __init__(self, vr, mapper=None, robot=None, *, execute=False, gripper=None,
                  diagnostics_path=None,
                  max_position_step_m=None, max_rotation_step_rad=None,
-                 max_feedback_age_s=0.25, gripper_speed_mm_s=30.0,
+                 max_feedback_age_s=0.25, gripper_speed_mm_s=30.0, gripper_direction=1,
                  max_position_tracking_error_m=0.05,
                  max_rotation_tracking_error_rad=0.35,
                  control_mode='delta', reference_options=None, observe_only=False,
@@ -72,6 +72,8 @@ class VRTeleopRuntime:
             raise ValueError('max_feedback_age_s must be positive and finite')
         if not math.isfinite(gripper_speed_mm_s) or gripper_speed_mm_s <= 0:
             raise ValueError('gripper_speed_mm_s must be positive and finite')
+        if type(gripper_direction) not in (int, float) or gripper_direction not in (-1, 1):
+            raise ValueError('gripper_direction must be 1 or -1')
         for name, value in [('max_position_tracking_error_m', max_position_tracking_error_m),
                             ('max_rotation_tracking_error_rad', max_rotation_tracking_error_rad)]:
             if not math.isfinite(value) or value <= 0:
@@ -103,6 +105,8 @@ class VRTeleopRuntime:
         self.max_rotation_step_rad = max_rotation_step_rad
         self.max_feedback_age_s = max_feedback_age_s
         self.gripper_speed_mm_s = gripper_speed_mm_s
+        self.gripper_direction = gripper_direction
+        self.last_gripper_command = None
         self.max_position_tracking_error_m = max_position_tracking_error_m
         self.max_rotation_tracking_error_rad = max_rotation_tracking_error_rad
         self._target_pose = None
@@ -261,10 +265,10 @@ class VRTeleopRuntime:
             self._send_absolute_target(self._target_pose)
         self._engaged = False
 
-    def _send_gripper(self, action):
+    def _send_gripper(self, action, *, input_deadline=None):
         if self.gripper is None:
             return
-        velocity = float(action.get('gripper.pos', 0.0))
+        velocity = float(action.get('gripper.pos', 0.0)) * self.gripper_direction
         if not math.isfinite(velocity) or abs(velocity) > 1:
             raise ValueError('VR gripper input must be within [-1, 1]')
         now = time.monotonic()
@@ -273,16 +277,27 @@ class VRTeleopRuntime:
         self._last_gripper_time = now
         if abs(velocity) < 1e-6 or elapsed <= 0:
             return
+        started = time.monotonic()
         measured = self.gripper.get_position_mm()
+        if input_deadline is not None and time.monotonic() > input_deadline:
+            self._last_gripper_time = None
+            self.last_gripper_command = dict(measured_mm=measured, transmitted=False,
+                                            reason='input_expired_during_read',
+                                            io_elapsed_s=time.monotonic() - started)
+            return
         target = min(self.gripper.max_width_mm, max(
             0., measured + velocity * self.gripper_speed_mm_s * elapsed))
         self.gripper.set_position_mm(target)
+        self.last_gripper_command = dict(measured_mm=measured, target_mm=target,
+                                        transmitted=True, arrival_confirmed=False,
+                                        io_elapsed_s=time.monotonic() - started)
 
     def step(self):
         self.last_sdk_command = None
         self.last_relative_target = None
         self.last_reference_result = None
         started = time.monotonic()
+        self.last_gripper_command = None
         raw, action = {}, {}
         error = None
         try:
@@ -321,6 +336,7 @@ class VRTeleopRuntime:
                               error=error, execute=self.execute,
                               cartesian_adapter=self.cartesian_adapter,
                               sdk_tool_command=self.last_sdk_command,
+                              gripper_command=self.last_gripper_command,
                               cartesian_wire_format=getattr(self.robot, 'cartesian_wire_format', None),
                               control_mode=self.control_mode, observe_only=self.observe_only,
                               pose_mapping=self.pose_mapping,
@@ -351,11 +367,7 @@ class VRTeleopRuntime:
             self._hold()
             # Mapper arm guards retain the thumbstick value. Never integrate a
             # stale browser sample into another gripper command.
-            age = raw.get('xlevr.sample_age_s')
-            if age is None or (math.isfinite(age) and 0 <= age <= self.mapper.stale_timeout_s):
-                self._send_gripper(action)
-            else:
-                self._last_gripper_time = None
+            self._send_fresh_gripper(raw, action, allow_missing_age=True)
             return action
         pose = self._checked_frame(require_active=self._started_follower)
         # Validate before starting or updating the controller.
@@ -381,7 +393,7 @@ class VRTeleopRuntime:
         self._send_absolute_target(target)
         self._target_pose = target
         self._engaged = True
-        self._send_gripper(action)
+        self._send_fresh_gripper(raw, action, allow_missing_age=True)
         return action
 
     def _stop_reference(self):
@@ -537,10 +549,16 @@ class VRTeleopRuntime:
         self._engaged = True
         return action
 
-    def _send_fresh_gripper(self, raw, action):
+    def _send_fresh_gripper(self, raw, action, *, allow_missing_age=False):
         age = raw.get('xlevr.sample_age_s')
-        if age is not None and math.isfinite(age) and 0 <= age <= self.mapper.stale_timeout_s:
-            self._send_gripper(action)
+        if age is None and allow_missing_age:
+            age = 0.  # Compatibility with the delta input contract.
+        budget = self.mapper.stale_timeout_s
+        if self.reference_control is not None:
+            budget = min(budget, self.reference_control.config.max_input_age_s)
+        elapsed = 0. if self._input_read_time is None else max(0., time.monotonic() - self._input_read_time)
+        if age is not None and math.isfinite(age) and 0 <= age and age + elapsed <= budget:
+            self._send_gripper(action, input_deadline=time.monotonic() + budget - age - elapsed)
         else:
             self._last_gripper_time = None
 

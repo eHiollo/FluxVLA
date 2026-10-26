@@ -19,7 +19,11 @@ teleop = dict(
     cartesian_adapter='legacy_anchor',  # or 'sdk_tool_cumulative'
     # Used only in reference mode. Offline-selected initial values, not hardware acceptance.
     # Outer half of each budget gradually slows outward reference progress.
-    reference_options=dict(max_reference_lead_m=.02, max_reference_lead_rad=.12),
+    reference_options=dict(
+        max_reference_lead_m=.02, max_reference_lead_rad=.12,
+        # Angular acceleration/deceleration limit (rad/s^2); trial value, previously .96.
+        max_angular_accel_rad_s2=1.5,
+    ),
     # Old mapping stays the default. New mode requires control_mode='reference'.
     pose_mapping='anchor_relative',  # or 'calibrated_absolute'
     # Tracking space -> robot base still requires an intentional reference pose.

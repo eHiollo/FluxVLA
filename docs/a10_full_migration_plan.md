@@ -744,3 +744,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 验证结果：新增7项老夹爪VR用例；`python -m unittest discover -s test -p test_vr*.py` 共127项通过；
   `test_vr_legacy_gripper/test_vr_native_entry/test_vr_operator/test_vr_reference_runtime/test_gripper_operator`
   定向验证共69项通过（与VR全量有重叠）；真实控制参数的 `--preview` 和 `git diff --check` 通过。
+
+### 2026-10-26：显式配置 VR 前端角加速度
+
+- 将原提交 `1c73d85` 的角加速度配置迁入正确的 `kaanh_follower` 分支。
+- 在 `configs/a10/a10_vr_teleop.py` 的 `reference_options` 中显式设置
+  `max_angular_accel_rad_s2=1.5`，并注明单位及原算法默认值0.96，方便现场调整旋转加速、减速和换向响应。
+- 1.5为待实机验证的候选值；继承此项且未覆盖它的配置同步生效，命令行仍可覆盖。
+- 验证基础配置及老夹爪配置读取结果均为1.5，参数可构建ReferenceConfig；未连接机器人。

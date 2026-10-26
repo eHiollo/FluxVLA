@@ -20,3 +20,39 @@
  终端三：启动机器人控制
     python scripts/inference.py \
   --config configs/a10/a10_remote_inference.py
+
+
+双臂 VR（左右手独立输入；默认仅 VR，不连接机械臂）
+
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
+
+只检查配置：
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --preview
+
+左手侧键接管左臂，右手侧键接管右臂；松开仅对应臂减速保持。
+按住侧键时前扳机切换精调；双臂模式不启用夹爪或录制摇杆事件。
+实际连接双臂控制器的参数及映射确认见 docs/a10_vr_operator.md 的“双臂 VR”章节。
+
+单臂 VR（旧控制器 192.168.0.125 + 老 USB 夹爪）
+
+python scripts/teleoperate.py \
+  --config configs/a10/a10_vr_teleop_legacy_gripper.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.control_mode=reference \
+    teleop.cartesian_adapter=sdk_tool_cumulative \
+    teleop.pose_mapping=anchor_relative \
+    teleop.operator.host=192.168.0.125 \
+    teleop.operator.allow_motion=True \
+    teleop.operator.feedback_position_unit=mm \
+    teleop.input.network.host_ip=0.0.0.0 \
+    teleop.controller_speed_percent=50 \
+    teleop.reference_options.max_linear_speed_m_s=0.08 \
+    teleop.reference_options.max_angular_speed_rad_s=0.6 \
+    teleop.reference_options.max_reference_lead_m=0.03 \
+    teleop.reference_options.max_reference_lead_rad=0.30
+
+换模式：
+teleop.pose_mapping=calibrated_absolute/anchor_relative
+teleop.cartesian_adapter=legacy_anchor/sdk_tool_cumulative

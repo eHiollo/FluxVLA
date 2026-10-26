@@ -6,13 +6,14 @@ import json
 from pathlib import Path
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 import unittest
 from unittest.mock import patch
 
 from scripts.a10_control import main as control_main, parse_command, CommandError
-from test_a10_operator import FakeController
+from test_a10_operator import FakeController, DUAL_ARMS, dual_motion
 
 
 def main(argv=None, **kwargs):
@@ -503,6 +504,200 @@ class ConsoleTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(c.operators[0].command_timeout_s, 60.)
             self.assertEqual(c.operators[0].timeout_s, .15)
+
+
+class DualConsoleTest(unittest.TestCase):
+    def run_config(self, controller, commands, *, read_only=False, extra=()):
+        settings = dict(type='A10Operator', host='127.0.0.1',
+                        ws_port=controller.server.socket.getsockname()[1],
+                        status_ws_port=controller.server.socket.getsockname()[1],
+                        udp_port=controller.udp.getsockname()[1],
+                        joint_udp_port=controller.joint_udp.getsockname()[1],
+                        timeout_s=.3, allow_motion=not read_only,
+                        feedback_position_unit='mm', arms=DUAL_ARMS,
+                        cartesian_wire_format='pe321',
+                        cartesian_target_order=['left','right'])
+        output, lines = [], iter(commands)
+        def read(_):
+            try:
+                return next(lines)
+            except StopIteration:
+                raise EOFError
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'dual.py'
+            path.write_text('operator = ' + repr(settings))
+            args = ['--config', str(path)]
+            if read_only:
+                args.append('--read-only')
+            args.extend(extra)
+            result = main([*args, 'shell'], operator_factory=lambda **kw: controller.operator(**kw),
+                          input_fn=read, output=output.append)
+        return result, '\n'.join(output)
+
+    def test_jog_parser_units_bounds_and_session_only(self):
+        import math
+        args = parse_command(['jog','left','x','-1e-3','right','rz','1'])
+        self.assertEqual(args.deltas['left'], [-.000001,0,0,0,0,0])
+        self.assertEqual(args.deltas['right'][-1], math.radians(1))
+        for moves in (['left','x','nan'], ['left','x','11'], ['left','rx','6'],
+                      ['left','xx','1'], ['left','x','1','left','y','1'], ['left','x']):
+            with self.assertRaises(CommandError): parse_command(['jog',*moves])
+        with patch('socket.socket', side_effect=AssertionError('unexpected network')):
+            self.assertEqual(main(['--host','example','jog','left','x','1'], output=lambda _:None), 2)
+
+    def test_dual_jog_full_console_zero_hold_and_stop(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, ['follower_cart', 'jog left x 0 right x 0',
+                                                'stop_follower', 'exit'])
+            self.assertEqual(result, 0)
+            self.assertNotIn('操作未完成', output)
+            self.assertIn('连续 3 次落入容差', output)
+            packet = c.udp.recv(4096)
+            self.assertEqual(json.loads(packet[40:]), {'type':'321', 'pe':[[0]*6,[0]*6]})
+            self.assertEqual([x for x in c.commands if x!='get'], ['follower_cart','stop_follower'])
+
+    def test_dual_jog_readonly_cannot_start_or_send(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, ['jog left x 1','exit'], read_only=True)
+            self.assertEqual(result, 0)
+            self.assertIn('allow_motion is false', output)
+            self.assertEqual(set(c.commands), {'get'})
+            with self.assertRaises(socket.timeout): c.udp.recv(4096)
+
+    def test_allow_motion_explicitly_overrides_safe_config(self):
+        with FakeController() as c, tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'safe.py'
+            path.write_text("operator = dict(type='A10Operator', host='127.0.0.1', allow_motion=False)")
+            captured = []
+            def factory(**settings):
+                captured.append(settings)
+                return c.operator(**settings)
+            result = main(['--config',str(path),'--allow-motion','manual_en'],
+                          operator_factory=factory, output=lambda _:None)
+            self.assertEqual(result,0)
+            self.assertTrue(captured[0]['allow_motion'])
+
+    def test_readonly_config_without_status_port_uses_its_command_port(self):
+        with FakeController() as c, tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'single_ws.py'
+            port = c.server.socket.getsockname()[1]
+            path.write_text(f"operator = dict(type='A10Operator', host='127.0.0.1', ws_port={port})")
+            captured=[]
+            def factory(**settings):
+                captured.append(settings)
+                return c.operator(**settings)
+            result=main(['--config',str(path),'--read-only','get'],operator_factory=factory,output=lambda _:None)
+            self.assertEqual(result,0)
+            self.assertEqual(captured[0]['ws_port'],port)
+            self.assertEqual(set(c.commands),{'get'})
+
+    def test_dual_get_joints_global_lifecycle_and_incomplete_commands(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, [
+                'get','joints','follower_cart','pq 0 0 0 0 0 0 1',
+                'joints --deg 0 0 0 0 0 0','g_move --pos=10','follower_aj','exit'])
+            self.assertEqual(result, 0)
+            self.assertIn('left（ee_id=0）', output)
+            self.assertIn('right（ee_id=1）', output)
+            self.assertIn('整个双臂控制组', output)
+            self.assertIn('双臂模式拒绝', output)
+            self.assertNotIn('可复制为目标', output)
+            self.assertEqual([x for x in c.commands if x!='get'], ['follower_cart','stop_follower'])
+            for sock in (c.udp,c.joint_udp):
+                with self.assertRaises(TimeoutError):
+                    sock.recv(65535)
+
+    def test_readonly_config_queries_only_even_with_start_requested(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            result, output = self.run_config(c, ['get','follower_cart','manual_en','exit'], read_only=True)
+            self.assertEqual(result, 0)
+            self.assertIn('allow_motion is false', output)
+            self.assertEqual(set(c.commands), {'get'})
+
+    def test_single_controller_cannot_bootstrap_dual_config_or_send_start(self):
+        with FakeController() as c:
+            result, output = self.run_config(c, ['follower_cart','exit'])
+            self.assertEqual(result, 0)
+            self.assertIn('configured feedback group', output)
+            self.assertTrue(all(x=='get' for x in c.commands))
+
+    def test_bad_config_type_does_not_construct_or_connect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wrong.py'
+            path.write_text("operator = dict(type='OtherOperator', host='127.0.0.1')")
+            def never(**_):
+                self.fail('invalid operator type constructed')
+            output = []
+            result = main(['--config',str(path),'get'],operator_factory=never,output=output.append)
+            self.assertEqual(result,1)
+            self.assertIn('必须使用 A10Operator','\n'.join(output))
+
+
+class MergedConsoleCompatibilityTest(unittest.TestCase):
+    def capture(self, args, settings=None):
+        from unittest.mock import MagicMock
+        captured = []
+        with FakeController() as controller, tempfile.TemporaryDirectory() as directory:
+            if settings is not None:
+                path = Path(directory) / 'config.py'
+                path.write_text('operator = ' + repr(dict(type='A10Operator', **settings)))
+                args = ['--config', str(path), *args]
+            def factory(**options):
+                captured.append(options)
+                return controller.operator(allow_motion=options.get('allow_motion', False))
+            service = MagicMock()
+            with patch('fluxvla.engines.communication.a10_shared_server.ConsoleSharedControl',
+                       return_value=service) as constructor:
+                code = control_main([*args,'get'], operator_factory=factory, output=lambda _:None)
+            return code, captured, constructor, service
+
+    def test_legacy_no_config_keeps_shared_defaults(self):
+        code, captured, constructor, service = self.capture([])
+        self.assertEqual(code, 0)
+        self.assertEqual(captured[0]['host'], '192.168.0.125')
+        self.assertEqual(captured[0]['ws_port'], 5999)
+        self.assertEqual(captured[0]['shared_control']['role'], 'console')
+        constructor.assert_called_once()
+        service.start.assert_called_once()
+
+    def test_dual_config_defaults_direct_without_overwriting_endpoints(self):
+        code, captured, constructor, _ = self.capture([], dict(
+            host='192.168.0.150', ws_port=5867, status_ws_port=5867,
+            allow_motion=False, arms=DUAL_ARMS))
+        self.assertEqual(code, 0)
+        self.assertEqual(captured[0]['host'], '192.168.0.150')
+        self.assertEqual(captured[0]['ws_port'], 5867)
+        self.assertNotIn('shared_control', captured[0])
+        self.assertFalse(captured[0]['allow_motion'])
+        constructor.assert_not_called()
+
+    def test_explicit_overrides_win_and_direct_removes_config_shared(self):
+        code, captured, constructor, _ = self.capture(
+            ['--direct','--host','127.0.0.1','--ws-port','1234','--read-only'],
+            dict(host='example', ws_port=5867, status_ws_port=5888,
+                 shared_control=dict(port=9876), allow_motion=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(captured[0]['host'], '127.0.0.1')
+        self.assertEqual(captured[0]['ws_port'], 1234)
+        self.assertNotIn('shared_control', captured[0])
+        self.assertFalse(captured[0]['allow_motion'])
+        constructor.assert_not_called()
+
+    def test_shared_override_and_dual_shared_rejected_before_connection(self):
+        code, captured, constructor, _ = self.capture(['--shared-port','12345'],
+            dict(host='example', shared_control=dict(port=9876)))
+        self.assertEqual(code, 0)
+        self.assertEqual(captured[0]['shared_control']['port'], 12345)
+        self.assertEqual(constructor.call_args.args[0], ('127.0.0.1', 12345))
+        code, captured, constructor, _ = self.capture(['--shared'],
+            dict(host='example', arms=DUAL_ARMS))
+        self.assertEqual(code, 1)
+        self.assertEqual(captured, [])
+        constructor.assert_not_called()
 
 
 if __name__ == '__main__':

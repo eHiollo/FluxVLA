@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FluxVLA · 只读标定验证</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f1f5f9;color:#172033;font:16px system-ui,sans-serif}
+main{max-width:1150px;margin:auto;padding:20px}h1{font-size:25px;margin:0 0 10px}h2{font-size:18px;margin:0 0 12px}
+.card{background:white;border:1px solid #dbe3ed;border-radius:12px;padding:16px;margin:14px 0}
+.grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}.notice{background:#fff4d6;padding:12px;border-radius:8px}
+label{display:inline-block;margin:6px 12px 6px 0}button,select{font:inherit;padding:7px;border:1px solid #94a3b8;border-radius:6px;background:white}
+button{cursor:pointer;margin:5px 8px 5px 0}canvas{width:100%;height:370px;border:1px solid #e2e8f0;border-radius:8px;background:#fbfdff}
+.small{font-size:14px;color:#475569;line-height:1.6}.status{font-weight:bold;padding:10px;background:#e2e8f0;border-radius:7px}
+.bad{background:#fee2e2;color:#991b1b}.live{background:#dbeafe;color:#1e40af}.metric{padding:9px 0;border-bottom:1px solid #e2e8f0}
+.blue{color:#2563eb}.gray{color:#64748b}.orange{color:#b45309}pre{white-space:pre-wrap;word-break:break-all;font-size:13px}
+li{margin:12px 0}li select{margin-left:8px}a{color:#1d4ed8}@media(max-width:760px){.grid{grid-template-columns:1fr}}
+</style></head><body><main>
+<h1>只读标定验证</h1>
+<p>机械臂保持静止。这里只读取状态和计算目标，侧键仅用于记录平移锚点。</p>
+<div id="status" class="status">正在连接验证服务…</div>
+<div class="card notice">这张图展示<strong>现有标定实际算出的结果</strong>，不自动纠正或判定标定通过。
+射线和目标共用标定坐标系，二者重合也不能证明现场方向正确。请用现场固定方向和实际夹爪作独立参照。</div>
+<div class="card">
+<h2>先确认夹爪的物理方向</h2>
+<label>TCP 哪个轴指向夹爪前方？ <select id="forward"></select></label>
+<label>TCP 哪个轴指向夹爪上方？ <select id="up"></select></label>
+<label><input type="checkbox" id="confirmed">已现场核对这两个轴</label>
+<div id="axesNotice" class="small">默认 +Z 前方、+X 上方只是旧代码约定，尚未确认实际安装方向。改变选项仅改变显示，不修改标定。</div>
+</div>
+<div class="grid">
+<section class="card"><h2>朝向叠加比较（位置重合显示）</h2>
+<div><span class="gray">● 实际夹爪</span>　<span class="blue">● 目标夹爪</span>　<span class="orange">● 手柄射线映射方向</span></div>
+<canvas id="pose" aria-label="在机器人基坐标系内比较实际夹爪、目标夹爪和射线方向"></canvas>
+<label>观察方位 <input id="yaw" type="range" min="-180" max="180" value="35"></label>
+<label>观察仰角 <input id="pitch" type="range" min="-80" max="80" value="25"></label>
+<p class="small">滑块只改变看图角度。X/Y/Z 为机器人基坐标轴，并不直接代表屏幕的左右上下。</p>
+<h2>平移方向（毫米）</h2><canvas id="translation" style="height:220px" aria-label="相对本次平移锚点的目标位移"></canvas>
+<p class="small">按住侧键后平移手柄；松开再按下会重新记录锚点。箭头按当前位移自动缩放，数字是实际计算值。</p>
+</section>
+<aside class="card"><h2>当前数据</h2><div id="metrics">等待数据…</div>
+<button id="freeze">冻结画面</button><button id="export">导出检查报告</button>
+<div id="frozenNotice" class="small"></div>
+<p class="small">冻结期间继续接收连接状态，但图形保留冻结时的数据；报告同时注明冻结时间和当前连接状态。</p>
+<details><summary>标定与来源</summary><pre id="metadata"></pre></details>
+</aside></div>
+<section class="card"><h2>按顺序人工检查</h2>
+<p class="small">保持同一 VR 会话，用现场确定的方向判断。只有把手柄摆成实际夹爪的朝向时，灰色和蓝色才应重合。</p>
+<ol id="checks"></ol>
+<p class="notice small">这不是机械臂仿真，不检查逆运动学、关节速度、奇异点或停止性能；本页没有实机启动按钮。</p>
+</section>
+</main><script>
+'use strict';
+const $ = id => document.getElementById(id);
+const labels = ['+X','-X','+Y','-Y','+Z','-Z'];
+const vectors = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+for (const id of ['forward','up']) labels.forEach((name,i) => {
+  const option = document.createElement('option'); option.value=i; option.textContent=name; $(id).appendChild(option);
+});
+$('forward').value='4'; $('up').value='0';
+const evidence = [];
+const checkNames = [
+  '初始对应：射线和夹爪前方、上方都摆成一致，比较实际与目标姿态。',
+  '左右转向：手柄射线朝现场左/右转，目标夹爪应同向偏转。',
+  '上下转向：射线向上/下转，目标夹爪应同向抬起/压低。',
+  '翻转：射线方向基本不变，只拧转手柄，观察夹爪上方箭头。',
+  '平移：保持朝向，按住侧键沿已知基坐标轴移动；重新接管后位移应归零。'
+];
+checkNames.forEach((name,index) => {
+  const li=document.createElement('li'); li.append(document.createTextNode(name));
+  const select=document.createElement('select');
+  ['未验证','符合预期','不符合预期'].forEach(text=> { const option=document.createElement('option'); option.textContent=text; select.appendChild(option); });
+  select.onchange=()=>{
+    if(select.value==='未验证'){evidence[index]=null;return;}
+    const sample=frozen||latest;
+    if(!sample?.valid||(!frozen&&!fresh(latest))||!axesValid()){
+      select.value='未验证';evidence[index]=null;alert('请先取得有效样本并确认轴选项，再记录结果。');return;
+    }
+    evidence[index]={sample:JSON.parse(JSON.stringify(sample)),frozen:!!frozen,
+      recorded_at:new Date().toISOString(),metrics:selectedMetrics(sample)};
+  };
+  li.append(select); $('checks').append(li);
+});
+let latest=null, frozen=null, offline=true, lastSuccess=0, lastError='等待服务';
+const add=(a,b)=>a.map((v,i)=>v+b[i]);
+const mul=(a,s)=>a.map(v=>v*s);
+const dot=(a,b)=>a.reduce((sum,v,i)=>sum+v*b[i],0);
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const angle=(a,b)=>a&&b?Math.acos(Math.max(-1,Math.min(1,dot(a,b))))*180/Math.PI:null;
+function axis(axes, index){return mul(axes[Math.floor(index/2)],index%2?-1:1);}
+function axesValid(){return Math.floor(Number($('forward').value)/2)!==Math.floor(Number($('up').value)/2);}
+function fresh(data){return !!data?.valid && Date.now()-lastSuccess<700 && !offline;}
+function selectedMetrics(data){
+  if (!data?.valid || !axesValid()) return {};
+  const f=Number($('forward').value);
+  return {forward_error_deg:angle(axis(data.actual_axes,f),axis(data.target_axes,f)),
+    ray_target_error_deg:angle(data.ray_base,axis(data.target_axes,f)),rotation_error_deg:data.rotation_error_deg};
+}
+function projection(v, width, height, scale){
+  const yaw=Number($('yaw').value)*Math.PI/180, pitch=Number($('pitch').value)*Math.PI/180;
+  const horizontal=[-Math.sin(yaw),Math.cos(yaw),0];
+  const vertical=[-Math.sin(pitch)*Math.cos(yaw),-Math.sin(pitch)*Math.sin(yaw),Math.cos(pitch)];
+  return [width*.5+dot(v,horizontal)*scale,height*.54-dot(v,vertical)*scale];
+}
+function draw(id, data, translation=false){
+  const canvas=$(id), box=canvas.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+  canvas.width=Math.round(box.width*dpr);canvas.height=Math.round(box.height*dpr);
+  const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);const w=box.width,h=box.height,scale=Math.min(w,h)*.31;
+  ctx.font='14px system-ui';ctx.lineCap='round';
+  function line(a,b,color,width=2,label='',dashed=false){
+    const p=projection(a,w,h,scale),q=projection(b,w,h,scale);ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=width;
+    ctx.setLineDash(dashed?[4,4]:[]);ctx.beginPath();ctx.moveTo(...p);ctx.lineTo(...q);ctx.stroke();ctx.setLineDash([]);
+    if(label){const t=Math.atan2(q[1]-p[1],q[0]-p[0]);ctx.beginPath();ctx.moveTo(...q);ctx.lineTo(q[0]-9*Math.cos(t-.4),q[1]-9*Math.sin(t-.4));ctx.moveTo(...q);ctx.lineTo(q[0]-9*Math.cos(t+.4),q[1]-9*Math.sin(t+.4));ctx.stroke();ctx.fillText(label,q[0]+5,q[1]-5);}
+  }
+  [[1,0,0],[0,1,0],[0,0,1]].forEach((v,i)=>line([0,0,0],mul(v,1.3),['#b91c1c','#15803d','#7c3aed'][i],1,['基 X','基 Y','基 Z'][i],true));
+  if(!data?.valid||!axesValid()){ctx.fillStyle='#991b1b';ctx.fillText('等待有效数据 / 请检查轴选项',12,25);return;}
+  if(translation){
+    if(!data.translation_anchored){ctx.fillStyle='#475569';ctx.fillText('按住侧键记录平移锚点',12,25);return;}
+    const d=data.displacement_mm, length=Math.hypot(...d);
+    if(length>0.001)line([0,0,0],mul(d,1/Math.max(1,length)),'#2563eb',4,`${length.toFixed(1)} mm`);
+    return;
+  }
+  const f=Number($('forward').value),u=Number($('up').value);
+  function gripper(axes,color){
+    const forward=axis(axes,f),up=axis(axes,u),right=cross(forward,up),palm=mul(forward,-.25);
+    line(mul(forward,-.65),palm,color,7);
+    const a=add(palm,mul(right,.18)),b=add(palm,mul(right,-.18));line(a,b,color,6);
+    for(const p of [a,b])line(p,add(p,mul(forward,.6)),color,5);
+    line([0,0,0],mul(forward,1.03),color,3,'前');line([0,0,0],mul(up,.8),color,2,'上');
+  }
+  gripper(data.actual_axes,'#64748b');gripper(data.target_axes,'#2563eb');
+  if(data.ray_base)line([0,0,0],mul(data.ray_base,1.2),'#b45309',2,'射线');
+}
+function render(){
+  const data=frozen||latest, live=fresh(latest);
+  $('status').className='status '+(live?'live':'bad');
+  $('status').textContent=live?latest.status:(offline?`连接不可用：${lastError}`:(latest?.status||'等待数据'));
+  $('frozenNotice').textContent=frozen?`画面已冻结于 ${frozen.captured_at}，不是当前实时姿态。`:'';
+  $('axesNotice').textContent=!axesValid()?'前方和上方不能选同一根轴（正负也不可以）。':
+    ($('confirmed').checked?'轴选择由操作员现场确认；仍需完成下方方向检查。':'轴方向尚未现场确认：默认只是旧代码约定，不能据此判定标定通过。');
+  // Frozen samples are intentionally historical; otherwise clear stale graphics.
+  const display=frozen?data:(live?data:null);
+  draw('pose',display);draw('translation',display,true);
+  const m=selectedMetrics(display),fmt=x=>Number.isFinite(x)?`${x.toFixed(2)}°`:'—';
+  const rows=[['完整姿态差',fmt(m.rotation_error_deg)],['夹爪前方夹角',fmt(m.forward_error_deg)],
+    ['射线与目标前方夹角',fmt(m.ray_target_error_deg)],
+    ['平移 ΔX / ΔY / ΔZ',display?.translation_anchored?display.displacement_mm.map(x=>x.toFixed(1)).join(' / ')+' mm':'未建立锚点'],
+    ['射线数据',display?.ray_base?'已收到网页实际 raycaster 方向':'尚无：请确认手柄已追踪，必要时更新 VR 页面'],
+    ['数据状态',frozen?'历史冻结帧':(live?'实时':'不可用')]];
+  $('metrics').replaceChildren(...rows.map(([name,value])=>{const div=document.createElement('div');div.className='metric';div.textContent=`${name}：${value}`;return div;}));
+  $('metadata').textContent=JSON.stringify(data?.metadata||latest?.metadata||{},null,2);
+}
+async function poll(){
+  try{
+    const response=await fetch('/api/calibration-view',{cache:'no-store',signal:AbortSignal.timeout(2000)});
+    if(!response.ok)throw Error(`HTTP ${response.status}`);
+    latest=await response.json();lastSuccess=Date.now();offline=false;
+  }catch(error){offline=true;lastError=String(error);}
+  render();setTimeout(poll,100);
+}
+$('freeze').onclick=()=>{
+  if(frozen){frozen=null;$('freeze').textContent='冻结画面';}
+  else if(fresh(latest)){frozen=JSON.parse(JSON.stringify(latest));$('freeze').textContent='恢复实时';}
+  render();
+};
+$('export').onclick=()=>{
+  const sample=frozen||latest;
+  if(!sample?.valid||(!frozen&&!fresh(latest))){alert('没有可导出的有效样本，请等待数据或先冻结有效画面。');return;}
+  const report={kind:'vr_calibration_verification',schema_version:1,read_only:true,
+    exported_at:new Date().toISOString(),frozen:!!frozen,current_service_live:fresh(latest),
+    axes:{tool_forward:labels[$('forward').value],tool_up:labels[$('up').value],confirmed_by_operator:$('confirmed').checked},
+    checks:Array.from($('checks').querySelectorAll('select')).map((select,i)=>({item:checkNames[i],result:select.value,evidence:evidence[i]||null})),
+    metrics:selectedMetrics(sample),sample,
+    conclusion:'人工检查记录；非自动通过，不证明机械臂运动或停止安全'};
+  if(!axesValid()){alert('请先选择互相垂直的前方和上方轴。');return;}
+  const url=URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}));
+  const a=document.createElement('a');a.href=url;a.download=`vr_calibration_check_${Date.now()}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+for(const id of ['forward','up'])$(id).onchange=()=>{
+  $('confirmed').checked=false;evidence.length=0;
+  $('checks').querySelectorAll('select').forEach(select=>{select.value='未验证';});render();
+};
+for(const id of ['yaw','pitch','confirmed'])$(id).oninput=render;
+window.addEventListener('resize',render);
+setInterval(render,250);poll();
+</script></body></html>

@@ -21,6 +21,15 @@
 
 FluxVLA Engine是面向具身智能落地应用的全链路一体化工程平台，以统一配置、标准接口、模块解耦、可部署为核心设计理念，构建从数据到真机部署的完整工程闭环，并以“标准化产学研基座”为目标，显著降低 VLA 研究与开发的工程门槛。
 
+## 工程结构入门
+
+第一次参与开发，可以先读 [项目结构入门说明](docs/project_structure_guide.md)：用通俗语言介绍目录职责，并串起 A10 的 VR、推理和训练流程。
+
+本机 A10 工程已于 2026-10-26 将 VR/双臂开发合入 `kaanh_follower`，统一从 `/home/robot/VLA/FluxVLA` 运行；入口见 [A10 命令速查](docs/a10_command_cheatsheet.md)。
+
+
+公司内部技术分享可参考 [A10 工程实现分享底稿](docs/a10_engineering_share_brief.md)，包含架构、流程、已完成工作和后续规划。
+
 ## 真机演示
 
 <p align="center">

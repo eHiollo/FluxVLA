@@ -14,7 +14,7 @@ class VREventHandler:
       - right  -> exit current episode early
       - left   -> re-record episode
       - down   -> stop recording
-      - up     -> A10 vr_vel reset / home
+      - up     -> reset request (semantics depend on the robot backend)
     """
 
     def __init__(self, vr_monitor, threshold: float = 0.7):
@@ -69,5 +69,5 @@ class VREventHandler:
     def print_control_guide(self) -> None:
         logger.info(
             "VR recording controls (left thumbstick): "
-            "right=next episode / start recording, left=re-record, down=stop, up=reset arm"
+            "right=next episode / start recording, left=re-record, down=stop, up=reset request"
         )

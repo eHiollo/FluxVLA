@@ -1,17 +1,9 @@
-"""Native FluxVLA VR entrypoint."""
-
-import argparse
-from .training import _project
-from .session import run_session
+"""Retired project entrypoint; use the native config-driven teleoperation script."""
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--vr-only', action='store_true')
-    args = parser.parse_args()
-    run_session(_project(), vr_only=args.vr_only)
-    return 0
+    raise SystemExit('VR 入口已迁移：python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py')
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    main()

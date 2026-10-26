@@ -1,14 +1,17 @@
 """A10 reference protocol tests. All endpoints are loopback or in-memory."""
 
 import json
+import math
 import socket
 import threading
 import time
 import struct
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from fluxvla.engines import build_operator_from_cfg
 from fluxvla.engines.operators.a10_operator import (
@@ -163,6 +166,9 @@ class FakeController:
         self.coordinate = 'Tool'
         self.motion = 'Stopped'
         self.op_mode = 'Manual'
+        self.jog_vel, self.pgm_vel = 10, 50
+        self.speed_change = True
+        self.reject_speed = False
         self.activation = 'Enabled'
         self.activation_change = True
         self.reject_enable = False
@@ -171,6 +177,7 @@ class FakeController:
         self.active_after_rejection = False
         self.recovery_fault = None
         self.get_reply_delay_s = 0.
+        self.motion_override = None
         self.lock = threading.Lock()
 
     def __enter__(self):
@@ -241,12 +248,16 @@ class FakeController:
                     reply['ret_context']['robot_msg']['motion'] = self.motion
                     reply['ret_context']['robot_msg']['op_mode'] = self.op_mode
                     reply['ret_context']['robot_msg']['activate'] = self.activation
+                    reply['ret_context']['motion_msg']['jog_vel'] = self.jog_vel
+                    reply['ret_context']['program_msg'] = {'vel': self.pgm_vel}
                     if not self.actual:
                         del reply['ret_context']['motion_msg']['actual_pos']
                     if not self.tcp:
                         del reply['ret_context']['motion_msg']['pq']
                     if self.driver_fault:
                         reply['ret_context']['driver_msg']['driver_err_code'][0] = 8
+                    if self.motion_override is not None:
+                        reply['ret_context']['motion_msg'].update(self.motion_override)
                     reply['ret_context']['test_gripper'] = {'actual_mm': 42.5}
                     reply['ret_context'] = json.dumps(reply['ret_context'])
                     if self.fault == 'timeout':
@@ -269,6 +280,17 @@ class FakeController:
                         continue
                     time.sleep(self.get_reply_delay_s)
                     ws.send(frame)
+                elif command.startswith(('set_jog_vel --vel_percent=', 'set_pgm_vel --vel_percent=')):
+                    value = float(command.split('=')[1])
+                    if self.reject_speed:
+                        ws.send(wire_reply({'ret_code': 9, 'ret_msg': 'speed denied', 'ret_context': ''}))
+                    else:
+                        if self.speed_change:
+                            if command.startswith('set_jog_vel'):
+                                self.jog_vel = value
+                            else:
+                                self.pgm_vel = value
+                        ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                 elif command in ('follower_cart', 'follower_aj', 'stop_follower'):
                     if command != 'stop_follower' and self.start_rejected:
                         self.active = self.active_after_rejection
@@ -318,6 +340,57 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_pe321_preserves_signed_angles_against_native_sdk_samples(self):
+        fixture = json.loads((Path(__file__).parent / 'data/vr_control/kaanh_cartesian_wire.json').read_text())
+        # Native SDK pq -> pe changes -0.01 degrees into +359.99 degrees.
+        self.assertGreater(fixture['cases'][0]['sdk_pq_to_pe321'][3], 6.)
+        with FakeController() as controller:
+            operator = controller.operator(cartesian_wire_format='pe321')
+            operator.start_follower()
+            for case in fixture['cases']:
+                operator.send_eepose({'right': case['pose']})
+                packet = controller.udp.recv(4096)
+                self.assertEqual(packet[4:40], bytes(36))
+                self.assertEqual(int.from_bytes(packet[:4], 'little'), len(packet) - 40)
+                payload = json.loads(packet[40:])
+                self.assertEqual(set(payload), {'type', 'pe'})
+                self.assertEqual(payload['type'], '321')
+                np.testing.assert_allclose(payload['pe'][0], case['signed_pe321'], atol=1e-14)
+                self.assertLess(case['sdk_matrix_max_error'], 1e-12)
+            operator.stop_follower()
+
+    def test_pe321_unwraps_pi_and_resets_on_new_follower_start(self):
+        with FakeController() as controller:
+            operator = controller.operator(cartesian_wire_format='pe321')
+            operator.start_follower()
+            for yaw in (60., 120., 179., -179.):
+                pose = [0., 0., 0., *Rotation.from_euler('Z', yaw, degrees=True).as_quat()]
+                operator.send_eepose({'right': pose})
+                payload = json.loads(controller.udp.recv(4096)[40:])
+            self.assertAlmostEqual(np.rad2deg(payload['pe'][0][3]), 181.)
+            operator.stop_follower()
+            operator.start_follower()
+            operator.send_eepose({'right': [0., 0., 0., 0., 0., 0., 1.]})
+            np.testing.assert_allclose(json.loads(controller.udp.recv(4096)[40:])['pe'], [[0.] * 6])
+            operator.stop_follower()
+
+    def test_pe321_rejects_singular_or_large_euler_jumps_before_udp(self):
+        with FakeController() as controller:
+            operator = controller.operator(cartesian_wire_format='pe321')
+            operator.start_follower()
+            for angles, error in (([0., 90., 0.], UserWarning), ([100., 0., 0.], ValueError)):
+                pose = [0., 0., 0., *Rotation.from_euler('ZYX', angles, degrees=True).as_quat()]
+                with self.assertRaises(error):
+                    operator.send_eepose({'right': pose})
+                with self.assertRaises(socket.timeout):
+                    controller.udp.recv(4096)
+            np.testing.assert_array_equal(operator._cartesian_euler, np.zeros(3))
+            operator.stop_follower()
+
+    def test_invalid_cartesian_wire_format_rejected_without_connecting(self):
+        with self.assertRaisesRegex(ValueError, 'cartesian_wire_format'):
+            A10Operator(host='127.0.0.1', cartesian_wire_format='guess')
+
     def test_joint_roundtrip_wire_degrees_and_separate_ports(self):
         with FakeController() as controller:
             controller.coordinate = 'Axis'
@@ -779,6 +852,316 @@ class NetworkTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 operator.send_eepose({'right': [0, 0, 0, 0, 0, 0, 1]})
             self.assertNotIn('stop_follower', controller.commands)
+
+
+DUAL_ARMS = {
+    'left': dict(ee_id=0, joint_group=0, tcp_index=0),
+    'right': dict(ee_id=1, joint_group=1, tcp_index=1),
+}
+
+
+def dual_motion():
+    return dict(actual_pos=[[0, 10, 20, 30, 40, 50], [60, 70, 80, 90, 100, 110]],
+                motor_pos=[[1, 11, 21, 31, 41, 51], [61, 71, 81, 91, 101, 111]],
+                pq=[[100, 200, 300, 0, 0, 0, 1], [400, 500, 600, 0, 0, 0, 1]])
+
+
+class DualSDKConsoleTest(unittest.TestCase):
+    def robot(self, controller, **extra):
+        controller.motion_override = dual_motion()
+        return controller.operator(arms=DUAL_ARMS, cartesian_target_order=['left', 'right'],
+                                   cartesian_wire_format='pe321', feedback_position_unit='mm', **extra)
+
+    def start(self, controller):
+        robot = self.robot(controller)
+        robot.start_follower()
+        poses = {name: arm.tcp_pq_m.copy() for name, arm in robot.get_state().arms.items()}
+        robot.begin_sdk_tool_trajectory(poses)
+        return robot, poses
+
+    def test_rows_order_hold_continuity_and_fresh_restart(self):
+        with FakeController() as c:
+            robot, poses = self.start(c)
+            limits = dict(max_position_step_m=.001, max_rotation_step_rad=.01)
+            robot.send_sdk_tool_pose(dict(reversed(list(poses.items()))), **limits)
+            np.testing.assert_allclose(json.loads(c.udp.recv(4096)[40:])['pe'], np.zeros((2, 6)))
+            poses['left'][0] += .0005
+            robot.send_sdk_tool_pose(poses, **limits)
+            first = json.loads(c.udp.recv(4096)[40:])['pe']
+            np.testing.assert_allclose(first, [[.0005,0,0,0,0,0], [0]*6])
+            poses['right'][2] -= .0005
+            robot.send_sdk_tool_pose(poses, **limits)
+            np.testing.assert_allclose(json.loads(c.udp.recv(4096)[40:])['pe'],
+                                       [[.0005,0,0,0,0,0], [0,0,-.0005,0,0,0]])
+            with self.assertRaises(RuntimeError):
+                robot.send_eepose(poses)
+            robot.stop_follower(); robot.start_follower()
+            robot.begin_sdk_tool_trajectory(poses)
+            robot.send_sdk_tool_pose(poses, **limits)
+            np.testing.assert_allclose(json.loads(c.udp.recv(4096)[40:])['pe'], np.zeros((2, 6)))
+            robot.stop_follower()
+
+    def test_invalid_second_row_and_send_failure_are_transactional(self):
+        with FakeController() as c:
+            robot, poses = self.start(c)
+            adapters = robot._sdk_tool_adapters
+            poses['left'][0] += .0005
+            poses['right'][0] += 1
+            limits = dict(max_position_step_m=.001, max_rotation_step_rad=.01)
+            with self.assertRaises(ValueError): robot.send_sdk_tool_pose(poses, **limits)
+            with self.assertRaises(ValueError): robot.send_sdk_tool_pose({'left': poses['left']}, **limits)
+            for adapter in adapters.values(): np.testing.assert_array_equal(adapter.cumulative_pe, np.zeros(6))
+            with self.assertRaises(socket.timeout): c.udp.recv(4096)
+            poses['right'] = adapters['right'].previous_pose.copy()
+            with patch.object(robot, '_send_follower_target', side_effect=OSError('send lost')):
+                with self.assertRaises(OSError): robot.send_sdk_tool_pose(poses, **limits)
+            self.assertIsNone(robot._sdk_tool_adapters)
+            for adapter in adapters.values(): np.testing.assert_array_equal(adapter.cumulative_pe, np.zeros(6))
+            with self.assertRaises(RuntimeError): robot.send_sdk_tool_pose(poses, **limits)
+            robot.get_state()
+            with self.assertRaises(RuntimeError): robot.begin_sdk_tool_trajectory(poses)
+            robot.stop_follower()
+
+    def test_dual_stop_requires_inactive_and_stopped_feedback(self):
+        with FakeController() as c:
+            robot = self.robot(c, timeout_s=.05)
+            robot.start_follower()
+            c.motion = 'Moving'
+            with self.assertRaises(TimeoutError): robot.stop_follower()
+            self.assertTrue(robot.follower_stop_pending)
+            c.motion = 'Stopped'
+            robot.stop_follower()
+            self.assertFalse(robot.follower_stop_pending)
+
+    def test_bounded_jog_uses_tool_axes_holds_other_arm_and_accumulates(self):
+        with FakeController() as c:
+            robot = self.robot(c)
+            c.motion_override['pq'][0][3:] = Rotation.from_euler('z', 90, degrees=True).as_quat().tolist()
+            robot.start_follower()
+            packets, previous = [], np.zeros((2, 6))
+            send = robot._send_follower_target
+            def execute(packet, mode):
+                nonlocal previous
+                send(packet, mode)
+                wire = c.udp.recv(4096)
+                self.assertEqual(wire[:40], struct.pack('<IIQqqq', len(wire)-40, 0,0,0,0,0))
+                rows = np.array(json.loads(wire[40:])['pe'])
+                packets.append(rows)
+                # Independent ideal Tool follower: integrate packet differences.
+                for i, delta in enumerate(rows - previous):
+                    pose = c.motion_override['pq'][i]
+                    rotation = Rotation.from_quat(pose[3:])
+                    xyz = np.array(pose[:3]) + rotation.apply(delta[:3]) * 1000
+                    quat = (rotation * Rotation.from_euler('ZYX', delta[3:])).as_quat()
+                    c.motion_override['pq'][i] = np.r_[xyz, quat].tolist()
+                previous = rows
+            with patch.object(robot, '_send_follower_target', side_effect=execute):
+                state = robot.jog_tool({'left': [.003,0,0,0,0,0]})
+                np.testing.assert_allclose(state.arms['left'].tcp_pq_m[:3], [.1,.203,.3], atol=1e-8)
+                np.testing.assert_allclose(state.arms['right'].tcp_pq_m[:3], [.4,.5,.6])
+                robot.jog_tool({'left': [-.003,0,0,0,0,0], 'right': [0,0,.002,0,0,0]})
+                np.testing.assert_allclose(packets[-1], [[0]*6,[0,0,.002,0,0,0]], atol=1e-10)
+                robot.jog_tool({'right': [0,0,0,0,0,math.radians(1)]})
+                np.testing.assert_allclose(packets[-1][1], [0,0,.002,math.radians(1),0,0], atol=1e-10)
+            self.assertTrue(c.active)
+            robot.stop_follower()
+
+    def test_jog_limits_readonly_and_unstarted_have_no_targets(self):
+        with FakeController() as c:
+            robot = self.robot(c)
+            for delta in ({'left':[.011,0,0,0,0,0]}, {'missing':[0]*6}, {'left':[float('nan')]*6}):
+                with self.assertRaises(ValueError): robot.jog_tool(delta)
+            with self.assertRaises(RuntimeError): robot.jog_tool({'left':[.001,0,0,0,0,0]})
+            robot.allow_motion = False
+            with self.assertRaises(PermissionError): robot.jog_tool({'left':[.001,0,0,0,0,0]})
+            self.assertTrue(all(x == 'get' for x in c.commands))
+            with self.assertRaises(socket.timeout): c.udp.recv(4096)
+
+    def test_jog_fault_interrupt_and_no_arrival_request_stop(self):
+        for fault in ('fault', 'interrupt', 'no_arrival'):
+            with self.subTest(fault=fault), FakeController() as c:
+                robot = self.robot(c); robot.start_follower()
+                send = robot._send_follower_target
+                def execute(packet, mode):
+                    send(packet, mode)
+                    c.udp.recv(4096)
+                    if fault == 'fault': c.driver_fault = True
+                    if fault == 'interrupt': raise KeyboardInterrupt
+                expected = KeyboardInterrupt if fault == 'interrupt' else (TimeoutError if fault == 'no_arrival' else RuntimeError)
+                with patch.object(robot, '_send_follower_target', side_effect=execute):
+                    with self.assertRaises(expected): robot.jog_tool({'left':[.003,0,0,0,0,0]})
+                self.assertIn('stop_follower', c.commands)
+                self.assertFalse(c.active)
+                self.assertIsNone(robot._sdk_tool_adapters)
+
+
+class DualArmTest(unittest.TestCase):
+    def settings(self, **extra):
+        return dict(arms=DUAL_ARMS, cartesian_target_order=['left', 'right'],
+                    feedback_position_unit='mm', **extra)
+
+    def test_config_validation_before_network(self):
+        import copy
+        for field in ('ee_id', 'tcp_index', 'joint_group'):
+            bad = copy.deepcopy(DUAL_ARMS)
+            bad['right'][field] = 0
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                A10Operator('127.0.0.1', arms=bad, cartesian_target_order=['left', 'right'])
+        for order in (None, ['left'], ['left', 'left'], ['left', 'unknown']):
+            with self.subTest(order=order), self.assertRaises(ValueError):
+                A10Operator('127.0.0.1', arms=DUAL_ARMS, cartesian_target_order=order)
+        for spec in (dict(ee_id=True, joint_group=0, tcp_index=0),
+                     dict(ee_id=0, joint_group=-1, tcp_index=0),
+                     dict(ee_id=0, joint_group=0, tcp_index=0, joint_indices=[0]*6),
+                     dict(ee_id=0, joint_group=0),
+                     dict(ee_id=0, joint_group=0, tcp_index=0, host='other-controller')):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                A10Operator('127.0.0.1', arms={'left': spec})
+        with self.assertRaises(NotImplementedError):
+            A10Operator('127.0.0.1', **self.settings(command_mode='joint'))
+        with self.assertRaises(NotImplementedError):
+            A10Operator('127.0.0.1', **self.settings(gripper_transport='usb', gripper={'port': '/never/open'}))
+
+    def test_feedback_named_models_units_and_aux_tcp(self):
+        reply = status_reply()
+        reply['ret_context']['motion_msg'].update(dual_motion())
+        # Explicit mappings distinguish two robot TCPs from an auxiliary entry.
+        reply['ret_context']['motion_msg']['pq'].append([0, 0, 0, 0, 0, 0, 1])
+        state = parse(reply, arms=DUAL_ARMS, position_unit='mm')
+        self.assertIsNone(state.actual_joints_rad)
+        self.assertIsNone(state.tcp_pq_m)
+        self.assertIsNone(state.qpos)
+        self.assertIs(state.raw, reply)
+        np.testing.assert_allclose(state.arms['right'].actual_joints_rad, np.deg2rad([60,70,80,90,100,110]))
+        np.testing.assert_allclose(state.arms['left'].tcp_pq_m[:3], [.1,.2,.3])
+        np.testing.assert_allclose(state.arms['right'].tcp_pq_m[:3], [.4,.5,.6])
+        self.assertEqual(state.arms['left'].received_monotonic_s, state.received_monotonic_s)
+        self.assertEqual(state.arms['right'].received_monotonic_s, state.received_monotonic_s)
+        with self.assertRaises(TypeError):
+            state.arms['left'] = state.arms['right']
+
+    def test_flat_joint_feedback_explicit_slices_and_single_named_compatibility(self):
+        reply = status_reply()
+        reply['ret_context']['motion_msg'].update(dual_motion())
+        motion = reply['ret_context']['motion_msg']
+        motion['actual_pos'] = [motion['actual_pos'][0] + motion['actual_pos'][1]]
+        motion['motor_pos'] = [motion['motor_pos'][0] + motion['motor_pos'][1]]
+        arms = {'left': dict(ee_id=0, joint_group=0, tcp_index=0, joint_indices=list(range(6))),
+                'right': dict(ee_id=1, joint_group=0, tcp_index=1, joint_indices=list(range(6,12)))}
+        state = parse(reply, arms=arms, position_unit='mm')
+        self.assertAlmostEqual(state.arms['right'].actual_joints_rad[0], np.pi/3)
+        selected = parse(reply, arms={'tool': arms['right']}, position_unit='mm')
+        np.testing.assert_array_equal(selected.actual_joints_rad, state.arms['right'].actual_joints_rad)
+        self.assertEqual(tuple(selected.arms), ('tool',))
+
+    def test_one_session_whole_packet_order_and_single_stop(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings())
+            op.start_follower()
+            # Explicit row order must win over both dictionary insertion orders.
+            targets = {'right': [.04,.05,.06,0,0,0,1], 'left': [.01,.02,.03,0,0,0,1]}
+            op.send_eepose(targets)
+            packet = c.udp.recv(65535)
+            self.assertEqual(int.from_bytes(packet[:4], 'little'), len(packet)-40)
+            self.assertEqual(packet[4:40], bytes(36))
+            self.assertEqual(json.loads(packet[40:]), {'type':'pq', 'pq':[targets['left'],targets['right']]})
+            with self.assertRaises(TimeoutError):
+                c.udp.recv(65535)
+            frame = op.get_frame()
+            self.assertEqual(set(frame['arms']), {'left', 'right'})
+            self.assertIsNone(frame['qpos'])
+            self.assertEqual(op.capabilities, frozenset({'relative_cartesian_follower'}))
+            op.stop_follower()
+            self.assertEqual([x for x in c.commands if x != 'get'], ['follower_cart','stop_follower'])
+
+    def test_per_arm_euler_encoding_and_atomic_validation(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings(cartesian_wire_format='pe321'))
+            op.start_follower()
+            left = [0,0,0,*Rotation.from_euler('z', -.2).as_quat()]
+            right = [0,0,0,*Rotation.from_euler('x', .3).as_quat()]
+            op.send_eepose({'left': left, 'right': right})
+            payload = json.loads(c.udp.recv(65535)[40:])
+            np.testing.assert_allclose(payload['pe'][0][3:], [-.2,0,0], atol=1e-12)
+            np.testing.assert_allclose(payload['pe'][1][3:], [0,0,.3], atol=1e-12)
+            previous = {k:v.copy() for k,v in op._cartesian_eulers.items()}
+            for targets in ({'left':left}, {'left':left,'unknown':right},
+                            {'left':left,'right':[0]*7},
+                            {'left':[0,0,0,*Rotation.from_euler('z', -.3).as_quat()],
+                             'right':[0,0,0,*Rotation.from_euler('z', 2.5).as_quat()]}):
+                with self.assertRaises(ValueError):
+                    op.send_eepose(targets)
+                for name in previous:
+                    np.testing.assert_array_equal(previous[name], op._cartesian_eulers[name])
+            with self.assertRaises(TimeoutError):
+                c.udp.recv(65535)
+            op.stop_follower()
+
+    def test_feedback_mismatch_refused_before_follower_start(self):
+        for override in (None, dict(dual_motion(), pq=[[0,0,0,0,0,0,1]]),
+                         dict(dual_motion(), actual_pos=None)):
+            with self.subTest(override=override), FakeController() as c:
+                c.motion_override = override
+                op = c.operator(**self.settings())
+                with self.assertRaises(A10ProtocolError):
+                    op.start_follower()
+                self.assertTrue(all(x == 'get' for x in c.commands))
+                with self.assertRaises(TimeoutError):
+                    c.udp.recv(65535)
+
+    def test_unsupported_operations_have_no_network_side_effects(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings())
+            for method, args in ((op.start_follower, ('joint',)),
+                                 (op.send_joints, ({'left':[0]*6,'right':[0]*6},)),
+                                 (op.execute_trajectory, ({'left':[[0]*6],'right':[[0]*6]},)),
+                                 (op.send_gripper, ({'left':0,'right':0},))):
+                with self.assertRaises(NotImplementedError):
+                    method(*args)
+            self.assertEqual(c.commands, [])
+            with self.assertRaises(TimeoutError):
+                c.joint_udp.recv(4096)
+
+    def test_background_monitor_uses_same_explicit_mapping(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            op = c.operator(**self.settings(status_poll_interval_s=.01,
+                                            status_ws_port=c.server.socket.getsockname()[1]))
+            self.assertEqual(set(op.get_frame()['arms']), {'left','right'})
+            self.assertEqual(set(op._recent_state().arms), {'left','right'})
+            self.assertTrue(all(x == 'get' for x in c.commands))
+
+    def test_explicit_row_order_and_mapping_do_not_depend_on_ids_or_names(self):
+        with FakeController() as c:
+            c.motion_override = dual_motion()
+            settings = self.settings()
+            settings['cartesian_target_order'] = ['right', 'left']
+            op = c.operator(**settings)
+            op.start_follower()
+            left, right = [.01,0,0,0,0,0,1], [.02,0,0,0,0,0,1]
+            op.send_eepose({'left':left,'right':right})
+            self.assertEqual(json.loads(c.udp.recv(65535)[40:])['pq'], [right,left])
+            op.stop_follower()
+
+    def test_observed_global_fault_or_missing_model_revokes_target_permission(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing), FakeController() as c:
+                c.motion_override = dual_motion()
+                op = c.operator(**self.settings())
+                op.start_follower()
+                if missing:
+                    c.motion_override['actual_pos'] = None
+                else:
+                    c.driver_fault = True
+                op.get_state()
+                with self.assertRaises(RuntimeError):
+                    op.send_eepose({'left':[0,0,0,0,0,0,1],'right':[0,0,0,0,0,0,1]})
+                with self.assertRaises(TimeoutError):
+                    c.udp.recv(65535)
+                op.stop_follower()
 
 
 if __name__ == '__main__':

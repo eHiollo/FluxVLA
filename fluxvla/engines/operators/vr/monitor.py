@@ -6,6 +6,7 @@ Bridge to XLeVR's VRMonitor with a configurable project path.
 from __future__ import annotations
 
 import asyncio
+import copy
 import http.server
 import logging
 import os
@@ -78,8 +79,20 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == '/vr-config.js':
-            content = f'window.FLUXVLA_WS_PORT={int(self.server.config.websocket_port)};'.encode()
+        view = getattr(self.server, 'calibration_view', None)
+        if self.path == '/api/calibration-view' and view is not None:
+            import json
+            content = json.dumps(view.snapshot(), ensure_ascii=False, allow_nan=False).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(content)
+        elif self.path == '/calibration.html' and view is not None:
+            self.serve_file('web-ui/calibration.html', 'text/html; charset=utf-8')
+        elif self.path == '/vr-config.js':
+            content = (f'window.FLUXVLA_WS_PORT={int(self.server.config.websocket_port)};'
+                       f'window.FLUXVLA_VERIFY_ONLY={str(view is not None).lower()};').encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/javascript')
             self.end_headers()
@@ -123,7 +136,7 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
                     content = file_obj.read()
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
-                if content_type in ("text/html", "application/javascript", "text/css"):
+                if content_type.startswith(("text/html", "application/javascript", "text/css")):
                     self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(content)
@@ -140,11 +153,13 @@ class SimpleHTTPSServer:
         self.httpd = None
         self.server_thread = None
         self.web_root_path = web_root_path
+        self.calibration_view = None
 
     async def start(self):
         self.httpd = ReuseHTTPServer((self.config.host_ip, self.config.https_port), SimpleAPIHandler)
         self.httpd.web_root_path = self.web_root_path
         self.httpd.config = self.config
+        self.httpd.calibration_view = self.calibration_view
 
         if not self.config.ensure_ssl_certificates():
             raise RuntimeError("Cannot create VR TLS certificate")
@@ -273,7 +288,8 @@ class VRMonitorBridge:
             goal.metadata = metadata
 
             if goal.arm == "left":
-                self.left_goal = goal
+                self.left_goal = self._merge_goal(self.left_goal, goal)
+                goal = self.left_goal
             elif goal.arm == "right":
                 self.right_goal = self._merge_goal(self.right_goal, goal)
                 goal = self.right_goal
@@ -303,12 +319,16 @@ class VRMonitorBridge:
         if not cur_meta.get("reset_target_to_current"):
             merged_meta.pop("reset_target_to_current", None)
 
-        if not cur_meta.get("buttons") and prev_meta.get("buttons"):
+        if "buttons" not in cur_meta and prev_meta.get("buttons"):
             merged_meta["buttons"] = prev_meta["buttons"]
         if "trigger" not in cur_meta and "trigger" in prev_meta:
             merged_meta["trigger"] = prev_meta["trigger"]
         if "grip_active" not in cur_meta and "grip_active" in prev_meta:
             merged_meta["grip_active"] = prev_meta["grip_active"]
+        elif "grip_active" in cur_meta:
+            # An explicit release must override a cached squeeze button too.
+            merged_meta['buttons'] = dict(merged_meta.get('buttons') or {})
+            merged_meta['buttons']['squeeze'] = bool(cur_meta['grip_active'])
         current.metadata = merged_meta
         return current
 
@@ -328,6 +348,11 @@ class VRMonitorBridge:
                 "has_right": self.right_goal is not None,
                 "has_headset": self.headset_goal is not None,
             }
+
+    def get_hand_snapshot(self):
+        """Copy both latest hands under one lock; timestamps remain per hand."""
+        with self._goal_lock:
+            return copy.deepcopy({'left': self.left_goal, 'right': self.right_goal})
 
     def get_status(self) -> dict[str, Any]:
         """Return VR server / client connectivity snapshot."""

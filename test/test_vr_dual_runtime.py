@@ -26,8 +26,12 @@ ROOT = Path(__file__).resolve().parents[1]
 IDENTITY = np.array([0., 0., 0., 0., 0., 0., 1.])
 
 
-def configuration():
-    return Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
+def configuration(*, identity_bindings=False):
+    cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
+    if identity_bindings:
+        # Lifecycle fixtures name arms after their hands; site mapping is tested separately.
+        cfg.input.hand_to_arm = dict(left='left', right='right')
+    return cfg
 
 
 def hand(seq, pressed=False, x=0., angle=0., age=0., trigger=0.):
@@ -198,7 +202,7 @@ class DualInputTest(unittest.TestCase):
         for override in ('bindings', 'mode', 'mapping', 'topology', 'acceleration'):
             cfg = configuration()
             if override == 'bindings':
-                cfg.input.hand_to_arm.right = 'left'
+                cfg.input.hand_to_arm.right = cfg.input.hand_to_arm.left
             elif override == 'mode':
                 cfg.control_mode = 'delta'
             elif override == 'mapping':
@@ -222,7 +226,7 @@ class DualRuntimeTest(unittest.TestCase):
         self.clock_patch = patch('time.monotonic', self.clock.now)
         self.clock_patch.start()
         self.addCleanup(self.clock_patch.stop)
-        cfg = configuration()
+        cfg = configuration(identity_bindings=True)
         self.vr = VROperator(**{k: v for k, v in cfg.input.items() if k != 'type'})
         self.vr.input = HandInput()
         self.robot = self.robot_type()
@@ -427,6 +431,36 @@ class DualSDKRuntimeTest(DualRuntimeTest):
         self.assertEqual(runtime.reference_control.config.max_angular_accel_rad_s2, .96)
         self.assertEqual(runtime.reference_control.config.max_reference_lead_rad, .12)
 
+    def test_site_binding_routes_hands_to_expected_ids_and_releases_independently(self):
+        self.runtime.close()
+        cfg = configuration()
+        self.vr = VROperator(**{k: v for k, v in cfg.input.items() if k != 'type'})
+        self.vr.input = HandInput()
+        self.robot = DualSDKRobot()
+        self.runtime = DualVRTeleopRuntime(self.vr, self.robot, execute=True,
+            control_mode='reference', cartesian_adapter=self.cartesian_adapter,
+            max_position_step_m=.005, max_rotation_step_rad=.015)
+        self.runtime.connect()
+        self.addCleanup(self.runtime.close)
+        left_hand_arm = self.vr.hand_to_arm['left']
+        right_hand_arm = self.vr.hand_to_arm['right']
+        self.assertEqual(cfg.operator.arms[left_hand_arm].ee_id, 1)
+        self.assertEqual(cfg.operator.arms[right_hand_arm].ee_id, 0)
+        self.assertEqual(cfg.operator.cartesian_target_order, ['left', 'right'])
+        initial = copy.deepcopy(self.robot.poses)
+        self.move(left=True, right=False)
+        self.assertGreater(np.linalg.norm(self.robot.poses[left_hand_arm][:3]
+                                         - initial[left_hand_arm][:3]), .001)
+        np.testing.assert_allclose(self.robot.poses[right_hand_arm], initial[right_hand_arm])
+        for i in range(40):
+            self.tick(left=False, right=True, xright=.0003 * i)
+        self.assertEqual(self.runtime._arms[left_hand_arm]['state'], 'holding')
+        self.assertEqual(self.runtime._arms[right_hand_arm]['state'], 'tracking')
+        self.assertGreater(np.linalg.norm(self.robot.poses[right_hand_arm][:3]
+                                         - initial[right_hand_arm][:3]), .001)
+        self.assertEqual(self.robot.events.count('start'), 1)
+        self.assertNotIn('stop', self.robot.events)
+
     def test_sdk_initializes_once_and_reclutch_never_resets_other_arm(self):
         self.test_late_engagement_and_reclutch_preserve_other_and_startup_anchors()
         self.assertEqual(self.robot.events.count('begin_sdk'), 1)
@@ -549,7 +583,7 @@ class DualLoopbackTest(unittest.TestCase):
             server.motion_override = dual_motion()
             robot = server.operator(arms=DUAL_ARMS, cartesian_target_order=['right', 'left'],
                                     cartesian_wire_format='pe321', feedback_position_unit='mm')
-            cfg = configuration()
+            cfg = configuration(identity_bindings=True)
             vr = VROperator(**{k: v for k, v in cfg.input.items() if k != 'type'})
             vr.input = HandInput()
             runtime = DualVRTeleopRuntime(vr, robot, execute=True, control_mode='reference',

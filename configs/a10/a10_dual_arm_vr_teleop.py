@@ -18,7 +18,9 @@ teleop = dict(
         max_reference_lead_m=.02, max_reference_lead_rad=.12,
     ),
     pose_calibration_path=None,
-    input=dict(arm='both', hand_to_arm=dict(left='left', right='right'),
+    # Onsite .150: physical left arm is ee 1 (operator key 'right'), right is ee 0.
+    # Swap input bindings only; keep GET mappings and UDP row order unchanged.
+    input=dict(arm='both', hand_to_arm=dict(left='right', right='left'),
                enable_left_events=False, network=dict(host_ip='0.0.0.0')),
     operator={{_base_.operator}},
     diagnostics_path='work_dirs/a10/vr/dual_teleop_diagnostics.jsonl',

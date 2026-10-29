@@ -802,3 +802,22 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 在 `CLI.txt`、命令速查和VR说明中补充新目录、最短启动命令、端口占用和现场验证边界。
   下一步由现场人员确认左右臂对应关系、单侧接管/释放和双侧同步运动；本次没有修改控制器文件，
   没有使能、启停 follower 或执行实机运动。
+
+### 2026-10-29：双臂现场左右绑定与松手停止超时排查
+
+- 用户运行双臂VR后反馈手柄与实体臂左右相反；仅在 `a10_dual_arm_vr_teleop.py` 对调
+  `hand_to_arm` 为左手→operator `right`（ee 1）、右手→operator `left`（ee 0）。
+  原operator分组名、GET解析、UDP行序、单臂配置和控制台均不改，避免重复交换协议数据。
+- 只读分析本地 `work_dirs/a10/vr/dual_teleop_diagnostics.jsonl` 最新会话2463帧，对照用户
+  16:41:33的 `release_settle_timeout`：错误分组为原 `left`/ee 0，松手过渡约0.23秒后
+  前端命令线/角速度均为零，最终位置残差2.9367mm、姿态残差0.4446°。
+  最后一秒30帧的反馈位置与计划位置各自保持不变；2mm停止到位条件未满足，持续超过2秒退出。
+  最终停止状态为 requested=true、mode_inactive=true、reported_stopped=true。
+- 直接触发原因是松手停止到位检查超时，不是WebSocket断连，也没有报告控制器故障。
+  已收到新鲜反馈不代表内部滤波/SDK叠加完全一致，当前日志不能确定2.94mm残差的底层原因。
+  本次不更改停止算法、2mm容差或2秒预算，不以延长等待或取消保护掩盖残差。
+- 增加使用现场绑定的SDK双臂用例，验证左手路由至ee 1、右手至ee 0，松开一侧后另一侧
+  继续运动且不重启全组。通用生命周期用例显式使用其原同名测试绑定；现场绑定单独验证。
+  更新CLI、速查及VR说明中的编号和故障解释；所有修改仅在 `FluxVLA_follower/kaanh_follower`。
+- 验证：双臂专项41项通过，VR全量147项通过（包含专项，不重复计数）；实机参数配置预览和
+  `git diff --check`通过。本轮没有连接、使能或驱动机器人，未改控制器配置。

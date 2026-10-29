@@ -75,6 +75,8 @@ class XLeVRDeltaEEMapper:
     axis_remap: tuple[tuple[float, float, float], ...] = field(
         default_factory=lambda: AXIS_REMAP_VR_TO_ROBOT
     )
+    # Optional translation-only mapping; rotation keeps axis_remap in SO(3).
+    position_axis_remap: tuple[tuple[float, float, float], ...] | None = None
 
     _prev_position: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_orientation_quat: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -114,6 +116,13 @@ class XLeVRDeltaEEMapper:
     _anchor_shadow_last_hand_pose: np.ndarray | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.position_axis_remap is not None:
+            matrix = np.asarray(self.position_axis_remap, dtype=float)
+            # Translation may swap two axes (det=-1); never use this for rotvecs.
+            if (matrix.shape != (3, 3) or not np.all(np.isfinite(matrix))
+                    or not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-6, rtol=0)):
+                raise ValueError('position_axis_remap must be a finite orthogonal 3x3 matrix')
+            self.position_axis_remap = tuple(tuple(row) for row in matrix.tolist())
         if self.position_control_mode not in {"safe_frame_delta", "legacy_frame_delta"}:
             raise ValueError(
                 "position_control_mode must be 'safe_frame_delta' or 'legacy_frame_delta'"
@@ -172,6 +181,10 @@ class XLeVRDeltaEEMapper:
         self._position_filter = _SecondOrderLowPass(self.position_cutoff_hz)
 
     @property
+    def _position_axes(self):
+        return self.axis_remap if self.position_axis_remap is None else self.position_axis_remap
+
+    @property
     def control_state(self) -> str:
         return self._control_state
 
@@ -208,6 +221,8 @@ class XLeVRDeltaEEMapper:
             "anchor_shadow_active": self._anchor_shadow_active,
             "anchor_shadow_status": "inactive",
             "position_control_mode": self.position_control_mode,
+            "position_axis_remap": np.asarray(self._position_axes, dtype=float).tolist(),
+            "rotation_axis_remap": np.asarray(self.axis_remap, dtype=float).tolist(),
             "motion_shaping_mode": self.motion_shaping_mode,
             "motion_shaping_owner": (
                 "downstream_controller_unverified"
@@ -402,7 +417,7 @@ class XLeVRDeltaEEMapper:
             )
             translation_ee = remap_position(
                 displacement_anchor_vr * self.vr_to_robot_scale * self._anchor_shadow_pos_scale,
-                self.axis_remap,
+                self._position_axes,
             )
             rotation_anchor_vr = (
                 quat_delta_rotvec_body_rad(self._anchor_shadow_quat, quat)
@@ -555,7 +570,7 @@ class XLeVRDeltaEEMapper:
                     raw_delta = (current_pos - self._prev_position) * pos_scale_eff
                 self._current_diagnostics["mapped_delta_before_filter_m"] = raw_delta.tolist()
                 self._prev_position = current_pos.copy()
-                delta_pos = remap_position(raw_delta, self.axis_remap)
+                delta_pos = remap_position(raw_delta, self._position_axes)
                 delta_pos = self._clip_delta_pos(delta_pos)
 
         delta_rx, delta_ry, delta_rz = self._orientation_delta_rotvec(
@@ -742,7 +757,7 @@ class XLeVRDeltaEEMapper:
         self._spike_count = 0
         pos_scale_eff, angle_scale_eff = self._motion_scales(trigger)
         raw_delta = delta_position_body(previous_position, current_pos, previous_quat) * pos_scale_eff
-        delta_pos = remap_position(raw_delta, self.axis_remap)
+        delta_pos = remap_position(raw_delta, self._position_axes)
         rotvec_vr = quat_delta_rotvec_body_rad(previous_quat, quat) * angle_scale_eff
         rotvec_robot = remap_rotvec(rotvec_vr, self.axis_remap)
         self._anchor_sample(current_pos, quat, sample_receive_time_s)

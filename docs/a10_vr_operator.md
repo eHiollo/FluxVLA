@@ -505,6 +505,11 @@ VR 实机验收仍待现场进行。** 配置继承 `a10_dual_arm_operator.py`�
   右手接管 ee 0。operator 原分组键仍是 `left=ee0`、`right=ee1`，用于协议和反馈索引，
   不等同于现场物理左右；此处仅交换 VR 绑定，不交换 GET 或 UDP 行顺序。
   前扳机只在按住侧键时调整精细比例，不单独接管。
+- 左手到 ee 1 的平移轴独立配置在 `teleop.input.mapping_by_hand.left.position_axis_remap`。
+  根据现场确认的“左手向前→机械臂向上、左手向上→机械臂向前”，将原工具局部平移X/Z通道交换：
+  `[[0,0,-1],[1,0,0],[0,1,0]]`。右手继续使用公共 `axis_remap`；两手旋转也沿用公共映射。
+  仅平移使用这个交换矩阵，不把它用于四元数或旋转向量；公共单臂配置不变。
+  此项仍基于接管时的手柄/末端锚点，不是房间固定坐标系的标定；现场方向还需用实际握姿验证。
 - 每次接管以当前手柄和该臂的实际位姿记录锚点，平移、旋转均使用旧相对映射；不加载绝对姿态标定。
 - 每臂独立计算 reference、命令速度与跟踪误差；底层 IK、运动规划和电机控制仍在控制器。
 - 默认使用 `sdk_tool_cumulative`：每次启动整个 follower 后，以两臂实际位姿调用一次
@@ -587,6 +592,7 @@ python scripts/teleoperate.py \
 SDK 路径的 `sent_relative_target` 为空，避免把累计通道误读为相对四元数位姿。
 `local_send_success` 只表示本机发送成功，`execution_confirmed=false` 不表示确认到位。
 `reengage_requires_release` 表示该臂需要重新松手再接管。
+`hands.left/right.position_axis_remap` 与 `rotation_axis_remap` 分别记录每只手实际使用的平移、旋转映射。
 VR-only 中反馈和发送目标为空；该日志不是训练数据集，也不能证明实际机械臂已经停止。
 
 

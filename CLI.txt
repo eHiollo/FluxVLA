@@ -49,6 +49,7 @@ python scripts/teleoperate.py \
 首轮双臂目标限速 0.04m/s、0.20rad/s；不改原单臂参数，也不自动使能。
 左手侧键接管左臂，右手侧键接管右臂；松开仅对应臂减速保持。
 现场编号已对调：左手 -> ee_id=1（operator键right），右手 -> ee_id=0（operator键left）。
+左手平移的前后/上下单独交换，配置在 input.mapping_by_hand.left.position_axis_remap；右手及旋转沿用原值。
 按住侧键时前扳机切换精调；双臂模式不启用夹爪或录制摇杆事件。
 console 分支可在原目录继续开发，但现场不能同时占用控制器 5999 或发送运动。
 两手松开并完成停止过渡后请求全组停止；Ctrl+C 不是急停。双臂 VR 实机验收待现场完成。

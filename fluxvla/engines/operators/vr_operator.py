@@ -36,7 +36,7 @@ class BaseTeleoperator(ABC):
 class VROperator(BaseTeleoperator):
     """Own WebXR input + mapper, never connect to or command a robot."""
 
-    def __init__(self, *, network, mapping=None, arm='right', hand_to_arm=None,
+    def __init__(self, *, network, mapping=None, mapping_by_hand=None, arm='right', hand_to_arm=None,
                  connection_timeout=10., enable_left_events=True,
                  thumbstick_event_threshold=.7):
         from .vr.input import VRInput
@@ -53,14 +53,25 @@ class VROperator(BaseTeleoperator):
                     or any(not isinstance(v, str) or not v for v in hand_to_arm.values())
                     or len(set(hand_to_arm.values())) != 2):
                 raise ValueError('both hands require distinct explicit hand_to_arm bindings')
-            if (mapping.get('position_control_mode', 'safe_frame_delta') != 'safe_frame_delta'
-                    or not mapping.get('require_squeeze_to_move', True)):
-                raise ValueError('dual input requires safe_frame_delta and squeeze control')
         elif hand_to_arm is not None:
             raise ValueError('hand_to_arm requires arm=both')
         self.hand_to_arm = dict(hand_to_arm or {})
         hands = ('left', 'right') if self.is_dual else (arm,)
-        self.mappers = {hand: XLeVRDeltaEEMapper(**mapping) for hand in hands}
+        overrides = {} if mapping_by_hand is None else mapping_by_hand
+        if not isinstance(overrides, dict) or set(overrides) - set(hands):
+            raise ValueError('mapping_by_hand keys must name configured hands')
+        if overrides and not self.is_dual:
+            raise ValueError('mapping_by_hand requires arm=both; use mapping for single-hand input')
+        self.mappers = {}
+        for hand in hands:
+            override = overrides.get(hand, {})
+            if not isinstance(override, dict) or set(override) - allowed:
+                raise ValueError(f'Unknown VR mapping settings for {hand}')
+            options = dict(mapping, **override)
+            if self.is_dual and (options.get('position_control_mode', 'safe_frame_delta') != 'safe_frame_delta'
+                                or not options.get('require_squeeze_to_move', True)):
+                raise ValueError('dual input requires safe_frame_delta and squeeze control')
+            self.mappers[hand] = XLeVRDeltaEEMapper(**options)
         self.mapper = self.mappers[hands[0]]  # Preserve the single-input interface.
         settings = dict(network)
         directory = Path(settings.pop('tls_directory')).expanduser().resolve()

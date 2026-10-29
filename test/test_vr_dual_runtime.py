@@ -31,6 +31,7 @@ def configuration(*, identity_bindings=False):
     if identity_bindings:
         # Lifecycle fixtures name arms after their hands; site mapping is tested separately.
         cfg.input.hand_to_arm = dict(left='left', right='right')
+        cfg.input.mapping_by_hand = {}
     return cfg
 
 
@@ -162,6 +163,55 @@ class DualSDKRobot(DualRobot):
 
 
 class DualInputTest(unittest.TestCase):
+    def test_left_forward_up_swap_preserves_right_translation_and_both_rotations(self):
+        vr = build_runtime(configuration()).teleoperator
+        vr.input = HandInput()
+        clock = Clock()
+        clock.value = 100.
+        # Expected tool-local translations for the two reported physical gestures.
+        gestures = (
+            ([0., 0., -.003], [.0027, 0., 0.], [0., 0., .0027]),  # forward
+            ([0., .003, 0.], [0., 0., .0027], [.0027, 0., 0.]),  # up
+            ([.003, 0., 0.], [0., .0027, 0.], [0., .0027, 0.]),  # sideways
+        )
+        with patch('time.monotonic', clock.now):
+            for displacement, expected_left, expected_right in gestures:
+                with self.subTest(displacement=displacement):
+                    vr.reset_reference()
+                    vr.input.rows = {side: hand(1, True) for side in ('left', 'right')}
+                    vr.get_action()
+                    clock.advance()
+                    vr.input.rows = {side: hand(2, True) for side in ('left', 'right')}
+                    for raw in vr.input.rows.values():
+                        raw['xlevr.target_position'] = displacement
+                        raw['xlevr.orientation_quat'] = Rotation.from_rotvec([.01, .02, -.03]).as_quat()
+                    actions = vr.get_action()
+                    left = actions[vr.hand_to_arm['left']]
+                    right = actions[vr.hand_to_arm['right']]
+                    np.testing.assert_allclose(left['_xlevr.anchor_command']['offset'][:3], expected_left, atol=1e-12)
+                    np.testing.assert_allclose(right['_xlevr.anchor_command']['offset'][:3], expected_right, atol=1e-12)
+                    np.testing.assert_allclose([left[f'ee.delta_{a}'] for a in 'xyz'], expected_left, atol=1e-12)
+                    np.testing.assert_allclose([right[f'ee.delta_{a}'] for a in 'xyz'], expected_right, atol=1e-12)
+                    np.testing.assert_allclose(left['_xlevr.anchor_command']['offset'][3:],
+                                               right['_xlevr.anchor_command']['offset'][3:], atol=1e-12)
+                    np.testing.assert_allclose([left[f'ee.delta_r{a}'] for a in 'xyz'],
+                                               [right[f'ee.delta_r{a}'] for a in 'xyz'], atol=1e-12)
+        self.assertIsNone(vr.mappers['right'].position_axis_remap)
+
+    def test_invalid_per_hand_settings_are_rejected_before_connecting(self):
+        for overrides in (
+            {'middle': {}}, {'left': {'position_axis_typo': []}},
+            {'left': {'position_control_mode': 'legacy_frame_delta'}},
+            {'left': {'require_squeeze_to_move': False}},
+            {'left': {'position_axis_remap': [[2., 0., 0.], [0., 1., 0.], [0., 0., 1.]]}},
+            {'left': {'position_axis_remap': [[0., 1.], [1., 0.]]}},
+            {'left': {'position_axis_remap': [[float('nan'), 0., 0.], [0., 1., 0.], [0., 0., 1.]]}},
+        ):
+            cfg = configuration()
+            cfg.input.mapping_by_hand = overrides
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                build_runtime(cfg)
+
     def test_snapshot_is_detached_and_partial_left_pose_keeps_its_age(self):
         monitor = VRMonitorBridge('.', {})
         for side in ('left', 'right'):

@@ -357,7 +357,7 @@ class ConsoleTest(unittest.TestCase):
             parse_command(['set_jog_coordinate','--to'])
 
     def test_unknown_commands_preserve_text_and_controller_reply(self):
-        commands = ['m_init', '  custom --value="两个 words"  --pos=[1,2]  ']
+        commands = ['native_init', '  custom --value="两个 words"  --pos=[1,2]  ']
         with FakeController() as c:
             for command in commands:
                 c.command_replies[command] = {'ret_code': 0, 'ret_msg': 'accepted',
@@ -371,9 +371,9 @@ class ConsoleTest(unittest.TestCase):
 
     def test_unknown_command_failure_displays_actual_response_and_keeps_shell(self):
         with FakeController() as c:
-            c.command_replies['m_init'] = {'ret_code': 72, 'ret_msg': 'init rejected',
+            c.command_replies['native_init'] = {'ret_code': 72, 'ret_msg': 'init rejected',
                                           'ret_context': {'reason': 'not ready'}}
-            code, output = self.run_console(c, ['m_init', 'get', 'exit'])
+            code, output = self.run_console(c, ['native_init', 'get', 'exit'])
             self.assertEqual(code, 0)
             self.assertIn('"ret_code": 72', output)
             self.assertIn('not ready', output)
@@ -382,22 +382,22 @@ class ConsoleTest(unittest.TestCase):
 
     def test_unknown_command_readonly_and_disconnected_do_not_send(self):
         with FakeController() as c:
-            code, output = self.run_console(c, ['m_init', 'exit'], ['--read-only'])
+            code, output = self.run_console(c, ['native_init', 'exit'], ['--read-only'])
             self.assertEqual(code, 0)
-            self.assertNotIn('m_init', c.commands)
+            self.assertNotIn('native_init', c.commands)
             self.assertIn('allow_motion is false', output)
         with FakeController() as c:
             c.command_replies['disconnect_me'] = None
-            code, output = self.run_console(c, ['disconnect_me', 'm_init', 'help', 'exit'])
+            code, output = self.run_console(c, ['disconnect_me', 'native_init', 'help', 'exit'])
             self.assertEqual(code, 0)  # Arbitrary commands are not follower starts.
             self.assertIn('控制台保留', output)
             self.assertIn('可用指令', output)
-            self.assertNotIn('m_init', c.commands)
+            self.assertNotIn('native_init', c.commands)
 
     def test_unknown_command_invalidates_targets_but_preserves_cleanup(self):
         with FakeController() as c:
-            c.command_replies['m_init'] = {'ret_code': 0, 'ret_context': ''}
-            code, output = self.run_console(c, ['follower_aj', 'm_init',
+            c.command_replies['native_init'] = {'ret_code': 0, 'ret_context': ''}
+            code, output = self.run_console(c, ['follower_aj', 'native_init',
                 'joints --deg 0 0 0 0 0 0', 'reconnect', 'exit'])
             self.assertEqual(code, 0)
             self.assertIn('Axis follower start has not been confirmed', output)
@@ -421,11 +421,11 @@ class ConsoleTest(unittest.TestCase):
 
     def test_one_shot_unknown_command(self):
         with FakeController() as c:
-            c.command_replies['m_init --mode=1'] = {'ret_code': 0, 'ret_context': ''}
+            c.command_replies['native_init --mode=1'] = {'ret_code': 0, 'ret_context': ''}
             out = []
-            self.assertEqual(main(['--host', '127.0.0.1', 'm_init', '--mode=1'],
+            self.assertEqual(main(['--host', '127.0.0.1', 'native_init', '--mode=1'],
                 operator_factory=lambda **_: c.operator(), output=out.append), 0)
-            self.assertIn('m_init --mode=1', c.commands)
+            self.assertIn('native_init --mode=1', c.commands)
 
     def test_explicit_raw_preserves_native_arguments_for_builtin_name(self):
         with FakeController() as c:
@@ -456,12 +456,12 @@ class ConsoleTest(unittest.TestCase):
             def slow_reply():
                 time.sleep(.12)
                 return {'ret_code': 0, 'ret_context': 'init reply'}
-            c.command_replies['m_init'] = slow_reply
-            code, output = self.run_console(c, ['m_init', 'get', 'exit'],
+            c.command_replies['native_init'] = slow_reply
+            code, output = self.run_console(c, ['native_init', 'get', 'exit'],
                 ['--timeout', '.05', '--command-timeout', '.5'])
             self.assertEqual(code, 0)
             self.assertIn('init reply', output)
-            self.assertEqual(c.commands.count('m_init'), 1)
+            self.assertEqual(c.commands.count('native_init'), 1)
             self.assertNotIn('stop_follower', c.commands)
             self.assertEqual(c.operators[0].timeout_s, .05)
             self.assertEqual(c.operators[0].command_timeout_s, .5)
@@ -471,16 +471,16 @@ class ConsoleTest(unittest.TestCase):
             def late_reply():
                 time.sleep(.12)
                 return {'ret_code': 0, 'ret_context': 'late init reply'}
-            c.command_replies['m_init'] = late_reply
+            c.command_replies['native_init'] = late_reply
             code, output = self.run_console(c,
-                ['m_init', 'get', 'reconnect', 'get', 'exit'], ['--command-timeout', '.03'])
+                ['native_init', 'get', 'reconnect', 'get', 'exit'], ['--command-timeout', '.03'])
             self.assertEqual(code, 0)
             self.assertIn('执行结果未知', output)
             self.assertIn('为避免迟到回复串线', output)
             self.assertNotIn('之前的跟随尚未确认停止', output)
             self.assertNotIn('late init reply', output)
             self.assertNotIn('stop_follower', c.commands)
-            self.assertEqual(c.commands.count('m_init'), 1)
+            self.assertEqual(c.commands.count('native_init'), 1)
             self.assertGreaterEqual(c.commands.count('get'), 4)
             self.assertFalse(c.operators[0].follower_stop_pending)
 

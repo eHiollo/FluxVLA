@@ -1,7 +1,8 @@
-"""A10 single-controller operator for KAANH single/dual Cartesian followers.
+"""A10 single-controller operator for KAANH joint and Cartesian followers.
 
-Wire layout follows the user-supplied robot.7z reference. Controller-side
-planning stays on the controller. This module does not open connections at
+Wire layout follows the user-supplied robot.7z reference. Local initialization
+plans joint targets in FluxVLA; low-level follower execution stays on the controller.
+This module does not open connections at
 import/construction, automatically enable motors, interpret VR increments, or invent a
 seventh joint. Legacy Cartesian packets retain their original encoding. Native
 Tool follower integrates cumulative component differences in current tool axes;
@@ -498,7 +499,9 @@ class A10Operator(BaseOperator):
     joint_indices (six entries) and tcp_index. ``cartesian_target_order`` is
     the XML control-group row order, not inferred from left/right or ee_id.
     Two arms share one connection/follower; all targets must be supplied in
-    one call. Dual joint, gripper and trajectory commands are unsupported.
+    one call. Joint targets flatten in joint_target_order (default ascending
+    ee_id). Dual gripper and inference trajectory commands are unsupported;
+    The local m_init command generates a complete joint group through send_joints.
     A10State.arms / get_frame()['arms'] expose named model feedback. Legacy
     flat fields remain available only for a single configured arm.
     """
@@ -518,7 +521,9 @@ class A10Operator(BaseOperator):
                  trajectory_max_lateness_s=None, status_poll_interval_s=None,
                  status_max_age_s=0.5, status_ws_port=5888,
                  command_timeout_s=60.0, record_trajectory_trace=False, shared_control=None,
-                 cartesian_wire_format='pq', arms=None, cartesian_target_order=None):
+                 cartesian_wire_format='pq', arms=None, cartesian_target_order=None,
+                 joint_target_order=None, init_position=None,
+                 init_gripper_positions=None, init_motion=None):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -542,13 +547,31 @@ class A10Operator(BaseOperator):
         self._arm_specs, self.cartesian_target_order = _normalize_arms(arms, arm_name, cartesian_target_order)
         self.arm_names = tuple(self._arm_specs) if self._arm_specs is not None else (arm_name,)
         self.is_multi_arm = len(self.arm_names) > 1
-        if self.is_multi_arm and command_mode != 'cartesian':
-            raise NotImplementedError('Dual-arm joint follower is not supported by the current controller')
+        arm_ids = ({name: spec['ee_id'] for name, spec in self._arm_specs.items()}
+                   if self._arm_specs is not None else {arm_name: 0})
+        order = (sorted(self.arm_names, key=arm_ids.__getitem__)
+                 if joint_target_order is None else joint_target_order)
+        if (not isinstance(order, (list, tuple)) or len(order) != len(self.arm_names)
+                or any(not isinstance(name, str) for name in order)
+                or set(order) != set(self.arm_names)):
+            raise ValueError('joint_target_order must list every configured arm exactly once')
+        self.joint_target_order = tuple(order)
+        self.joint_dofs = {name: 6 for name in self.arm_names}
+        self.init_position = None
+        if init_position is not None:
+            if not isinstance(init_position, Mapping) or set(init_position) != set(self.arm_names):
+                raise ValueError('init_position must provide every configured arm')
+            self.init_position = {name: _vector(init_position[name], 6, f'{name} init_position')
+                                  for name in self.arm_names}
+        self.init_gripper_positions = ({name: 0. for name in self.arm_names}
+                                       if init_gripper_positions is None else dict(init_gripper_positions))
+        self.init_motion = {} if init_motion is None else dict(init_motion)
+        self.last_init_motion = None
         if self.is_multi_arm and (gripper is not None or gripper_transport != 'controller'
                                   or gripper_feedback_path is not None):
-            raise NotImplementedError('Dual-arm gripper routing is not configured; use Cartesian arm targets only')
+            raise NotImplementedError('Dual-arm gripper routing is not configured')
         if self.is_multi_arm:
-            self.capabilities = frozenset({'relative_cartesian_follower'})
+            self.capabilities = frozenset({'relative_cartesian_follower', 'absolute_joint_follower'})
         if feedback_joint_unit not in ('deg', 'rad'):
             raise ValueError('feedback_joint_unit must be deg or rad')
         if feedback_position_unit not in (None, 'mm', 'm'):
@@ -1060,8 +1083,6 @@ class A10Operator(BaseOperator):
         mode = self.command_mode if mode is None else mode
         if mode not in _FOLLOWER_MODES:
             raise ValueError('mode must be cartesian or joint')
-        if mode == 'joint':
-            self._require_single_arm('joint follower')
         command, feedback_mode = _FOLLOWER_MODES[mode]
         with self._io_lock:
             self._require_motion()
@@ -1643,15 +1664,16 @@ class A10Operator(BaseOperator):
         return self._trajectory_owner is not None
 
     def send_joints(self, arm_targets):
-        """Send six absolute joint radians via joint follower UDP (wire degrees).
+        """Send a complete joint group via follower UDP (wire degrees).
 
-        No gripper, implicit hold, interpolation, retry, or arrival ACK. Client
-        targets must match controller joint order; controller plans motion.
+        Flatten arms in joint_target_order, with six joints per A10 arm.
+        No gripper, implicit hold, interpolation, retry, or arrival ACK.
         """
-        self._require_single_arm('joint targets')
-        if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
-            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
-        radians = _vector(arm_targets[self.arm_name], 6, 'joint targets in radians')
+        if not isinstance(arm_targets, Mapping) or set(arm_targets) != set(self.arm_names):
+            raise ValueError(f'Expected exactly these arms: {self.arm_names}')
+        targets = {name: _vector(arm_targets[name], self.joint_dofs[name],
+                                 f'{name} joint targets in radians') for name in self.arm_names}
+        radians = np.concatenate([targets[name] for name in self.joint_target_order])
         with np.errstate(over='ignore'):
             degrees = np.rad2deg(radians)
         if not np.isfinite(degrees).all():
@@ -1659,6 +1681,32 @@ class A10Operator(BaseOperator):
         values = ','.join(format(float(v), '.17g') for v in degrees)
         payload = f'jp --motor_pos=[{values}]'.encode('utf-8')
         self._send_follower_target(_pack(payload, command=False), 'Axis')
+
+    def _claim_init_motion(self):
+        with self._io_lock:
+            if not self._trajectory_lock.acquire(blocking=False):
+                raise RuntimeError('A trajectory is already running')
+            self._trajectory_owner = threading.get_ident()
+
+    def _release_init_motion(self):
+        with self._io_lock:
+            self._trajectory_owner = None
+        self._trajectory_lock.release()
+
+    def _prepare_init_motion(self):
+        with self._io_lock:
+            self._require_motion()
+            self._prepare_shared_console_command()
+            if self.follower_stop_pending:
+                self.stop_follower()
+
+    def _read_init_joints(self):
+        state = self.get_state()
+        if state.has_error or state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled':
+            raise A10ControllerError('Initialization requires healthy Enabled feedback')
+        if self._started_here and not self._confirmed_active:
+            raise A10ControllerError('Initialization joint follower is no longer active')
+        return {name: arm.actual_joints_rad for name, arm in state.arms.items()}
 
     def gohome(self):
         raise NotImplementedError('No verified home command for this follower adapter')

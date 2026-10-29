@@ -4,7 +4,8 @@ XML inspected 2026-10-23; separate WS entries added 2026-10-29.
 Load the updated controller XML before connecting to 5999; 5867 stays for the pendant.
 Physical left/right and live GET groups/units still require onsite confirmation.
 Use one command/status WS connection; no background polling connection.
-No recording, VR calibration, gripper or dual joint trajectory support here.
+No recording or VR calibration. m_init supports the full joint follower group;
+gripper initialization is reserved for a future driver.
 """
 
 operator = dict(
@@ -15,9 +16,17 @@ operator = dict(
     feedback_joint_unit='deg', feedback_position_unit='mm',
     # TEMPLATE mappings, to verify against actual dual-controller GET replies.
     arms=dict(
-        left=dict(ee_id=0, joint_group=0, joint_indices=[0, 1, 2, 3, 4, 5], tcp_index=0),
-        right=dict(ee_id=1, joint_group=1, joint_indices=[0, 1, 2, 3, 4, 5], tcp_index=1),
+        right=dict(ee_id=0, joint_group=0, joint_indices=[0, 1, 2, 3, 4, 5], tcp_index=0),
+        left=dict(ee_id=1, joint_group=1, joint_indices=[0, 1, 2, 3, 4, 5], tcp_index=1),
     ),
     # Row order follows the controller Cartesian group, NOT dict insertion order.
-    cartesian_target_order=['left', 'right'],
+    cartesian_target_order=['right', 'left'],
+    joint_target_order=['right', 'left'],
+    # Absolute joint radians; right/id 0, then left/id 1.
+    init_position=dict(
+        right=[-2.044251792983398, -0.8144404421506339, 2.385708007843569,
+               -0.6513219702592439, -1.2242612038114224, -0.24410174918392694],
+        left=[0., 0., 2.6179938779914944, -1.832595714594046, -1.5707963267948966, 0.],
+    ),
+    init_gripper_positions=dict(right=0., left=0.),
 )

@@ -1017,8 +1017,8 @@ class DualArmTest(unittest.TestCase):
                      dict(ee_id=0, joint_group=0, tcp_index=0, host='other-controller')):
             with self.subTest(spec=spec), self.assertRaises(ValueError):
                 A10Operator('127.0.0.1', arms={'left': spec})
-        with self.assertRaises(NotImplementedError):
-            A10Operator('127.0.0.1', **self.settings(command_mode='joint'))
+        self.assertEqual(A10Operator('127.0.0.1',
+                         **self.settings(command_mode='joint')).command_mode, 'joint')
         with self.assertRaises(NotImplementedError):
             A10Operator('127.0.0.1', **self.settings(gripper_transport='usb', gripper={'port': '/never/open'}))
 
@@ -1071,7 +1071,8 @@ class DualArmTest(unittest.TestCase):
             frame = op.get_frame()
             self.assertEqual(set(frame['arms']), {'left', 'right'})
             self.assertIsNone(frame['qpos'])
-            self.assertEqual(op.capabilities, frozenset({'relative_cartesian_follower'}))
+            self.assertEqual(op.capabilities, frozenset({'relative_cartesian_follower',
+                                                       'absolute_joint_follower'}))
             op.stop_follower()
             self.assertEqual([x for x in c.commands if x != 'get'], ['follower_cart','stop_follower'])
 
@@ -1115,9 +1116,7 @@ class DualArmTest(unittest.TestCase):
         with FakeController() as c:
             c.motion_override = dual_motion()
             op = c.operator(**self.settings())
-            for method, args in ((op.start_follower, ('joint',)),
-                                 (op.send_joints, ({'left':[0]*6,'right':[0]*6},)),
-                                 (op.execute_trajectory, ({'left':[[0]*6],'right':[[0]*6]},)),
+            for method, args in ((op.execute_trajectory, ({'left':[[0]*6],'right':[[0]*6]},)),
                                  (op.send_gripper, ({'left':0,'right':0},))):
                 with self.assertRaises(NotImplementedError):
                     method(*args)

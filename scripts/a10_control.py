@@ -13,6 +13,8 @@ import sys
 # Prefer this checkout, including when another branch is installed editable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fluxvla.engines.operators.kaanh_commands import LOCAL_COMMANDS, add_local_command_parsers
+
 
 HELP = """可用指令：
   reconnect                     重新连接并查询状态，不重发控制指令（仅 shell）
@@ -23,7 +25,7 @@ HELP = """可用指令：
   set_jog_coordinate --tool     切换工具坐标系并回读
   set_jog_coordinate --axis     切换关节坐标系并回读
   follower_cart                 启动本连接的笛卡尔跟随（仅 shell）
-  follower_aj                   启动本连接的六轴关节跟随（仅 shell）
+  follower_aj                   启动本连接的单/双臂关节跟随（仅 shell）
   joints                        查询六轴实际角度（度），只读取不发送目标
   joints --deg q1 q2 q3 q4 q5 q6 发送六轴绝对角度目标（仅 shell）
   stop_follower                 停止跟随（共享模式也可停止推理；仅 shell）
@@ -32,7 +34,8 @@ HELP = """可用指令：
   jog right rz 1                右臂绕本次开始时工具 Z 轴旋转 1 度
   jog left x 5 right x 5        两臂各沿自身工具 X 轴移动 5 mm
   g_move --pos=毫米数            发送夹爪目标，范围 0..100 mm
-  其他指令（如 m_init）          原文发送到控制器，显示完整回复
+  m_init                        返回机器人定义的唯一初始位置，完成后停止跟随
+  其他未注册指令                原文发送到控制器，显示完整回复
   raw 控制器指令                显式透传，可发送与内置名称相同的原生命令
   help                          显示帮助
   exit                          停止本次跟随后关闭连接，不自动掉使能
@@ -46,7 +49,8 @@ UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场�
 双臂 jog：轴 x/y/z 单位毫米，rx/ry/rz 单位度；单次最多 10 mm / 5 度。
 先确认 ee_id 的物理左右对应，再 manual_en、set_jog_coordinate --tool、follower_cart、jog。
 未选择的臂保持；连续 jog 保留累计量；到位检查失败会请求停止整个控制组。
-双臂 pq、joints --deg、g_move、follower_aj 仍拒绝；jog 与原始 pq 不能混用。
+双臂 pq、joints --deg、g_move 仍拒绝；follower_aj 与 m_init 支持双臂关节控制组。
+m_init 使用 operator 的 init_position；需先 manual_en，夹爪初始化接口暂不执行。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
 断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
 内置指令保留参数检查和反馈确认；其他指令原文透传，不自动重试。
@@ -79,12 +83,13 @@ def parse_command(tokens, *, raw_text=None):
         text = (raw_text.lstrip()[3:].lstrip() if raw_text is not None
                 else shlex.join(tokens[1:]))
         return argparse.Namespace(command='controller_command', text=text)
-    if tokens and tokens[0] not in BUILTIN_COMMANDS:
+    if tokens and tokens[0] not in BUILTIN_COMMANDS and tokens[0] not in LOCAL_COMMANDS:
         return argparse.Namespace(command='controller_command',
                                   text=raw_text if raw_text is not None else shlex.join(tokens))
     parser = CommandParser(prog='a10', add_help=False, allow_abbrev=False)
     subs = parser.add_subparsers(dest='command', required=True,
                                  parser_class=CommandParser)
+    add_local_command_parsers(subs)
     get = subs.add_parser('get', add_help=False, allow_abbrev=False)
     get.add_argument('--raw', action='store_true')
     for name in ('manual_en', 'manual_ds', 'follower_cart', 'follower_aj',
@@ -209,9 +214,11 @@ class A10Console:
         """Execute parsed commands via public operator methods only."""
         robot, out, cmd = self.robot, self.output, args.command
         if getattr(robot, 'is_multi_arm', False) and (
-                cmd in ('pq', 'g_move', 'follower_aj') or (cmd == 'joints' and args.targets)):
-            raise CommandError('双臂模式拒绝单臂目标、夹爪和关节跟随指令；请使用完整控制组的 operator 笛卡尔接口。')
-        if cmd == 'help':
+                cmd in ('pq', 'g_move') or (cmd == 'joints' and args.targets)):
+            raise CommandError('双臂模式拒绝单臂目标和夹爪指令；请使用 m_init 或完整控制组的 operator 接口。')
+        if cmd in LOCAL_COMMANDS:
+            LOCAL_COMMANDS[cmd].execute(robot, args, out)
+        elif cmd == 'help':
             out(HELP)
         elif cmd == 'exit':
             return False
@@ -238,7 +245,8 @@ class A10Console:
             state = self.observe(robot.start_follower(mode=mode))
             if getattr(robot, 'is_multi_arm', False):
                 out('本次启用整个双臂控制组，不是独立启动某一臂。')
-            out(('六轴关节' if mode == 'joint' else '笛卡尔') +
+            out((('双臂关节' if getattr(robot, 'is_multi_arm', False) else '六轴关节')
+                 if mode == 'joint' else '笛卡尔') +
                 '跟随已启动（反馈已确认）；尚未发送 UDP 目标。')
             show_state(state, out)
         elif cmd == 'joints':
@@ -380,14 +388,11 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
         if operator_factory is None:
             from fluxvla.engines.operators.a10_operator import A10Operator
             operator_factory = A10Operator
-        if args.config is not None:
-            from mmengine import Config
-            settings = dict(Config.fromfile(str(args.config))['operator'])
-            if settings.pop('type', 'A10Operator') != 'A10Operator':
-                raise CommandError('控制台配置必须使用 A10Operator')
-        else:
-            settings = dict(host='192.168.0.125', ws_port=5999, udp_port=9998,
-                            joint_udp_port=9999, status_ws_port=5888, timeout_s=5., allow_motion=True)
+        from mmengine import Config
+        config_path = args.config or Path(__file__).resolve().parents[1] / 'configs/a10/a10_operator.py'
+        settings = dict(Config.fromfile(str(config_path))['operator'])
+        if settings.pop('type', 'A10Operator') != 'A10Operator':
+            raise CommandError('控制台配置必须使用 A10Operator')
         overrides = dict(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,
                          joint_udp_port=args.joint_udp_port, timeout_s=args.timeout,
                          command_timeout_s=args.command_timeout, status_ws_port=args.status_ws_port)

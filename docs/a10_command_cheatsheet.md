@@ -3,6 +3,46 @@
 2026-10-26：VR、双臂控制与推理已整合到 `FluxVLA` 的 `kaanh_follower`。原 VR 目录保留作回退。
 无 `--config` 的控制台沿用默认共享连接；双臂配置默认直连。不要同时启动推理与 VR 驱动同一机器人。
 
+## FluxVLA 本地初始化 `m_init`（2026-10-29）
+
+console 优先执行 FluxVLA 注册的命令；未注册名称继续原文透传。
+本地命令参数错误或执行失败不会转发机器人端。`raw m_init` 可显式调用机器人端旧命令。
+本地命令统一放在 `fluxvla/engines/operators/kaanh_commands/`，每个命令一个文件，
+在该目录的 `__init__.py` 中登记；`m_init.py` 实现回位逻辑。
+
+```bash
+# 双臂控制台；单臂可省略 --config
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --allow-motion shell
+```
+
+```text
+manual_en
+m_init
+```
+
+`m_init` 无参数，只返回 config 中的唯一 `operator.init_position`（弧度，`{臂名: 关节数组}`）。
+单臂点位在 `configs/a10/a10_operator.py`，双臂点位在 `configs/a10/a10_dual_arm_operator.py`。
+不带 `--config` 时控制台读取单臂配置。operator 保存传入的属性，未配置点位时 `m_init` 明确报错。
+命令本身不定义点位；回位流程是 `kaanh_commands/m_init.py` 中的独立函数，BaseOperator 无须继承命令实现。
+`joint_dofs` 记录每臂维度，公共规划支持六轴、七轴及多臂；具体机器人提供实际反馈与 follower 读写，A10 每臂仍为六轴。
+
+双臂 A10 默认右臂 `ee_id=0`、左臂 `ee_id=1`，关节目标顺序 `joint_target_order=['right', 'left']`。
+`cartesian_target_order` 独立描述末端控制组行顺序。关节 follower 使用原有 40 字节头及
+`jp --motor_pos=[...]` 协议（度），双臂一次发送完整十二维；需机器人 follower 接收对应维度。
+本次只修改 FluxVLA，上述双臂关节接口仅经回环测试，尚未实机验收。
+
+回位先停止本次已有跟随；共享 console 会先撤销推理控制权。读取实际关节后启动关节 follower，
+以五次平滑插值同步回位；所有关节连续三次误差不超过 `0.01 rad` 后请求并确认停止 follower。
+不会自动使能、恢复推理或重试运动命令。中断、故障、反馈缺失及超时均结束发送并尝试停止。
+
+`init_motion` 可配置：`publish_hz=50`、`max_velocity_rad_s=0.1`、
+`max_acceleration_rad_s2=0.2`、`tolerance_rad=0.01`、`feedback_interval_s=0.1`、
+`arrival_timeout_margin_s=10`（从轨迹开始计，规划时长加该余量）。发送遇到慢 I/O 不补发追赶帧。
+
+`init_gripper_positions` 默认每臂 `0 mm`；命令模块中的 `initialize_grippers(robot, targets_mm)` 是后续驱动接入点。
+当前只执行机械臂回位，夹爪保持原状，console 明确显示夹爪初始化尚未执行。
+`last_init_motion` 分别记录机械臂到位、夹爪执行、follower 停止及完成状态。
+
 ## 旧单臂 .125 + 老夹爪 VR（2026-10-26）
 
 在 `/home/robot/VLA/FluxVLA`、`kaanh_follower` 分支使用。
@@ -287,7 +327,7 @@ python scripts/a10_control.py \
 此时用双臂模板查询会报告反馈组不匹配，这是预期保护，不会自动切换控制器配置。
 想连续查询可将末尾 `get` 换为 `shell`，输入 `get`、`joints`，退出输入 `exit`。
 模板默认禁止运动；控制台启停作用于整个控制组。双臂 VR 独立接管见⑦，尚未实机验收；
-录制、标定、模型推理、双臂关节和夹爪未开放。⑤仍是原单臂 VR 命令。
+录制、标定、模型推理和双臂夹爪未开放；双臂关节回位见上方 `m_init`。⑤仍是原单臂 VR 命令。
 
 ## ⑦ 双臂 VR：左手控左臂，右手控右臂
 

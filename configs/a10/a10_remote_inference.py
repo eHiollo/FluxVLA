@@ -12,11 +12,12 @@ For motion, configure both dry_run=False and operator.allow_motion=True,
 and set max_joint_step_rad to the verified site limit. 'p' + Enter ends the
 run after the current chunk. Ctrl+C unwinds through follower stop and close.
 This runner does not perform homing or claim physical arrival after a chunk.
-RTC guidance defaults off for follower debugging. When enabled, condition
+RTC guidance is disabled for accelerated inference. When enabled, condition
 each new prediction on the previous chunk's unexecuted targets, rebased
 to the new observation in model space.
 This is synchronous chunk stitching, not asynchronous latency compensation.
-Restart the model server with --acceleration off after updating the code.
+Use --acceleration on for accelerated inference with RTC disabled.
+RTC guidance requires --acceleration off and an unexecuted action prefix.
 """
 
 inference = dict(
@@ -40,7 +41,7 @@ inference = dict(
                                              width=640, height=480, fps=30, rotate_180=True))),
     instruction='Grasp the bottle, place it into the box beside it, close the lid, and return the robot arm to its initial position.',
     action_chunk=30,
-    execute_horizon=15,
+    execute_horizon=30,
     controller_speed_percent=None,  # Optional 1..100; restore after confirmed stop.
     rtc_config=dict(enabled=False, method='guidance', prefix_len=9,  # Model steps, not UDP packets.
                     decay_end=15, schedule='exp', max_guidance_weight=5., use_vjp=False),

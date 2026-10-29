@@ -28,7 +28,7 @@ from scipy.spatial.transform import Rotation
 from ..utils.root import OPERATORS
 from .base_operator import BaseOperator
 from .camera_operator import CameraOperator
-from .gripper_operator import GripperOperator
+from .gripper_operator import GripperOperator, GripperError, GripperTimeoutError
 
 __all__ = ['A10Operator', 'A10State', 'A10ArmState', 'A10ProtocolError', 'A10ControllerError']
 
@@ -512,6 +512,7 @@ class A10Operator(BaseOperator):
                  feedback_position_unit=None, gripper_feedback_path=None,
                  joint_udp_port=9999, command_mode='cartesian',
                  cameras=None, gripper=None, gripper_transport='controller',
+                 continue_on_gripper_timeout=False,
                  trajectory_feedback_interval_s=0.1,
                  trajectory_feedback_timeout_s=0.1,
                  trajectory_max_lateness_s=None, status_poll_interval_s=None,
@@ -570,6 +571,8 @@ class A10Operator(BaseOperator):
                 or any(not isinstance(k, str) or not k or k in reserved for k in cameras)):
             raise ValueError('Camera names must be nonempty and not overwrite robot fields')
         self.camera_operator = None if cameras is None else CameraOperator(cameras)
+        self.continue_on_gripper_timeout = bool(continue_on_gripper_timeout)
+        self._gripper_timed_out = False
         self.gripper_transport = gripper_transport
         self.gripper_operator = (GripperOperator(**dict(gripper))
                                  if gripper_transport == 'usb' else None)
@@ -680,6 +683,7 @@ class A10Operator(BaseOperator):
                 try:
                     self._connect_robot_transport()
                     if self.gripper_operator is not None:
+                        self._gripper_timed_out = False
                         self.gripper_operator.connect()
                     if self.status_poll_interval_s is not None:
                         if self.shared_control:
@@ -871,6 +875,8 @@ class A10Operator(BaseOperator):
 
         These sequential reads are not synchronized sensor samples. Missing
         configured hardware raises; targets are never substituted for feedback.
+        Opt-in gripper timeout continuation retains the last measured width and
+        its timestamp, marks it stale, and skips USB traffic until reconnect.
         get_state() remains the unmodified controller-only status interface.
         """
         del slop
@@ -888,7 +894,8 @@ class A10Operator(BaseOperator):
                                             received_monotonic_s=arm.received_monotonic_s)
                                  for name, arm in state.arms.items()}
                 if self.gripper_operator is not None:
-                    grip = self.gripper_operator.read_state()
+                    grip = self._read_gripper_state()
+                    frame['gripper_feedback_stale'] = self._gripper_timed_out
                     width = grip.position_mm
                     frame['gripper_received_monotonic_s'] = grip.timestamp
                 frame['gripper_mm'] = width
@@ -1382,6 +1389,27 @@ class A10Operator(BaseOperator):
             raise NotImplementedError('Controller gripper arrival feedback is not verified')
         return self._send_gripper_target(position, wait=wait)
 
+    def _gripper_call(self, operation):
+        if self._gripper_timed_out:
+            return None
+        try:
+            return operation()
+        except GripperError as exc:
+            from serial import SerialTimeoutException
+            timeout = isinstance(exc, GripperTimeoutError) or isinstance(
+                exc.__cause__, SerialTimeoutException)
+            if (not self.continue_on_gripper_timeout or not timeout
+                    or self.gripper_operator.last_state is None):
+                raise
+            self._gripper_timed_out = True
+            logging.getLogger(__name__).warning(
+                '夹爪超时，继续推理：沿用最后实测开度，本次会话暂停夹爪通信。%s', exc)
+            return None
+
+    def _read_gripper_state(self, **kwargs):
+        state = self._gripper_call(lambda: self.gripper_operator.read_state(**kwargs))
+        return self.gripper_operator.last_state if state is None else state
+
     def _send_gripper_target(self, position, *, wait=False, check_state=True):
         self._require_single_arm('gripper commands')
         with self._io_lock:
@@ -1390,7 +1418,8 @@ class A10Operator(BaseOperator):
             if check_state and self.get_state().has_error:
                 raise A10ControllerError('Controller reports a fault')
             if self.gripper_operator is not None:
-                return self.gripper_operator.set_position_mm(position, wait=wait)
+                return self._gripper_call(
+                    lambda: self.gripper_operator.set_position_mm(position, wait=wait))
             return self._connection.request(f'g_move --pos={position:.12g}')
 
     def _require_target_owner(self):
@@ -1430,7 +1459,7 @@ class A10Operator(BaseOperator):
         if state.actual_joints_rad is None:
             raise A10ProtocolError('Trajectory requires actual joint feedback')
         if check_gripper:
-            self.gripper_operator.read_state(timeout=timeout_s)
+            self._read_gripper_state(timeout=timeout_s)
 
     def execute_trajectory(self, arm_trajectories, gripper_trajectories=None,
                            head_trajectory=None, dt=0.1, async_exec=False,
@@ -1560,10 +1589,18 @@ class A10Operator(BaseOperator):
                         row['joint_sent'] = True
                         row['joint_send_finished_s'] = time.monotonic()
                     if widths is not None and repeat_index == 0:
+                        grip_started = time.monotonic()
                         self._send_gripper_target(float(widths[index]), check_state=False)
-                        gripper_targets_sent += 1
+                        if self._gripper_timed_out:
+                            # Resume after the failed USB transaction without a
+                            # catch-up burst or a secondary slot-budget failure.
+                            delay = time.monotonic() - grip_started
+                            started += delay
+                            deadline += delay
+                        else:
+                            gripper_targets_sent += 1
                         if row is not None:
-                            row['gripper_sent'] = True
+                            row['gripper_sent'] = not self._gripper_timed_out
                             row['gripper_send_finished_s'] = time.monotonic()
                     if repeat_index == joint_target_repeat - 1:
                         sent += 1

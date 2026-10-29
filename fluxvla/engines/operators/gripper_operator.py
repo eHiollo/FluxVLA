@@ -120,6 +120,7 @@ class GripperOperator:
         self._serial = None
         self._lock = threading.RLock()
         self._target_mm = None
+        self.last_state = None
 
     @property
     def is_connected(self):
@@ -160,6 +161,7 @@ class GripperOperator:
         with self._lock:
             serial_port, self._serial = self._serial, None
             self._target_mm = None
+            self.last_state = None
             if serial_port is not None:
                 serial_port.close()
 
@@ -252,8 +254,9 @@ class GripperOperator:
         position, speed, load, voltage, temperature = struct.unpack('<hhhBB', data)
         if not 0 <= position <= 4096:
             raise GripperError(f'Invalid measured servo position: {position}')
-        return GripperState(self.servo_id, position, self.raw_to_position(position),
-                            speed, load, voltage, temperature, time.monotonic())
+        self.last_state = GripperState(self.servo_id, position, self.raw_to_position(position),
+                                       speed, load, voltage, temperature, time.monotonic())
+        return self.last_state
 
     def get_position_mm(self):
         """Read actual opening in mm, without caching or using commanded width."""

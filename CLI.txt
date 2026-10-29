@@ -22,16 +22,37 @@
   --config configs/a10/a10_remote_inference.py
 
 
-双臂 VR（左右手独立输入；默认仅 VR，不连接机械臂）
+双臂 VR（kaanh_follower 独立开发目录；.150 控制器）
+
+cd /home/robot/VLA/FluxVLA_follower
+conda activate fluxvla
+
+先看双手输入，不连接机械臂：
 
 python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
 
 只检查配置：
 python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --preview
 
+只读机器人反馈，同时查看 VR 目标（不启动跟随、不下发运动）：
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --observe
+
+实机双臂 VR（现场先确认两臂已使能且停止，退出占用 5999 的控制台）：
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True
+
+默认连接 192.168.0.150:5999，UDP 9998；使用 SDK Tool 累计指令和相对锚点。
+首轮双臂目标限速 0.04m/s、0.20rad/s；不改原单臂参数，也不自动使能。
 左手侧键接管左臂，右手侧键接管右臂；松开仅对应臂减速保持。
 按住侧键时前扳机切换精调；双臂模式不启用夹爪或录制摇杆事件。
-实际连接双臂控制器的参数及映射确认见 docs/a10_vr_operator.md 的“双臂 VR”章节。
+console 分支可在原目录继续开发，但现场不能同时占用控制器 5999 或发送运动。
+两手松开并完成停止过渡后请求全组停止；Ctrl+C 不是急停。双臂 VR 实机验收待现场完成。
+日志：work_dirs/a10/vr/dual_teleop_diagnostics.jsonl（在本开发目录中，不是采集数据集）。
+详细说明见 docs/a10_vr_operator.md 的“双臂 VR”章节。
 
 单臂 VR（旧控制器 192.168.0.125 + 老 USB 夹爪）
 

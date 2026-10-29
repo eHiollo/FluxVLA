@@ -14,7 +14,8 @@ from scipy.spatial.transform import Rotation
 from mmengine import Config
 
 from fluxvla.engines.operators.vr_operator import VROperator
-from fluxvla.engines.operators.vr.control import VRPoseController, ReferenceConfig
+from fluxvla.engines.operators.a10_operator import SDKToolCumulativeAdapter
+from fluxvla.engines.operators.vr.control import VRPoseController, ReferenceConfig, follower_relative
 from fluxvla.engines.operators.vr.monitor import VRMonitorBridge
 from fluxvla.engines.operators.vr.input import VRInput
 from fluxvla.engines.operators.vr.runtime import build_runtime, DualVRTeleopRuntime, inspect_controller
@@ -123,6 +124,39 @@ class DualRobot:
         self.events.append('close')
 
 
+class DualSDKRobot(DualRobot):
+    """Ideal pose feedback for lifecycle tests; real codec is tested on loopback."""
+    cartesian_wire_format = 'pe321'
+
+    def __init__(self):
+        super().__init__()
+        self.adapters = None
+        self.sdk_packets = []
+        self.fail_send = self.fail_begin = False
+
+    def begin_sdk_tool_trajectory(self, poses):
+        self.events.append('begin_sdk')
+        if self.fail_begin:
+            raise RuntimeError('synthetic adapter initialization failed')
+        self.adapters = {name: SDKToolCumulativeAdapter(value) for name, value in poses.items()}
+
+    def send_sdk_tool_pose(self, targets, **limits):
+        if self.fail_send:
+            raise OSError('synthetic UDP failure')
+        candidates = {name: self.adapters[name].propose(target, **limits)
+                      for name, target in targets.items()}
+        for name, (target, cumulative) in candidates.items():
+            self.adapters[name].commit(target, cumulative)
+        self.sdk_packets.append({name: pe.copy() for name, (_, pe) in candidates.items()})
+        self.targets.append({name: follower_relative(self.anchors[name], target)
+                             for name, target in targets.items()})
+        if self.follow:
+            self.poses = copy.deepcopy(targets)
+        return dict(arms={name: dict(planned_pose_m=target.tolist(), cumulative_pe321=pe.tolist())
+                          for name, (target, pe) in candidates.items()},
+                    local_send_success=True, execution_confirmed=False)
+
+
 class DualInputTest(unittest.TestCase):
     def test_snapshot_is_detached_and_partial_left_pose_keeps_its_age(self):
         monitor = VRMonitorBridge('.', {})
@@ -179,6 +213,9 @@ class DualInputTest(unittest.TestCase):
 
 
 class DualRuntimeTest(unittest.TestCase):
+    robot_type = DualRobot
+    cartesian_adapter = 'legacy_anchor'
+
     def setUp(self):
         self.clock = Clock()
         self.clock.value = 100.
@@ -188,9 +225,10 @@ class DualRuntimeTest(unittest.TestCase):
         cfg = configuration()
         self.vr = VROperator(**{k: v for k, v in cfg.input.items() if k != 'type'})
         self.vr.input = HandInput()
-        self.robot = DualRobot()
+        self.robot = self.robot_type()
         self.runtime = DualVRTeleopRuntime(self.vr, self.robot, execute=True,
-            control_mode='reference', max_position_step_m=.005, max_rotation_step_rad=.015)
+            control_mode='reference', cartesian_adapter=self.cartesian_adapter,
+            max_position_step_m=.005, max_rotation_step_rad=.015)
         self.runtime.connect()
         self.addCleanup(self.runtime.close)
         self.seq = 0
@@ -338,7 +376,7 @@ class DualRuntimeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'dual.jsonl'
             self.runtime = DualVRTeleopRuntime(self.vr, control_mode='reference',
-                diagnostics_path=str(path))
+                cartesian_adapter=self.cartesian_adapter, diagnostics_path=str(path))
             self.runtime.connect()
             self.move(count=5)
             self.runtime.close()
@@ -363,13 +401,76 @@ class DualRuntimeTest(unittest.TestCase):
         self.robot.events.clear()
         self.robot.allow_motion = False
         self.runtime = DualVRTeleopRuntime(self.vr, self.robot, execute=False, observe_only=True,
-            control_mode='reference', max_position_step_m=.005, max_rotation_step_rad=.015)
+            control_mode='reference', cartesian_adapter=self.cartesian_adapter,
+            max_position_step_m=.005, max_rotation_step_rad=.015)
         self.runtime.connect()
         self.move()
         self.assertEqual(self.robot.targets, [])
         self.assertNotIn('start', self.robot.events)
         self.assertNotIn('stop', self.robot.events)
+        self.assertNotIn('begin_sdk', self.robot.events)
         self.assertEqual(self.runtime._arms['left']['state'], 'tracking')
+
+
+class DualSDKRuntimeTest(DualRuntimeTest):
+    """Run every independent-hand lifecycle check through the SDK path too."""
+    robot_type = DualSDKRobot
+    cartesian_adapter = 'sdk_tool_cumulative'
+
+    def test_config_selects_sdk_and_keeps_dual_tuning_separate(self):
+        cfg = configuration()
+        runtime = build_runtime(cfg)
+        self.assertEqual(runtime.cartesian_adapter, 'sdk_tool_cumulative')
+        self.assertIsNone(runtime.robot)
+        self.assertFalse(runtime.execute)
+        self.assertEqual(cfg.operator.ws_port, 5999)
+        self.assertEqual(runtime.reference_control.config.max_angular_accel_rad_s2, .96)
+        self.assertEqual(runtime.reference_control.config.max_reference_lead_rad, .12)
+
+    def test_sdk_initializes_once_and_reclutch_never_resets_other_arm(self):
+        self.test_late_engagement_and_reclutch_preserve_other_and_startup_anchors()
+        self.assertEqual(self.robot.events.count('begin_sdk'), 1)
+        self.assertIsNone(self.runtime.last_relative_target)
+        self.assertTrue(self.runtime.last_sdk_command['local_send_success'])
+        self.assertFalse(self.runtime.last_sdk_command['execution_confirmed'])
+        self.assertTrue(all(r['relative_target'] is None
+                            for r in self.runtime.last_reference_result['arms'].values()))
+        self.assertTrue(all(set(p) == {'left', 'right'} for p in self.robot.sdk_packets))
+
+    def test_sdk_initialization_failure_stops_before_first_target(self):
+        self.robot.fail_begin = True
+        with self.assertRaisesRegex(RuntimeError, 'initialization failed'):
+            self.move(count=2)
+        self.assertEqual(self.robot.targets, [])
+        self.assertEqual(self.robot.events.count('stop'), 1)
+
+    def test_sdk_send_failure_stops_and_requires_new_release(self):
+        self.move()
+        sent = len(self.robot.sdk_packets)
+        self.robot.fail_send = True
+        with self.assertRaisesRegex(OSError, 'UDP failure'):
+            self.tick(xleft=.006, xright=.004)
+        self.assertEqual(len(self.robot.sdk_packets), sent)
+        self.assertEqual(self.robot.events.count('stop'), 1)
+        self.tick()
+        self.assertEqual(self.robot.events.count('start'), 1)
+        self.assertEqual(self.runtime.last_reference_result['state'], 'release_required')
+
+    def test_sdk_diagnostics_record_wire_rows_without_claiming_arrival(self):
+        with tempfile.TemporaryDirectory() as directory:
+            from fluxvla.engines.operators.vr.diagnostics import XLeVRDiagnosticsWriter
+            path = Path(directory) / 'sdk.jsonl'
+            self.runtime._diagnostics = XLeVRDiagnosticsWriter(path)
+            self.move(count=8, right=False)
+            self.runtime._diagnostics.close()
+            self.runtime._diagnostics = None
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+        sent = [r for r in rows if r.get('sdk_tool_command')]
+        self.assertTrue(sent)
+        self.assertEqual(set(sent[-1]['sdk_tool_command']['arms']), {'left', 'right'})
+        self.assertIsNone(sent[-1]['sent_relative_target'])
+        self.assertFalse(sent[-1]['sdk_tool_command']['execution_confirmed'])
+        np.testing.assert_allclose(sent[-1]['sdk_tool_command']['arms']['right']['cumulative_pe321'], 0.)
 
 
 class ReleaseControlTest(unittest.TestCase):
@@ -438,6 +539,12 @@ class DualLoopbackTest(unittest.TestCase):
             self.assertEqual(report['udp_targets_sent'], 0)
 
     def test_real_ws_udp_whole_group_and_signed_order(self):
+        self.check_real_ws_udp('legacy_anchor')
+
+    def test_sdk_real_ws_udp_matches_planned_poses_and_holds_other_arm(self):
+        self.check_real_ws_udp('sdk_tool_cumulative')
+
+    def check_real_ws_udp(self, adapter):
         with FakeController() as server:
             server.motion_override = dual_motion()
             robot = server.operator(arms=DUAL_ARMS, cartesian_target_order=['right', 'left'],
@@ -446,6 +553,7 @@ class DualLoopbackTest(unittest.TestCase):
             vr = VROperator(**{k: v for k, v in cfg.input.items() if k != 'type'})
             vr.input = HandInput()
             runtime = DualVRTeleopRuntime(vr, robot, execute=True, control_mode='reference',
+                                         cartesian_adapter=adapter,
                                          max_position_step_m=.005, max_rotation_step_rad=.015)
             clock = Clock()
             clock.value = 100.
@@ -453,7 +561,7 @@ class DualLoopbackTest(unittest.TestCase):
                 with patch('time.monotonic', clock.now):
                     runtime.connect()
                     packets = []
-                    for seq in range(1, 12):
+                    for seq in range(1, 42):
                         clock.advance()
                         vr.input.rows = {'left': hand(seq, True, seq * .0002, -.001 * seq),
                                          'right': hand(seq, False)}
@@ -468,7 +576,19 @@ class DualLoopbackTest(unittest.TestCase):
                             self.assertTrue(all(len(row) == 6 for row in payload['pe']))
                             np.testing.assert_allclose(payload['pe'][0], np.zeros(6), atol=1e-12)
                             packets.append(payload)
+                            if runtime.last_reference_result['state'] == 'await_fresh_sample':
+                                starts = {name: np.array(arm['tcp_pq_m'])
+                                          for name, arm in runtime.last_frame['arms'].items()}
                     self.assertGreater(abs(packets[-1]['pe'][1][0]), 0.)
+                    if adapter == 'sdk_tool_cumulative':
+                        from test_a10_sdk_adapter import sdk_integrate
+                        for row, name in enumerate(robot.cartesian_target_order):
+                            actual = sdk_integrate(starts[name], [np.array(p['pe'][row]) for p in packets])
+                            planned = runtime.last_sdk_command['arms'][name]['planned_pose_m']
+                            np.testing.assert_allclose(actual[:3], planned[:3], atol=1e-5)
+                            self.assertLess((Rotation.from_quat(actual[3:]).inv()
+                                             * Rotation.from_quat(planned[3:])).magnitude(), 1e-5)
+                        self.assertIsNone(runtime.last_relative_target)
                     self.assertEqual(server.commands.count('follower_cart'), 1)
                     runtime.close()
                     self.assertEqual(server.commands.count('stop_follower'), 1)

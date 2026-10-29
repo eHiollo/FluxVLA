@@ -489,12 +489,14 @@ PDF 中的空数组示例直接用于发送。启动锚点刷新规则与完整 
 `fluxvla.projects` 导入后，新入口预览仍通过。日志在
 `work_dirs/a10/vr_native/20261015/`。未进行实机或真实头显验证。
 
-## 双臂 VR：独立锚点与 reference（2026-10-22）
+## 双臂 VR：独立锚点、reference 与 SDK 发送（2026-10-29）
 
 使用新配置 `configs/a10/a10_dual_arm_vr_teleop.py`，原单臂配置和用法保留。
-**前端实现和模拟测试已完成；尚未进行双臂实机验收。** 上次只读调查时 0.125 加载的是单臂 XML，
-本轮没有登录控制器；实机使用前须由团队确认已部署双臂模型、左右编号、GET 反馈行及目标行顺序。
-配置继承 `a10_dual_arm_operator.py`，其中映射仍为模板，不自动识别或切换远端模型。
+用户已反馈 `.150` 双臂基础控制台实机验证通过；**双臂 VR 的 SDK 发送和模拟测试已完成，
+VR 实机验收仍待现场进行。** 配置继承 `a10_dual_arm_operator.py`，连接 `.150:5999`、UDP 9998，
+左右编号、GET 反馈行及目标行顺序须与现场设备一致，不自动识别或切换远端模型。
+本次开发目录为 `/home/robot/VLA/FluxVLA_follower`、分支 `kaanh_follower`；
+原 `/home/robot/VLA/FluxVLA` 的 `console` 分支及其未提交修改不动。
 
 ### 操作逻辑
 
@@ -502,8 +504,13 @@ PDF 中的空数组示例直接用于发送。启动锚点刷新规则与完整 
 - 默认 `hand_to_arm=dict(left='left', right='right')`。左右侧键分别接管对应臂；前扳机只在按住侧键时调整精细比例，不单独接管。
 - 每次接管以当前手柄和该臂的实际位姿记录锚点，平移、旋转均使用旧相对映射；不加载绝对姿态标定。
 - 每臂独立计算 reference、命令速度与跟踪误差；底层 IK、运动规划和电机控制仍在控制器。
-- 两条臂的目标全部检查通过后，`A10Operator.send_eepose()` 按显式行顺序发送一个完整 UDP 包。
-  每条臂均相对**整个 follower 启动时该臂的固定锚点**编码；单手重新接管不改变此锚点。
+- 默认使用 `sdk_tool_cumulative`：每次启动整个 follower 后，以两臂实际位姿调用一次
+  `begin_sdk_tool_trajectory()`；随后 `send_sdk_tool_pose()` 接收两臂完整的计划位姿。
+  operator 把相邻计划位姿变为各臂工具系小步，累计成 SDK 要求的 xyz/Euler321 通道。
+- 两条臂的目标全部检查通过后，按 `cartesian_target_order=['left', 'right']` 发一个完整 UDP 包：
+  `type='321', pe=[[左臂6项], [右臂6项]]`。当前配置对应 ee 0、ee 1，不拼成一行12项。
+  单手重新接管只重建该侧 VR 锚点，**不重置 SDK 累计值，也不重启整个 follower**。
+- `legacy_anchor` 旧发送方式仍保留为显式选项；新双臂配置默认走上述 SDK 适配，不影响原单臂用法。
 
 ### 松手和重新接管
 
@@ -518,11 +525,13 @@ PDF 中的空数组示例直接用于发送。启动锚点刷新规则与完整 
 | 活动输入断流、控制器故障、严重跟踪误差或停止过渡超时 | 请求全组停止；须两手新鲜释放后才允许再次接管 |
 | 全组停止未确认 | 锁定本次会话；禁止松手后自行恢复，需现场核对状态 |
 
-“保持”仍持续发送该臂的固定目标，不能漏掉这一行，也不能用最后的手柄远目标代替。
+“保持”仍持续发送该臂停止终点对应的累计值，不能漏掉这一行、清零，或用最后的手柄远目标代替。
 前端停止过渡只限制**发送目标的速度/加速度**，不保证机械臂物理制动效果；本轮未验证原生
 follower 的内部滤波、插补、断流或制动行为，没有新增单臂 stop 后端协议。
 
-默认 reference 速度保持原值：`0.12 m/s`、`0.32 rad/s`，加速度 `0.4 m/s²`、`0.96 rad/s²`。
+双臂初次试验单独配置 reference 限速：`0.04 m/s`、`0.20 rad/s`，加速度 `0.4 m/s²`、`0.96 rad/s²`，
+参考超前范围 `0.02 m`、`0.12 rad`；这些是前端目标的限制，不是关节实测速度或碰撞距离。
+单臂配置及用户已有单臂调参保持原样。之后调整双臂参数请改 `a10_dual_arm_vr_teleop.py`。
 停止过渡期间同样检查跟踪误差和单步变化；命令速度为零且实际反馈距终点不超过 2 mm / 0.02 rad、
 反馈差分速度不超过 0.01 m/s / 0.05 rad/s，并连续满足 0.1 秒后，认为前端观察到保持。
 超过 2 秒未满足则请求全组停止。这是客户端接收反馈的判定，不是底层电机速度的独立测量。
@@ -531,14 +540,20 @@ follower 的内部滤波、插补、断流或制动行为，没有新增单臂 s
 ### 命令与日志
 
 ```bash
+cd /home/robot/VLA/FluxVLA_follower
+conda activate fluxvla
+
 # 默认只读取双手 VR，不连接机器人、不生成虚构的机器人反馈。
 python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
 
 # 仅构造配置，不启动网页或连接设备。
 python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --preview
+
+# 只读反馈并计算目标，不启动或停止 follower，不发送 UDP。
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --observe
 ```
 
-控制器已确认支持双臂、机械臂已由现场人员使能且停止后：
+机械臂已由现场人员使能且停止后，先退出占用 `.150:5999` 的控制台或其他客户端，再执行：
 
 ```bash
 python scripts/teleoperate.py \
@@ -546,26 +561,31 @@ python scripts/teleoperate.py \
   --cfg-options \
     teleop.vr_only=False \
     teleop.observe_only=False \
-    teleop.operator.host=192.168.0.125 \
     teleop.operator.allow_motion=True
 ```
 
 仍打开终端打印的**本机** HTTPS 地址，不在头显中填写控制器 IP 或 `0.0.0.0`。
+两个工作目录可以并行开发，但不能同时占用同一控制入口或向同一机械臂发送运动。
+示教器原5867入口保留；本机8442/8443网页端口同样一次只运行一个 VR 服务。
 双臂模式禁用旧录制摇杆事件、夹爪输出和摇杆重置；用 `Ctrl+C` 结束会话。
 `--observe` 可只读计算双臂目标，无 UDP 或启停命令；静止设备上的移动目标可能触发跟踪误差。
 本轮不开放双臂标定、采集、夹爪、模型推理、双臂关节轨迹或碰撞避障。
 
-诊断追加到 `work_dirs/a10/vr/dual_teleop_diagnostics.jsonl`：`hands` 保存左右 mapper 诊断，
+诊断追加到本开发目录下 `work_dirs/a10/vr/dual_teleop_diagnostics.jsonl`：`hands` 保存左右 mapper 诊断，
 `raw_input` 分左右手，`mapped_action`、`feedback.arms`、`reference_control.arms` 和
-`sent_relative_target` 按机械臂名区分。`reengage_requires_release` 表示该臂需要重新松手再接管。
+`sdk_tool_command.arms` 按机械臂名区分；每臂有 `cumulative_pe321` 与 `planned_pose_m`。
+SDK 路径的 `sent_relative_target` 为空，避免把累计通道误读为相对四元数位姿。
+`local_send_success` 只表示本机发送成功，`execution_confirmed=false` 不表示确认到位。
+`reengage_requires_release` 表示该臂需要重新松手再接管。
 VR-only 中反馈和发送目标为空；该日志不是训练数据集，也不能证明实际机械臂已经停止。
 
 
-## 单臂 SDK Tool 累计指令适配（2026-10-22）
+## SDK Tool 累计指令适配（单臂与双臂）
 
-`teleop.cartesian_adapter` 默认 `legacy_anchor`。在单臂 `control_mode=reference` 中选择
-`sdk_tool_cumulative`，可同时用于 `anchor_relative` 和 `calibrated_absolute`；要求 operator
-使用 `cartesian_wire_format=pe321`。delta 和双臂拒绝启用此适配。
+单臂基础配置的 `teleop.cartesian_adapter` 默认仍为 `legacy_anchor`；双臂配置默认改用
+`sdk_tool_cumulative`。此适配仅用于 `control_mode=reference`、operator 的
+`cartesian_wire_format=pe321`。单臂支持 `anchor_relative` 和 `calibrated_absolute`；
+双臂仅支持 `anchor_relative`，尚不开放双臂标定。delta 不支持此适配。
 
 上层锚点、标定、reference、速度/加速度和跟踪保护保持原设计。新接口把相邻平滑 command
 位姿的差转换为上一计划工具系的小步运动，再累计为 SDK 的 xyz/Euler321 通道。
@@ -574,6 +594,8 @@ VR-only 中反馈和发送目标为空；该日志不是训练数据集，也不
 `A10Operator.begin_sdk_tool_trajectory(startup_pose)` 只能在本会话新启动、确认健康的 Tool
 Cartesian follower 且没有发送旧路径数据时调用。`send_sdk_tool_pose()` 接收机器人基坐标系
 中的米/xyzw 计划位姿，校验小步限值后发 `type=321, pe=[[...]]`。
+双臂时这两个方法分别接收完整的 `{left: 位姿, right: 位姿}` 字典，输出两行6项；
+双臂初始化仅发生在全组启动时，单侧重新接管不会重置累计状态。
 累计状态在本地发送成功后提交；成功仅表示本机发送，不表示控制器执行或 UDP 已送达。
 发送异常后废弃适配状态并撤销可发送资格，不自动重放。重复目标保持累计值；停止、关闭及
 重新启动会废弃旧状态；同一会话不能混用原 `send_eepose()`。

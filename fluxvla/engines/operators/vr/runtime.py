@@ -32,8 +32,8 @@ class VRTeleopRuntime:
         if cartesian_adapter not in ('legacy_anchor', 'sdk_tool_cumulative'):
             raise ValueError('Unknown cartesian_adapter')
         if cartesian_adapter == 'sdk_tool_cumulative':
-            if control_mode != 'reference' or getattr(vr, 'is_dual', False) or getattr(robot, 'is_multi_arm', False):
-                raise ValueError('SDK tool adapter requires single-arm reference mode')
+            if control_mode != 'reference':
+                raise ValueError('SDK tool adapter requires reference mode')
             if robot is not None and getattr(robot, 'cartesian_wire_format', None) != 'pe321':
                 raise ValueError('SDK tool adapter requires cartesian_wire_format=pe321')
         self.cartesian_adapter = cartesian_adapter
@@ -700,6 +700,21 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             self._dual_require_release = True
             self.teleoperator.reset_reference()
 
+    def _send_dual_targets(self, targets):
+        """Send both planned poses together; SDK state survives per-hand re-clutch."""
+        if self.cartesian_adapter == 'sdk_tool_cumulative':
+            self.last_sdk_command = self.robot.send_sdk_tool_pose(
+                targets, max_position_step_m=self.max_position_step_m,
+                max_rotation_step_rad=self.max_rotation_step_rad)
+            self.last_relative_target = None
+        else:
+            from .control import follower_relative
+            relative = {name: follower_relative(self._arms[name]['control'].startup_anchor, target)
+                        for name, target in targets.items()}
+            self.robot.send_eepose(relative)
+            self.last_relative_target = relative
+        self.last_reference_result['transmitted'] = True
+
     def _input_state(self, raw, action):
         requested, fresh = {}, {}
         for arm, context in self._arms.items():
@@ -721,7 +736,6 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         return requested, fresh
 
     def _step(self, raw, action):
-        from .control import follower_relative
         if not self.execute and not self.observe_only:
             return action  # VR-only maps both hands, never fabricates feedback.
         if self._dual_stop_failed:
@@ -761,14 +775,14 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             for name, context in self._arms.items():
                 context.update(state='holding', blocked=False, key=None, target=poses[name].copy())
                 context['control'].start(poses[name])
-                targets[name] = follower_relative(poses[name], poses[name])
+                targets[name] = poses[name].copy()
             self.teleoperator.reset_reference()  # Discard input predating blocking WS setup.
             self._dual_time = time.monotonic()
             self.last_reference_result = dict(state='await_fresh_sample', arms={}, transmitted=False)
             if self.execute:
-                self.robot.send_eepose(targets)
-                self.last_relative_target = targets
-                self.last_reference_result['transmitted'] = True
+                if self.cartesian_adapter == 'sdk_tool_cumulative':
+                    self.robot.begin_sdk_tool_trajectory(poses)
+                self._send_dual_targets(targets)
             return action
         now = time.monotonic()
         dt = now - self._dual_time
@@ -811,13 +825,13 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     or (Rotation.from_quat(previous[3:]).inv()
                         * Rotation.from_quat(target[3:])).magnitude() > self.max_rotation_step_rad):
                 raise ValueError(f'Dual VR {name}: reference step limit exceeded')
-            targets[name] = result['relative_target']
+            targets[name] = target
+            if self.cartesian_adapter == 'sdk_tool_cumulative':
+                result['relative_target'] = None  # Wire rows are cumulative 321, not relative poses.
             context['target'] = target.copy()
         # Validate BOTH arms first: never transmit a partially valid group.
         if self.execute:
-            self.robot.send_eepose(targets)
-            self.last_relative_target = targets
-            self.last_reference_result['transmitted'] = True
+            self._send_dual_targets(targets)
         self._dual_time = now
         if not any(requested.values()) and all(r['state'] == 'holding' for r in results.values()):
             if self.execute:

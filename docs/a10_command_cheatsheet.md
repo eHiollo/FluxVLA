@@ -275,7 +275,7 @@ teleop.controller_speed_percent=25
 两组均保持 20 mm / 0.12 rad 超前范围。上一轮退出是 `input_stale`（VR 新姿态停更超过 250 ms），
 提速不会解决输入停更，也不应放宽输入过期保护来掩盖它。
 
-## ⑥ 双臂基础状态查询：控制器部署双臂后使用
+## ⑥ 双臂基础状态查询：.150 控制器
 
 ```bash
 python scripts/a10_control.py \
@@ -283,13 +283,20 @@ python scripts/a10_control.py \
   --read-only get
 ```
 
-模板中左右编号、反馈位置和单位须按实际双臂配置核对。**0.125 当前运行的是单臂 XML**，
-此时用双臂模板查询会报告反馈组不匹配，这是预期保护，不会自动切换控制器配置。
+配置默认连接 `.150:5999`，旧 `.125` 单臂继续使用单臂配置。用户已反馈双臂基础控制台实机验证通过；
+左右编号及反馈行仍须与现场设备一致，不自动切换控制器配置。
 想连续查询可将末尾 `get` 换为 `shell`，输入 `get`、`joints`，退出输入 `exit`。
 模板默认禁止运动；控制台启停作用于整个控制组。双臂 VR 独立接管见⑦，尚未实机验收；
-录制、标定、模型推理、双臂关节和夹爪未开放。⑤仍是原单臂 VR 命令。
+双臂录制、标定、模型推理、关节轨迹和夹爪未开放。⑤仍是原单臂 VR 命令。
 
 ## ⑦ 双臂 VR：左手控左臂，右手控右臂
+
+本次在 `kaanh_follower` 的独立目录开发，原 `FluxVLA` 目录的 `console` 分支可继续改代码：
+
+```bash
+cd /home/robot/VLA/FluxVLA_follower
+conda activate fluxvla
+```
 
 先看双手输入，不连接机器人：
 
@@ -300,7 +307,14 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
 头显打开终端打印的网址；按侧键观察终端与双手日志。仅检查配置可加 `--preview`。
 日志：`work_dirs/a10/vr/dual_teleop_diagnostics.jsonl`，不等于数据集录制。
 
-**以下实机命令仅在团队确认双臂 XML、左右编号与反馈布局后使用，不能用于现有单臂控制器。**
+只读机器人反馈并计算目标，不启动跟随、不发送运动：
+
+```bash
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --observe
+```
+
+现场确认两臂已使能且停止后，启动实机双臂 VR。**先退出占用 `.150:5999` 的控制台或其他客户端；
+两个代码目录独立，不代表同一台机器人能由两个程序同时控制。**
 
 ```bash
 python scripts/teleoperate.py \
@@ -308,11 +322,12 @@ python scripts/teleoperate.py \
   --cfg-options \
     teleop.vr_only=False \
     teleop.observe_only=False \
-    teleop.operator.host=192.168.0.125 \
     teleop.operator.allow_motion=True
 ```
 
 - 左右侧键分别接管对应臂；松开一侧，该臂减速保持，另一臂继续。
+- 默认 `.150:5999`、UDP 9998，SDK Tool 累计指令；无需额外填写 host 或发送适配参数。
+- 双臂初次试验目标限速 `0.04 m/s`、`0.20 rad/s`，角加速度 `0.96 rad/s²`；不修改单臂参数。
 - 减速尚未完成就按回侧键，需要等保持后松开一次，再重新按住。
 - 两手释放并完成停止过渡后，全组退出 follower；故障也请求全组停止。
 - 不录制、不控制夹爪、不加载姿态标定；摇杆事件禁用，用 `Ctrl+C` 结束。
@@ -336,7 +351,7 @@ python scripts/teleoperate.py \
 
 ## 使用时记住这几点
 
-- 网页、头显和控制器地址是不同的：网页用**本机局域网 IP**，控制器用 `192.168.0.125`。
+- 网页、头显和控制器地址是不同的：网页用**本机局域网 IP**，旧单臂控制器用 `.125`，新双臂用 `.150`。
 - 一次运行一个 VR 命令；原终端保持打开。换命令先按 `Ctrl+C` 退出，避免网页端口被占用。
 - ①～④不下发运动；⑤及⑦的实机命令会下发运动，退出会请求停止跟随，应确认控制器已停止。**`Ctrl+C` 不是机械臂急停**。
 - 新绝对姿态标定、奇异点及停止过程仍在核实；⑤沿用旧相对映射，不代表这些问题已修复。

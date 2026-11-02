@@ -360,3 +360,47 @@ python scripts/teleoperate.py \
 - ①～④不下发运动；⑤及⑦的实机命令会下发运动，退出会请求停止跟随，应确认控制器已停止。**`Ctrl+C` 不是机械臂急停**。
 - 新绝对姿态标定、奇异点及停止过程仍在核实；⑤沿用旧相对映射，不代表这些问题已修复。
 - 详细功能与历史命令见 [A10 VR 使用说明](a10_vr_operator.md)；人工使能、跟随和关节控制另见 [现场操作说明](a10_onsite_guide.md)。
+
+## ⑧ .150 控制器高频状态记录
+
+仅适用于已加载 `runtime_recorder` 的 `.150:5999`。控制器须由现场确认新库已加载；
+本机不会重启控制器。一次5999连接对应一次记录，多次跟随启停仍在同一会话内。
+
+先验证5秒记录，不启动机械臂、不要求连接VR手柄（仍会启动VR网页服务）：
+
+```bash
+cd /home/robot/VLA/FluxVLA_follower
+conda activate fluxvla
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --observe --record-controller \
+  --cfg-options \
+    teleop.max_steps=150 \
+    teleop.diagnostics_path=work_dirs/a10/vr/controller_recording_check.jsonl
+```
+
+`--observe` 禁止运动；额外的 `--record-controller` 明确允许创建控制器诊断文件。
+出现“控制器高频记录已开始：session=…，file=…”表示确认开始；还应核对状态里的
+`attempted/written/synced` 增长、`dropped` 与 `error`，才能判断数据是否实际采集及保存。
+退出会断开连接，后台完成写盘；本机最终标记 `disconnected_save_unconfirmed`，不冒称已落盘。
+现场可用控制器已有工具只读检查文件：
+
+```bash
+cd /home/kaanh/Desktop/kaanh-project
+python3 runtime_recorder/log_tool.py inspect log/robot_state/
+```
+
+实机遥操作沿用原命令，在 `--config` 行之后、`--cfg-options` 之前加入：
+
+```bash
+  --record-controller \
+```
+
+不开此开关维持原行为。开启时确认录制成功后才允许运动；每秒原连接串行发送心跳并记录状态，
+不另开连接。前端检测到录制停止、IO错误、心跳失败或会话改变时结束遥操作，并走既有停止流程。
+此检测通常最多间隔约1秒，网络阻塞可能更长；原有控制间隔保护继续生效。丢样增加会告警。
+
+控制器文件在 `/home/kaanh/Desktop/kaanh-project/log/robot_state/`，默认250Hz、12轴；
+本机JSONL的 `controller_recording` 保存对应session、文件、状态和请求时间。
+控制器没有 `record_stop`；断线或5秒没有应用消息才结束，WebSocket ping不能替代应用心跳。
+录制失败不自动重连或重发 `record_start`。先退出占用5999的其他程序。

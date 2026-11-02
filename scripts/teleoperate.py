@@ -13,6 +13,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
+    parser.add_argument('--record-controller', action='store_true',
+                        help='同一5999连接开启控制器高频记录；需实机模式或 --observe')
     parser.add_argument('--preview', action='store_true', help='只检查配置，不启动服务或连接设备')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--observe', action='store_true',
@@ -36,6 +38,10 @@ def main(argv=None):
     if cfg.teleop.input.get('arm') == 'both' and (
             args.calibrate_pose or args.verify_calibration or args.pose_calibration):
         parser.error('双臂模式本轮仅支持锚点相对控制，未开放双臂标定或标定验证界面')
+    if args.record_controller:
+        if args.calibrate_pose or args.verify_calibration or args.inspect_controller:
+            parser.error('--record-controller 仅用于遥操作或 --observe')
+        cfg.teleop.record_controller = True
     if args.pose_calibration:
         cfg.teleop.pose_calibration_path = str(args.pose_calibration.expanduser().resolve())
         if not args.calibrate_pose:
@@ -88,6 +94,7 @@ def main(argv=None):
     if args.preview:
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
+              f'record_controller={runtime.record_controller}，'
               '未启动服务或连接设备。')
         return 0
     runtime.run(fps=cfg.teleop.get('fps', 30),

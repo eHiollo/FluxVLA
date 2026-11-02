@@ -797,6 +797,39 @@ class A10Operator(BaseOperator):
         if not self.is_connected:
             raise ConnectionError('A10 operator is not connected')
 
+    def _runtime_recording_request(self, command):
+        """Recorder commands share the control WS transaction lock, not motion ownership."""
+        with self._io_lock:
+            if self.shared_control or self.status_poll_interval_s is not None:
+                raise ValueError('Runtime recording requires one direct WebSocket connection without status polling')
+            if not self.is_connected:
+                raise ConnectionError('A10 operator is not connected')
+            reply = self._connection.request(command)
+            state = reply.get('ret_context')
+            if (not isinstance(state, dict)
+                    or any(type(state.get(k)) is not bool for k in ('connected', 'recording', 'closing'))
+                    or any(not isinstance(state.get(k), str) for k in ('session_id', 'file', 'stop_reason', 'error'))
+                    or any(type(state.get(k)) is not int or state[k] < 0
+                           for k in ('attempted', 'written', 'synced', 'last_synced_cycle', 'dropped'))
+                    or type(state.get('heartbeat_timeout_ms')) is not int
+                    or state['heartbeat_timeout_ms'] <= 0):
+                raise A10ProtocolError('Invalid runtime recorder status reply')
+            return state
+
+    def start_runtime_recording(self):
+        """Explicitly start controller logging; never enable or start the robot."""
+        state = self._runtime_recording_request('record_start')
+        if (not state['connected'] or not state['recording'] or state['closing']
+                or not state['session_id'] or not state['file'] or state['error']):
+            raise RuntimeError(f'Controller recording did not start: {state}')
+        return state
+
+    def get_runtime_recording_status(self):
+        return self._runtime_recording_request('record_status')
+
+    def heartbeat_runtime_recording(self):
+        return self._runtime_recording_request('record_heartbeat')
+
     def get_state(self, *, timeout_s=None):
         with self._io_lock:
             try:

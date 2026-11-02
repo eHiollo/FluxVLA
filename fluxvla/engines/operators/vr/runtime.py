@@ -28,7 +28,8 @@ class VRTeleopRuntime:
                  max_rotation_tracking_error_rad=0.35,
                  control_mode='delta', reference_options=None, observe_only=False,
                  pose_mapping='anchor_relative', pose_calibration=None,
-                 controller_speed_percent=None, cartesian_adapter='legacy_anchor'):
+                 controller_speed_percent=None, cartesian_adapter='legacy_anchor',
+                 record_controller=False):
         if cartesian_adapter not in ('legacy_anchor', 'sdk_tool_cumulative'):
             raise ValueError('Unknown cartesian_adapter')
         if cartesian_adapter == 'sdk_tool_cumulative':
@@ -36,6 +37,14 @@ class VRTeleopRuntime:
                 raise ValueError('SDK tool adapter requires reference mode')
             if robot is not None and getattr(robot, 'cartesian_wire_format', None) != 'pe321':
                 raise ValueError('SDK tool adapter requires cartesian_wire_format=pe321')
+        if type(record_controller) is not bool:
+            raise ValueError('record_controller must be bool')
+        if record_controller and (robot is None or not (execute or observe_only) or not diagnostics_path):
+            raise ValueError('record_controller requires live/observe feedback and a diagnostics_path')
+        self.record_controller = record_controller
+        self.controller_recording = dict(state='disabled' if not record_controller else 'pending')
+        self._recording_next_heartbeat = None
+        self._recording_last_dropped = 0
         self.cartesian_adapter = cartesian_adapter
         self.last_sdk_command = None
         if controller_speed_percent is not None and (
@@ -125,6 +134,47 @@ class VRTeleopRuntime:
         self._speed_restore = None
         self.speed_status = dict(requested_percent=controller_speed_percent, state='unchanged')
 
+    def _recording_event(self):
+        if self._diagnostics is not None:
+            self._diagnostics.write(dict(event='controller_recording',
+                                         controller_recording=self.controller_recording))
+
+    def _controller_recording_request(self, *, start=False):
+        before = dict(client_send_monotonic_ns=time.monotonic_ns(), client_send_wall_ns=time.time_ns())
+        try:
+            status = (self.robot.start_runtime_recording() if start
+                      else self.robot.heartbeat_runtime_recording())
+            timing = dict(before, client_receive_monotonic_ns=time.monotonic_ns(),
+                          client_receive_wall_ns=time.time_ns())
+            self.controller_recording['last_reply'] = status
+            old_session = self.controller_recording.get('session_id')
+            # A shorter server timeout cannot be serviced at the one-second cadence.
+            if status['heartbeat_timeout_ms'] <= 2000:
+                raise RuntimeError('Controller recording heartbeat timeout must exceed 2000 ms')
+            if (not status['recording'] or not status['connected'] or status['closing'] or status['error']
+                    or (not start and status['session_id'] != old_session)):
+                raise RuntimeError(f'Controller recording interrupted: {status}')
+            self.controller_recording.update(state='recording', session_id=status['session_id'],
+                                             file=status['file'], status=status, timing=timing)
+            self._recording_next_heartbeat = time.monotonic() + 1.
+            if start:
+                logging.getLogger(__name__).info('控制器高频记录已开始：session=%s，file=%s',
+                                                 status['session_id'], status['file'])
+            if status['dropped'] > self._recording_last_dropped:
+                logging.getLogger(__name__).warning('控制器高频记录丢样：%s', status['dropped'])
+            self._recording_last_dropped = status['dropped']
+        except BaseException as exc:
+            self.controller_recording.update(state='failed', error=f'{type(exc).__name__}: {exc}', timing=before)
+            logging.getLogger(__name__).error('控制器高频记录未确认：%s', exc)
+            raise
+        finally:
+            self._recording_event()
+
+    def _poll_controller_recording(self):
+        if self.record_controller and self._recording_next_heartbeat is not None:
+            if time.monotonic() >= self._recording_next_heartbeat:
+                self._controller_recording_request()
+
     def _speed_event(self):
         logging.getLogger(__name__).info('控制器倍率：%s', self.speed_status)
         if self._diagnostics is not None:
@@ -187,6 +237,8 @@ class VRTeleopRuntime:
                 self.vr.connect()
             if self.execute or self.observe_only:
                 self.robot.connect()
+                if self.record_controller:
+                    self._controller_recording_request(start=True)
                 self._checked_frame(require_active=False)
             self._apply_speed_override()
             if self.execute or self.observe_only:
@@ -303,6 +355,7 @@ class VRTeleopRuntime:
         try:
             if not self._connected or not self.vr.is_connected:
                 raise ConnectionError('VR input is not connected')
+            self._poll_controller_recording()
             if self.teleoperator is not None:
                 action = self.teleoperator.get_action()
                 raw = self.teleoperator.last_raw
@@ -344,6 +397,8 @@ class VRTeleopRuntime:
                                                 self.reference_control.pose_calibration),
                               reference_control=self.last_reference_result,
                               controller_speed_override=self.speed_status,
+                              controller_recording=self.controller_recording,
+                              client_monotonic_ns=time.monotonic_ns(), client_wall_ns=time.time_ns(),
                               stop_status=self.last_stop_status)
                 self._diagnostics.write(record)
             self._frame_index += 1
@@ -622,7 +677,14 @@ class VRTeleopRuntime:
             finally:
                 try:
                     if self.robot is not None:
-                        self.robot.close()
+                        try:
+                            self.robot.close()  # Disconnect ends the remote recording; no record_stop exists.
+                        finally:
+                            if self.record_controller and self.controller_recording['state'] not in (
+                                    'pending', 'disconnected_save_unconfirmed'):
+                                self._recording_next_heartbeat = None
+                                self.controller_recording.update(state='disconnected_save_unconfirmed')
+                                self._recording_event()
                 finally:
                     try:
                         if self.teleoperator is not None:

@@ -641,3 +641,37 @@ python test/test_a10_sdk_adapter.py \
 此工具选取最近完成的旧发送方式绝对朝向实机会话，以历史 command 不变为前提，比较新旧
 累计指令在 SDK 几何叠加模型中的终点。不是完整滤波/规划复现，不重跑真实反馈闭环，
 不能将回放误差解释为实机控制精度。本轮尚未进行新适配的实机验收。
+
+## .150 控制器高频记录（显式开启）
+
+`python scripts/teleoperate.py --config … --record-controller …` 开启控制器记录。
+开关默认关闭，不会因单独连接或原有遥操作命令自动创建远端文件。要求本地诊断路径有效，
+使用实机模式或 `--observe`，且直连记录器所在的5999，不使用共享代理或第二路后台状态连接。
+`--preview` 只构造配置，不建连接；VR-only不能开启控制器记录。标定、验证网页和
+`--inspect-controller` 不接受此开关。
+
+连接后，在倍率设置、运动启动之前发送 `record_start`，检查返回成功且
+`recording=true`、`closing=false`、session和文件非空、error为空；失败中止启动。
+`A10Operator.start_runtime_recording()`、`get_runtime_recording_status()`、
+`heartbeat_runtime_recording()` 与 `get` 使用同一事务锁、原ARIS消息头和原WebSocket。
+这三个接口不需要运动权限，也不发送运动指令；远端决定是否接受该端口的记录命令。
+
+runtime在控制循环读入手柄前每秒检查心跳，空闲和单次跟随停止时也继续。
+现有GET也能续期，但仍定期确认记录状态。当前要求服务端心跳超时大于2000ms，
+现场默认5000ms；过短配置在启动时拒绝。心跳在同一线程串行收发，若通信阻塞，
+原控制间隔/输入时效保护照常生效。录制中断、错误、会话改变或通信失败时抛错，
+实机走既有全组停止流程，不自动重连/续录；`dropped` 增加会告警，继续标记记录缺口。
+这是低频监督，不能保证在远端停止记录的同一周期就停机。
+
+开启后本机每帧增加 `controller_recording`、`client_monotonic_ns`、`client_wall_ns`；
+记录状态事件含session、控制器文件路径、最近状态、请求前后本机时钟。
+`last_synced_cycle` 只表示最近已同步周期，并非该命令精确执行周期。
+两台主机的单调时钟不能直接相减；墙钟、session及时间窗口只能辅助关联，
+当前没有跨主机4ms精确同步，也没有新增控制器UDP接收事件。
+
+退出先处理机械臂停止和倍率恢复，再断开原连接，由远端排空缓冲并保存；没有
+`record_stop`命令。本机不另连5999追查落盘完成，最终状态明确为
+`disconnected_save_unconfirmed`，须在控制器检查 `.rlog` 的计数、有效性和结束标记。
+控制器记录默认250Hz，实际频率取决于其master采样周期。此记录是运行诊断，不是训练数据集。
+
+首轮无运动验证和原命令的开关位置见[命令速查⑧](a10_command_cheatsheet.md)。

@@ -352,15 +352,27 @@ class DualRuntimeTest(unittest.TestCase):
         for previous, current in zip(self.robot.targets, self.robot.targets[1:]):
             self.assertLessEqual(np.linalg.norm(np.array(current['left'][:3]) - previous['left'][:3]), .005 + 1e-12)
 
-    def test_both_release_stop_once_after_settling(self):
+    def test_both_release_stop_immediately_without_chasing_residual(self):
         self.move()
+        self.robot.follow = False
+        self.robot.poses['left'][0] += .0075
+        self.robot.poses['left'][3:] = (Rotation.from_quat(self.robot.poses['left'][3:])
+                                       * Rotation.from_euler('z', .057)).as_quat()
+        count = len(self.robot.targets)
+        self.tick(False, False)
+        self.assertEqual(len(self.robot.targets), count)
+        self.assertEqual(self.robot.events[-2:], ['stop', 'wait_stopped'])
+        self.assertEqual(self.runtime.last_reference_result['state'], 'stopped')
         for _ in range(25):
             self.tick(False, False)
         self.assertEqual(self.robot.events.count('stop'), 1)
         self.assertEqual(self.robot.events.count('wait_stopped'), 1)
+        restart_actual = copy.deepcopy(self.robot.poses)
         for _ in range(5):
             self.tick(True, True)
         self.assertEqual(self.robot.events.count('start'), 2)
+        for name, actual in restart_actual.items():
+            np.testing.assert_allclose(self.runtime._arms[name]['control'].startup_anchor, actual)
 
     def test_press_during_deceleration_requires_new_release(self):
         self.move()
@@ -419,10 +431,59 @@ class DualRuntimeTest(unittest.TestCase):
     def test_release_settle_timeout_does_not_silently_leave_other_arm_running(self):
         self.move()
         self.robot.follow = False
-        self.robot.poses['left'][0] += .01  # Within tracking cap but cannot settle.
+        # Continued motion within the hard cap must still time out.
         with self.assertRaisesRegex(RuntimeError, 'release_settle_timeout'):
-            for _ in range(70):
+            for i in range(70):
+                self.robot.poses['left'][0] += .001 if i % 2 else -.001
                 self.tick(False, True, 0., .004)
+        self.assertEqual(self.robot.events.count('stop'), 1)
+
+    def test_stable_residual_hold_and_reclutch_do_not_rewind_or_catch_up(self):
+        self.move()
+        self.robot.follow = False
+        self.robot.poses['left'][0] += .0075
+        self.robot.poses['left'][3:] = (Rotation.from_quat(self.robot.poses['left'][3:])
+                                       * Rotation.from_euler('z', .057)).as_quat()
+        for _ in range(75):  # Longer than the old two-second precision timeout.
+            self.tick(False, True, 0., .004)
+        self.assertEqual(self.runtime._arms['left']['state'], 'holding')
+        self.assertNotIn('stop', self.robot.events)
+        before = self.runtime._arms['left']['control'].command_pose.copy()
+        cumulative = (self.robot.sdk_packets[-1]['left'].copy()
+                      if hasattr(self.robot, 'sdk_packets') else None)
+        other_key = self.runtime._arms['right']['key']
+        actual = self.robot.poses['left'].copy()
+        for _ in range(15):
+            self.tick(True, True, .1, .004)  # New grip position, held stationary.
+            np.testing.assert_allclose(self.runtime._arms['left']['control'].command_pose,
+                                       before, atol=1e-12)
+            if cumulative is not None:
+                np.testing.assert_allclose(self.robot.sdk_packets[-1]['left'], cumulative, atol=1e-12)
+        np.testing.assert_allclose(self.runtime._arms['left']['control'].anchor.robot_anchor, actual)
+        self.assertEqual(self.runtime._arms['right']['key'], other_key)
+        self.assertEqual(self.robot.events.count('start'), 1)
+        for i in range(1, 10):
+            self.tick(True, True, .1 + .0002 * i, .004)
+        self.assertGreater(np.linalg.norm(self.runtime._arms['left']['control'].command_pose[:3] - before[:3]), 0.)
+
+    def test_both_release_stop_failure_blocks_restart(self):
+        self.move()
+        self.robot.stop_timeout = True
+        count = len(self.robot.targets)
+        with self.assertRaisesRegex(TimeoutError, 'stop unconfirmed'):
+            self.tick(False, False)
+        self.assertEqual(len(self.robot.targets), count)
+        self.robot.stop_timeout = False
+        with self.assertRaisesRegex(RuntimeError, 'stop is unconfirmed'):
+            self.tick(False, False)
+        self.assertEqual(self.robot.events.count('start'), 1)
+
+    def test_released_arm_excessive_residual_stops_entire_group(self):
+        self.move()
+        self.robot.follow = False
+        self.robot.poses['left'][0] += .06
+        with self.assertRaisesRegex(RuntimeError, 'release_tracking_error'):
+            self.tick(False, True, 0., .004)
         self.assertEqual(self.robot.events.count('stop'), 1)
 
     def test_vr_only_diagnostics_include_both_hands_without_robot_feedback(self):
@@ -586,8 +647,8 @@ class ReleaseControlTest(unittest.TestCase):
         control = VRPoseController(ReferenceConfig(release_timeout_s=.15))
         control.start(IDENTITY)
         actual = IDENTITY.copy()
-        actual[0] = .01
-        for _ in range(10):
+        for i in range(10):
+            actual[0] = .01 + .001 * (i % 2)
             result = control.step_released(actual, .02)
         self.assertEqual(result['fault_reason'], 'release_settle_timeout')
         self.assertTrue(result['stop_requested'])

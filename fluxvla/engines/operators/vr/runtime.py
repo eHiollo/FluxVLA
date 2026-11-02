@@ -784,6 +784,19 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     self.robot.begin_sdk_tool_trajectory(poses)
                 self._send_dual_targets(targets)
             return action
+        # A fresh release of BOTH hands follows the single-arm lifecycle:
+        # native stop + confirmation, with no more UDP endpoint chasing.
+        if not any(requested.values()) and all(fresh.values()):
+            self.last_reference_result = dict(state='stopping', arms={}, transmitted=False,
+                                             reason='both_hands_released')
+            if self.execute:
+                self._stop_reference()
+            else:
+                self._dual_time = None
+                self._dual_require_release = True
+                self.teleoperator.reset_reference()
+            self.last_reference_result['state'] = 'stopped'
+            return action
         now = time.monotonic()
         dt = now - self._dual_time
         feedback_age = now - self.last_frame['received_monotonic_s']
@@ -833,13 +846,6 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if self.execute:
             self._send_dual_targets(targets)
         self._dual_time = now
-        if not any(requested.values()) and all(r['state'] == 'holding' for r in results.values()):
-            if self.execute:
-                self._stop_reference()
-            else:
-                self._dual_time = None
-                self.teleoperator.reset_reference()
-            self.last_reference_result['state'] = 'stopped'
         return action
 
 

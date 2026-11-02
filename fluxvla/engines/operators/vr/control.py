@@ -118,6 +118,8 @@ class ReferenceConfig:
     # None preserves the original C++ parity path. Config opts into soft lead limits.
     max_reference_lead_m: float | None = None
     max_reference_lead_rad: float | None = None
+    # Retained for configuration compatibility; dual release uses stability plus
+    # the hard tracking caps, not precision arrival at the frontend endpoint.
     release_position_tolerance_m: float = .002
     release_rotation_tolerance_rad: float = .02
     release_settle_s: float = .1
@@ -351,6 +353,8 @@ class VRPoseController:
         self.fault_reason = None
         self._release_elapsed_s = self._release_settled_s = 0.
         self._release_previous_actual = None
+        self._reanchor_translation = np.zeros(3)
+        self._reanchor_rotation = Rotation.identity()
 
     def _new_anchor(self):
         return (CalibratedAnchorState(self.pose_calibration)
@@ -416,6 +420,14 @@ class VRPoseController:
                 packet = self.anchor.update(command, actual)
                 self.input_age_s = sample_age_s
                 if packet == 'anchored':
+                    # Keep the measured clutch anchor, but carry its existing
+                    # command/feedback offset into this segment. A stationary
+                    # hand must not trigger catch-up or rewind the UDP stream.
+                    self._reanchor_translation = (self.command_pose[:3] - actual[:3]
+                                                  if continuous_reanchor else np.zeros(3))
+                    self._reanchor_rotation = (
+                        Rotation.from_quat(self.command_pose[3:]) * Rotation.from_quat(actual[3:]).inv()
+                        if continuous_reanchor else Rotation.identity())
                     self.governor.engage(self.command_pose if continuous_reanchor else actual)
                     if not continuous_reanchor:
                         self.command_pose = actual.copy()
@@ -436,7 +448,9 @@ class VRPoseController:
             return self._result('fault', stop=True, packet=packet)
         if not self.anchor.active:
             return self._result('inactive', packet=packet)
-        state = self.governor.step(self.anchor.target, actual, dt_s)
+        tracking_target = np.r_[self.anchor.target[:3] + self._reanchor_translation,
+                                (self._reanchor_rotation * Rotation.from_quat(self.anchor.target[3:])).as_quat()]
+        state = self.governor.step(tracking_target, actual, dt_s)
         if state == 'fault':
             self.fault_reason = 'tracking_error'
             return self._result('fault', stop=True, packet=packet)
@@ -474,6 +488,7 @@ class VRPoseController:
             result.update(command_tracking_error_m=float(error_m), command_tracking_error_rad=float(error_rad))
             return result
         result = self._result(state, packet=packet)
+        result['tracking_target'] = tracking_target.tolist()
         result.update(command_tracking_error_m=float(error_m), command_tracking_error_rad=float(error_rad))
         return result
 
@@ -523,9 +538,9 @@ class VRPoseController:
                      and (Rotation.from_quat(previous[3:]).inv()
                           * Rotation.from_quat(actual[3:])).magnitude() <= .05 * dt_s)
         self._release_previous_actual = actual.copy()
-        settled = (stopped_command and quiet
-                   and error_m <= self.config.release_position_tolerance_m
-                   and error_rad <= self.config.release_rotation_tolerance_rad)
+        # Holding is not precision arrival. Residual error stays visible and
+        # bounded by max_tracking_error_* above; it is never silently zeroed.
+        settled = stopped_command and quiet and self.fault_reason is None
         self._release_settled_s = self._release_settled_s + dt_s if settled else 0.
         held = self._release_settled_s >= self.config.release_settle_s
         if not held and self._release_elapsed_s > self.config.release_timeout_s:
@@ -536,7 +551,9 @@ class VRPoseController:
             self._release_elapsed_s = 0.  # A later disturbance gets its own settle budget.
         result = self._result('holding' if held else 'releasing')
         result['relative_target'] = follower_relative(self.startup_anchor, self.command_pose).tolist()
-        result['release_elapsed_s'] = self._release_elapsed_s
+        result.update(release_elapsed_s=self._release_elapsed_s,
+                      command_stopped=bool(stopped_command), feedback_quiet=bool(quiet),
+                      release_stable_s=self._release_settled_s)
         return result
 
 

@@ -163,15 +163,15 @@ class DualSDKRobot(DualRobot):
 
 
 class DualInputTest(unittest.TestCase):
-    def test_left_forward_up_swap_preserves_right_translation_and_both_rotations(self):
+    def test_site_profile_uses_shared_translation_and_rotation_for_both_hands(self):
         vr = build_runtime(configuration()).teleoperator
         vr.input = HandInput()
         clock = Clock()
         clock.value = 100.
-        # Expected tool-local translations for the two reported physical gestures.
+        # Expected tool-local translations with identical hand poses; not site calibration.
         gestures = (
-            ([0., 0., -.003], [.0027, 0., 0.], [0., 0., .0027]),  # forward
-            ([0., .003, 0.], [0., 0., .0027], [.0027, 0., 0.]),  # up
+            ([0., 0., -.003], [0., 0., .0027], [0., 0., .0027]),  # forward
+            ([0., .003, 0.], [.0027, 0., 0.], [.0027, 0., 0.]),  # up
             ([.003, 0., 0.], [0., .0027, 0.], [0., .0027, 0.]),  # sideways
         )
         with patch('time.monotonic', clock.now):
@@ -196,6 +196,7 @@ class DualInputTest(unittest.TestCase):
                                                right['_xlevr.anchor_command']['offset'][3:], atol=1e-12)
                     np.testing.assert_allclose([left[f'ee.delta_r{a}'] for a in 'xyz'],
                                                [right[f'ee.delta_r{a}'] for a in 'xyz'], atol=1e-12)
+        self.assertIsNone(vr.mappers['left'].position_axis_remap)
         self.assertIsNone(vr.mappers['right'].position_axis_remap)
 
     def test_invalid_per_hand_settings_are_rejected_before_connecting(self):

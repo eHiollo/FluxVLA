@@ -21,11 +21,7 @@ teleop = dict(
     # Onsite .150: physical left arm is ee 1 (operator key 'right'), right is ee 0.
     # Swap input bindings only; keep GET mappings and UDP row order unchanged.
     input=dict(arm='both', hand_to_arm=dict(left='right', right='left'),
-               # .150 onsite: exchange left-hand forward/up translation channels.
-               # Right hand and both hands' rotation mappings keep the shared defaults.
-               mapping_by_hand=dict(left=dict(position_axis_remap=[
-                   [0., 0., -1.], [1., 0., 0.], [0., 1., 0.],
-               ])),
+               # Both hands use the shared mapping; no left-only translation swap.
                enable_left_events=False, network=dict(host_ip='0.0.0.0')),
     operator={{_base_.operator}},
     diagnostics_path='work_dirs/a10/vr/dual_teleop_diagnostics.jsonl',

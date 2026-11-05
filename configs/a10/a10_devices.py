@@ -8,11 +8,18 @@ left/right 按手柄和物理机械臂命名，不是 A10Operator 的内部字�
 旧单臂/老夹爪配置继续单独使用，不能把知行 raw 位置当成旧夹爪毫米值。
 """
 
-# 单独的外部场景相机；不是手腕相机。只有这一台，未配置虚拟第二视角。
-# D405 序列号 255323070551，index4 为彩色流；index0 为深度流。
-# 实测 640x480 RGB / 30Hz，rotate_180=False 保留现场检查时的原始方向。
+# 现场更正：未连接外部相机。逐台拔线/换接已验证接口确认：
+# 左腕 D405 255323070485；右腕 D405 255323070551。
+# 不将腕部画面绑定到 base_0_rgb，也不把同一台复制为第二路相机。
+# 两台均使用 index4 彩色流，index0 为深度流；分别读取验证 640x480 RGB / 30Hz。
+# 断电重启后暂仅枚举左腕，双路同时读取仍待排查右腕连接后验证。
+# rotate_180=False 保留原始画面方向，安装方向待现场预览确认。
 cameras = dict(
-    base_0_rgb=dict(
+    left_wrist_0_rgb=dict(
+        device='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_255323070485-video-index4',
+        width=640, height=480, fps=30, rotate_180=False,
+    ),
+    right_wrist_0_rgb=dict(
         device='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_255323070551-video-index4',
         width=640, height=480, fps=30, rotate_180=False,
     ),

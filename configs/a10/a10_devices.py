@@ -12,9 +12,16 @@ left/right 按手柄和物理机械臂命名，不是 A10Operator 的内部字�
 # 左腕 D405 255323070485；右腕 D405 255323070551。
 # 不将腕部画面绑定到 base_0_rgb，也不把同一台复制为第二路相机。
 # 两台均使用 index4 彩色流，index0 为深度流；双路同时读取各95帧，640x480 RGB / 30Hz。
-# 右腕换接后恢复识别；外部相机用户已接线，但系统尚未识别，不填写猜测ID。
+# 外部 D435i 序列号 262923065199，彩色接口为USB interface 03。
+# 本机该D435i的by-id index0在深度/彩色接口间重名，故使用区分接口的by-path。
+# 外部相机需要保持当前USB插口；换口后重新核对序列号、彩色接口和路径。
+# 三路同时读取各95帧，640x480 RGB / 约30Hz；未启用深度、IMU或硬件同步。
 # rotate_180=False 保留原始画面方向，安装方向待现场预览确认。
 cameras = dict(
+    base_0_rgb=dict(
+        device='/dev/v4l/by-path/platform-a80aa10000.usb-usb-0:3.2.2:1.3-video-index0',
+        width=640, height=480, fps=30, rotate_180=False,
+    ),
     left_wrist_0_rgb=dict(
         device='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_255323070485-video-index4',
         width=640, height=480, fps=30, rotate_180=False,

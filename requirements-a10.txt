@@ -4,3 +4,8 @@ websockets==15.0.1
 
 # USB bus-servo gripper
 pyserial==3.5
+
+# A10 dataset recording/export (no LeRobot installation required in FluxVLA).
+av==14.2.0
+pandas>=2.2,<3
+pyarrow>=21,<26

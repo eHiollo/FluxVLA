@@ -404,3 +404,22 @@ python3 runtime_recorder/log_tool.py inspect log/robot_state/
 本机JSONL的 `controller_recording` 保存对应session、文件、状态和请求时间。
 控制器没有 `record_stop`；断线或5秒没有应用消息才结束，WebSocket ping不能替代应用心跳。
 录制失败不自动重连或重发 `record_start`。先退出占用5999的其他程序。
+
+## 单臂训练数据检查与导出（离线，不连接设备）
+
+本轮只完成录制核心，尚未把相机/VR录制循环接入 `teleoperate.py`。
+`--record-controller` 是诊断日志，不是训练数据。接口及后续接线见 [录制核心说明](a10_recording_core.md)。
+
+```bash
+# 快速检查旧数据；去掉 --skip-videos 会进一步解码核对视频。
+python scripts/validate_a10_dataset.py \
+  /home/robot/VLA/lerobot/dataset/a10_vr_9_21_4 --skip-videos
+
+# 以下要求已有录制核心生成的数据，并且录制程序已经关闭。
+python scripts/validate_a10_dataset.py work_dirs/a10/datasets/a10_record
+python scripts/export_a10_openpi_dataset.py \
+  --source work_dirs/a10/datasets/a10_record \
+  --output work_dirs/a10/datasets/a10_record_openpi
+```
+
+导出目标必须不存在，原数据不会修改；输出供当前 OpenPI 的 v2.1 reader 使用，训练前重新计算 norm_stats。

@@ -9,3 +9,6 @@ pyserial==3.5
 av==14.2.0
 pandas>=2.2,<3
 pyarrow>=21,<26
+
+# Device-check camera JPEGs and labeled overview.
+pillow

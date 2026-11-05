@@ -149,5 +149,151 @@ class DeviceTests(unittest.TestCase):
         self.assertTrue(all(packet[1] == 3 for packet in transport.writes))
 
 
+class DeviceVisualTests(unittest.TestCase):
+    def setUp(self):
+        self.config, _ = m.load_config(SOURCE)
+        left = self.config['grippers']['left']
+        left.update(speed=5, check=dict(positions_raw=(0, 1000), open_raw=None, close_raw=None))
+        self.config['grippers']['right'] = copy.deepcopy(left)
+        self.config['grippers']['right']['port'] = '/dev/serial/by-id/right'
+        self.config['grippers']['right']['identity']['serial'] = 'right'
+        self.rows = m.match_devices(self.config, [camera(), gripper()])
+        for row in self.rows:
+            if row['name'] == 'left':
+                row['status'] = 'matched'
+        self.rows[-1].update(configured_path='/dev/serial/by-id/right', node='/dev/ttyUSB8', status='matched')
+        sys.path.insert(0, str(Path(__file__).parent))
+        try:
+            from test_zx_gripper import FakeSerial
+        finally:
+            sys.path.pop(0)
+        self.transport = FakeSerial()
+        self.transport.alarms = (0, 0)
+        self.transport.position = 0
+
+    def test_left_and_right_motion_open_only_selected_port(self):
+        for side, target in [('left', 1000), ('right', 0)]:
+            self.transport.closed = False
+            with patch('serial.Serial', return_value=self.transport) as opened:
+                result = m.move_gripper(self.config, self.rows, side, 'position', target)
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(opened.call_args.args[0], self.config['grippers'][side]['port'])
+            self.assertEqual(result['side'], side)
+            self.assertEqual(result['final']['position_raw'], target)
+            self.assertTrue(self.transport.closed)
+            self.assertTrue(self.transport.enabled)  # no automatic release
+
+    def test_alarm_blocks_all_motion_writes(self):
+        self.transport.alarms = (0, 0x1000)
+        with patch('serial.Serial', return_value=self.transport):
+            with self.assertRaisesRegex(RuntimeError, '有报警'):
+                m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
+        self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+    def test_position_outside_check_range_blocks_motion(self):
+        self.transport.position = 3000
+        with patch('serial.Serial', return_value=self.transport):
+            with self.assertRaisesRegex(ValueError, '实际位置'):
+                m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
+        self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+    def test_unconfirmed_direction_and_invalid_target_do_not_open_port(self):
+        with patch.object(m, 'load_operator') as loader:
+            for action, target in [('open', None), ('close', None), ('position', 500)]:
+                with self.assertRaises(ValueError):
+                    m.move_gripper(self.config, self.rows, 'left', action, target)
+            loader.assert_not_called()
+
+    def test_only_confirmed_direction_uses_open_close_labels(self):
+        self.config['grippers']['left']['check'].update(open_raw=1000, close_raw=0)
+        with patch('serial.Serial', return_value=self.transport):
+            result = m.move_gripper(self.config, self.rows, 'left', 'open')
+        self.assertEqual(result['target_raw'], 1000)
+        self.assertEqual(result['final']['completion'], 'position_reached')
+
+    def test_wrong_or_stale_identity_does_not_open_port(self):
+        for status in ('missing', 'path_changed', 'ambiguous', 'unusable'):
+            self.rows[1]['status'] = status
+            with patch.object(m, 'load_operator') as loader:
+                with self.assertRaises(ValueError):
+                    m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
+                loader.assert_not_called()
+
+    def test_excess_speed_rejected_before_any_serial_access(self):
+        self.config['grippers']['left']['speed'] = 6
+        with patch.object(m, 'load_operator') as loader:
+            with self.assertRaisesRegex(ValueError, 'speed'):
+                m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
+            loader.assert_not_called()
+
+    def test_motion_failure_is_not_retried_or_followed_by_release(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.read_state.return_value = SimpleNamespace(has_error=False, position_raw=0)
+        client.set_position_raw.side_effect = RuntimeError('timeout')
+        module = SimpleNamespace(ZXGripper=MagicMock(return_value=client))
+        with patch.object(m, 'load_operator', return_value=module):
+            with self.assertRaisesRegex(RuntimeError, 'timeout'):
+                m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
+        self.assertEqual(client.set_position_raw.call_count, 1)
+        client.disable.assert_not_called()
+        client.reset_alarms.assert_not_called()
+        self.assertEqual(client.__exit__.call_count, 1)
+
+    def test_snapshot_outputs_three_rgb_images_and_labeled_overview(self):
+        import json
+        import numpy as np
+        from PIL import Image
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        names = ('base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb')
+        colors = ((250, 10, 10), (10, 250, 10), (10, 10, 250))
+        frame = {name: np.full((48, 64, 3), color, dtype=np.uint8) for name, color in zip(names, colors)}
+        frame['camera_received_monotonic_s'] = 12.5
+        rows = [dict(group='cameras', name=name, label=name, serial=str(i), status='matched',
+                     configured_path='/dev/fake' + str(i), node='/dev/video' + str(i)) for i, name in enumerate(names)]
+        cfg = dict(cameras={name: dict(device=row['configured_path']) for name, row in zip(names, rows)})
+        operator = MagicMock()
+        operator.__enter__.return_value = operator
+        operator.get_frame.return_value = frame
+        module = SimpleNamespace(CameraOperator=MagicMock(return_value=operator))
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / 'photos'
+            with patch.object(m, 'load_operator', return_value=module):
+                result = m.take_snapshots(cfg, rows, output)
+            self.assertEqual(len(list(output.glob('*.jpg'))), 4)
+            with Image.open(output / 'overview.jpg') as overview:
+                self.assertEqual(overview.size, (1920, 566))
+            manifest = json.loads((output / 'manifest.json').read_text())
+            for name, color in zip(names, colors):
+                with Image.open(output / (name + '.jpg')) as image:
+                    self.assertTrue(all(abs(a - b) <= 3 for a, b in zip(image.getpixel((0, 0)), color)))
+                self.assertEqual(manifest['cameras'][name]['serial'], result['cameras'][name]['serial'])
+            self.assertEqual(operator.__exit__.call_count, 1)
+            with patch.object(m, 'load_operator', return_value=module):
+                with self.assertRaises(FileExistsError):
+                    m.take_snapshots(cfg, rows, output)
+
+    def test_snapshot_missing_camera_refuses_before_capture(self):
+        with patch.object(m, 'load_operator') as loader:
+            with self.assertRaises(ValueError):
+                m.take_snapshots(self.config, self.rows)
+            loader.assert_not_called()
+
+    def test_conflicting_cli_actions_rejected_without_scan(self):
+        args = [ ['--snapshot', '--gripper', 'left', '--position-raw', '0'],
+                 ['--snapshot', '--update'], ['--gripper', 'left'], ['--open'],
+                 ['--gripper', 'left', '--position-raw', '0', '--check-grippers'],
+                 ['--gripper', 'left', '--open', '--close'] ]
+        with patch.object(m, 'scan_devices') as scan, patch('sys.stderr'):
+            for argv in args:
+                with self.assertRaises(SystemExit) as result:
+                    m.main(argv)
+                self.assertEqual(result.exception.code, 2)
+            scan.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

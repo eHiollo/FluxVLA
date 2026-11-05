@@ -225,12 +225,109 @@ def update_paths(path, original, nodes, rows):
     return backup
 
 
-def check_grippers(rows, config):
-    # Load standalone driver without initializing FluxVLA, torch or ROS.
-    spec = importlib.util.spec_from_file_location('_a10_devices_zx', ROOT / 'fluxvla/engines/operators/zx_gripper.py')
+def load_operator(kind):
+    filename = 'camera_operator.py' if kind == 'camera' else 'zx_gripper.py'
+    spec = importlib.util.spec_from_file_location(
+        '_a10_devices_' + kind, ROOT / 'fluxvla/engines/operators' / filename)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    return module
+
+
+def require_matched(rows, group, name=None):
+    selected = [row for row in rows if row['group'] == group and
+                (name is None or row['name'] == name)]
+    if not selected:
+        raise ValueError('设备清单中没有所选设备')
+    bad = [f"{row['label']}：{STATUS[row['status']]}" for row in selected if row['status'] != 'matched']
+    if bad:
+        raise ValueError('；'.join(bad) + '。请先检查设备，路径变化时单独执行 --update')
+    return selected
+
+
+def take_snapshots(config, rows, output_dir=None):
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+    selected = require_matched(rows, 'cameras')
+    for row in selected:
+        if not row['name'] or any(ch not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for ch in row['name']):
+            raise ValueError('相机名称只能包含字母、数字、下划线或短横线')
+    if output_dir is not None and output_dir.exists():
+        raise FileExistsError('拍照目录已存在，请选择新目录，避免覆盖之前的检查图片')
+    # Read all cameras before writing images: failure cannot masquerade as a full capture.
+    camera_module = load_operator('camera')
+    with camera_module.CameraOperator(config['cameras']) as cameras:
+        for _ in range(5):
+            frames = cameras.get_frame()
+    images = {row['name']: Image.fromarray(frames[row['name']], 'RGB') for row in selected}
+    folder = (output_dir if output_dir is not None else
+              ROOT / 'work_dirs/a10/hardware_checks' / datetime.now().strftime('device_check_%Y%m%d_%H%M%S_%f'))
+    folder = folder.resolve()
+    folder.mkdir(parents=True, exist_ok=False)
+    font_path = Path('/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc')
+    font = ImageFont.truetype(str(font_path), 21) if font_path.exists() else ImageFont.load_default()
+    width, height, header = 640, 480, 86
+    overview = Image.new('RGB', (width * len(selected), height + header), '#151a22')
+    draw = ImageDraw.Draw(overview)
+    manifest = dict(created=datetime.now().astimezone().isoformat(),
+                    camera_received_monotonic_s=frames['camera_received_monotonic_s'],
+                    hardware_synchronized=False, cameras={})
+    for i, row in enumerate(selected):
+        name = row['name']
+        image_path = folder / (name + '.jpg')
+        images[name].save(image_path, quality=95)
+        label = f"{row['label']} / {name}" if font_path.exists() else name
+        draw.text((i * width + 12, 8), label, font=font, fill='white')
+        draw.text((i * width + 12, 43), 'SN: ' + row['serial'], font=font, fill='#9bd5ff')
+        thumb = ImageOps.contain(images[name], (width, height))
+        overview.paste(thumb, (i * width + (width - thumb.width) // 2,
+                              header + (height - thumb.height) // 2))
+        manifest['cameras'][name] = dict(serial=row['serial'], device=row['configured_path'],
+                                         node=row['node'], image=str(image_path),
+                                         width=images[name].width, height=images[name].height)
+    overview.save(folder / 'overview.jpg', quality=95)
+    (folder / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
+    return dict(directory=str(folder), overview=str(folder / 'overview.jpg'), **manifest)
+
+
+def move_gripper(config, rows, side, action, position_raw=None):
+    row, = require_matched(rows, 'grippers', side)
+    settings = config['grippers'][side]
+    check = settings.get('check', {})
+    positions = check.get('positions_raw')
+    if positions not in ((0, 1000), [0, 1000]):
+        raise ValueError('检查动作只支持已验证的位置0和1000，需要配置 check.positions_raw=(0, 1000)')
+    if action in ('open', 'close'):
+        opened, closed = check.get('open_raw'), check.get('close_raw')
+        if (type(opened) is not int or type(closed) is not int or
+                opened not in positions or closed not in positions or opened == closed):
+            raise ValueError('开合方向未确认；先用 --position-raw 0 / 1000 观察，再填写 check.open_raw 和 close_raw')
+        position_raw = opened if action == 'open' else closed
+    if type(position_raw) is not int or position_raw not in positions:
+        raise ValueError('检查位置仅允许0或1000，不是毫米或完整开合行程')
+    speed, torque = settings.get('speed'), settings.get('torque')
+    if (type(speed) is not int or not 1 <= speed <= 5 or
+            type(torque) is not int or not 1 <= torque <= 60):
+        raise ValueError('设备辨认动作要求 speed 在1..5、torque在1..60，不允许提高至完整操作速度')
+    gripper_module = load_operator('gripper')
+    # Only the selected port is opened. No robot controller is constructed.
+    with gripper_module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'],
+                                  max_position_raw=1000) as gripper:
+        initial = gripper.read_state(settings['device_id'])
+        if initial.has_error:
+            raise RuntimeError(f"夹爪有报警，不发送动作：0x{initial.alarm_a:04X}/0x{initial.alarm_b:04X}")
+        if not 0 <= initial.position_raw <= 1005:
+            raise ValueError('实际位置不在本次0..1000检查范围附近，不发送可能的大行程动作')
+        final = gripper.set_position_raw(settings['device_id'], position_raw,
+                                         speed=speed, torque=torque, wait=True, move_timeout=10)
+    return dict(side=side, serial=row['serial'], port=row['configured_path'],
+                action=action, initial_raw=initial.position_raw, target_raw=position_raw,
+                speed=speed, torque=torque, final=asdict(final))
+
+
+def check_grippers(rows, config):
+    module = load_operator('gripper')
     for row in rows:
         if row['group'] != 'grippers' or row['status'] not in ('matched', 'path_changed'):
             continue
@@ -265,6 +362,14 @@ def print_report(report):
             unknown.setdefault(key, []).append(device['node'])
     for (_, serial, model), nodes in unknown.items():
         print(f"未登记设备：{model}，序列号={serial or '无'}，节点={','.join(nodes)}；不自动分配左右")
+    if report.get('snapshot'):
+        print('三路相机检查图片：' + report['snapshot']['directory'])
+        print('带名称和序列号的拼图：' + report['snapshot']['overview'])
+    if report.get('gripper_motion'):
+        motion = report['gripper_motion']
+        print(f"{LABELS[motion['side']]} 检查目标raw={motion['target_raw']}；"
+              f"实际raw={motion['final']['position_raw']}；完成原因={motion['final']['completion']}")
+        print('串口已关闭；保持最后目标和力矩，不自动张开或掉使能。')
     if report['backup']:
         print('路径已更新，原配置备份：' + report['backup'])
     elif report['update_requested']:
@@ -279,7 +384,23 @@ def main(argv=None):
     parser.add_argument('--update', action='store_true', help='先备份，只更新按身份唯一匹配设备的连接路径')
     parser.add_argument('--check-grippers', action='store_true', help='额外打开已匹配夹爪串口，只读配置ID的状态')
     parser.add_argument('--json', action='store_true', help='输出完整JSON，包含各视频接口和格式')
+    parser.add_argument('--snapshot', action='store_true', help='三路相机各拍一张并保存带标签的拼图')
+    parser.add_argument('--output-dir', type=Path, help='拍照输出目录，须为新目录；默认保存到本仓库work_dirs')
+    parser.add_argument('--gripper', choices=('left', 'right'), help='仅操作指定侧夹爪，用于空载设备辨认')
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--position-raw', type=int, choices=(0, 1000), help='小范围辨认位置，仅0或1000')
+    actions.add_argument('--open', dest='open_gripper', action='store_true', help='方向确认配置后，移动到检查张开位置')
+    actions.add_argument('--close', dest='close_gripper', action='store_true', help='方向确认配置后，移动到检查闭合位置')
     args = parser.parse_args(argv)
+    has_action = args.position_raw is not None or args.open_gripper or args.close_gripper
+    if bool(args.gripper) != bool(has_action):
+        parser.error('--gripper left/right 必须配合 --position-raw 0/1000 或 --open/--close')
+    if args.snapshot and args.gripper:
+        parser.error('拍照和夹爪动作请分开执行')
+    if (args.snapshot or args.gripper) and (args.update or args.check_grippers):
+        parser.error('拍照/夹爪动作不能和 --update 或 --check-grippers 混用')
+    if args.output_dir is not None and not args.snapshot:
+        parser.error('--output-dir 仅用于 --snapshot')
     try:
         path = args.config.resolve()
         original = path.read_bytes()
@@ -295,15 +416,24 @@ def main(argv=None):
                     row.update(status='matched', configured_path=row['path'])
         report = dict(bindings=rows, devices=devices, backup=str(backup) if backup else None,
                       update_requested=args.update)
+        if args.snapshot:
+            report['snapshot'] = take_snapshots(config, rows, args.output_dir)
+        if args.gripper:
+            action = 'open' if args.open_gripper else 'close' if args.close_gripper else 'position'
+            report['gripper_motion'] = move_gripper(config, rows, args.gripper, action, args.position_raw)
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print_report(report)
+        if args.snapshot or args.gripper:
+            return 0
         return int(any(row['status'] != 'matched' or row.get('gripper_error') or
                        any(row.get('gripper_state', {}).get(k, 0) for k in ('alarm_a', 'alarm_b'))
                        for row in rows))
-    except (OSError, ValueError, SyntaxError) as exc:
+    except (OSError, ValueError, SyntaxError, RuntimeError, ImportError) as exc:
         print(f'设备检查失败：{exc}', file=sys.stderr)
+        if args.gripper:
+            print('不会自动重发目标、张开或掉使能；等待失败不代表夹爪已停止。', file=sys.stderr)
         return 2
 
 

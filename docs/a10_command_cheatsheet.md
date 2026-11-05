@@ -29,6 +29,51 @@ python scripts/a10_devices.py --check-grippers
 - 其他参数：`--config 路径` 指定另一份设备清单；`--json` 输出所有识别到的接口、格式及匹配结果。
   返回码：0=已匹配且可选夹爪查询无报警；1=缺失/需更新/不唯一/查询失败或夹爪有报警；2=配置或扫描失败。
 
+## 用图片和小范围动作辨认设备
+
+这些命令只检查本机相机/夹爪，不连接机械臂控制器。夹爪动作请先确认空载、手指离开夹口，
+每次只执行一条并观察对应实物。拍照和夹爪动作不能混在同一条命令中。
+
+```bash
+# 三台相机各拍一张，并生成带中文名称、用途名、序列号的overview.jpg
+python scripts/a10_devices.py --snapshot
+
+# 左夹爪：先移到检查位置1000，观察后再单独执行位置0
+python scripts/a10_devices.py --gripper left --position-raw 1000
+python scripts/a10_devices.py --gripper left --position-raw 0
+
+# 右夹爪：同样分两次执行
+python scripts/a10_devices.py --gripper right --position-raw 1000
+python scripts/a10_devices.py --gripper right --position-raw 0
+```
+
+拍照默认保存在 `work_dirs/a10/hardware_checks/device_check_时间戳/`；终端打印完整路径。
+包含 `base_0_rgb.jpg`、`left_wrist_0_rgb.jpg`、`right_wrist_0_rgb.jpg`、`overview.jpg`、`manifest.json`。
+单张图片保留原始画面，拼图另加标签；不自动旋转或镜像。照片不是硬件曝光同步的训练数据。
+可以用 `--snapshot --output-dir 新目录` 指定位置，已有目录拒绝覆盖。
+本轮实机图片在 `work_dirs/a10/hardware_checks/20261105_164809/device_images/overview.jpg`。
+
+- 拍照要求所有配置相机身份和路径匹配；夹爪动作只要求选中的夹爪匹配，另一只离线不影响辨认。
+  路径变化先单独执行 `--update`；动作不静默使用替代路径，也不自动分配新设备。
+- 夹爪固定为本次已验证的raw `0` / `1000` 两个检查位置，按配置speed=5%、torque=60%运行，
+  只允许降低速度/力矩；不是毫米，也不是完整张开/闭合。实际位置超出0..1000附近会拒绝动作。
+- 动作会按已有驱动使能选中的夹爪，等待最多10秒并显示实际位置和完成原因。
+  `position_reached`表示到位；`torque_reached`表示遇阻/力矩到达，不代表到达目标位置或已经夹稳。
+  超时不自动重发，报警不自动清除；退出不自动张开或掉使能，最后目标及保持力矩可能继续生效。
+
+**开合方向确认后**，在 `a10_devices.py` 对应侧的 `check` 中填写 `open_raw` / `close_raw`，
+两个值分别为0或1000，必须不同；目前均为None，避免猜错方向。之后可使用：
+
+```bash
+python scripts/a10_devices.py --gripper left --open
+python scripts/a10_devices.py --gripper left --close
+python scripts/a10_devices.py --gripper right --open
+python scripts/a10_devices.py --gripper right --close
+```
+
+这些名称也只代表检查开/合位置，不是全行程标定。位置参数或方向未知时，在打开串口前就拒绝执行。
+输出可加 `--json` 保存为机器可读结果；操作失败返回2，无硬件操作的扫描返回码保持原有约定。
+
 ## 当前设备绑定：双知行夹爪 + 三路相机（2026-11-05）
 
 配置保存在 [a10_devices.py](../configs/a10/a10_devices.py)。左右按手柄及物理机械臂命名。

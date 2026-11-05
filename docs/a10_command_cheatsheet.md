@@ -1,5 +1,48 @@
 # A10 常用命令速查
 
+## 当前设备绑定：双知行夹爪 + 外部 D405（2026-11-05）
+
+配置保存在 [a10_devices.py](../configs/a10/a10_devices.py)。左右按手柄及物理机械臂命名。
+
+| 设备 | 稳定标识 | 当前节点 | 设备 ID / 用途 |
+| --- | --- | --- | --- |
+| 左手柄对应臂的夹爪 | FTDI `DU0EMMMM` | `ttyUSB0` | Modbus ID 1 |
+| 右手柄对应臂的夹爪 | CP2102N `5c9323064b6eef11a2c4e7c2c169b110` | `ttyUSB1` | Modbus ID 1 |
+| 外部场景相机 | D405 `255323070551`，`video-index4` | `video4` | `base_0_rgb`，640×480 / 30Hz |
+
+使用配置中的完整 by-id 路径，USB 重插后 `ttyUSB` / `video` 编号可能改变。
+两只夹爪内部 ID 同为1没有冲突，因为串口不同；这个 ID 不是机械臂的 ee_id。
+当前双臂控制器中左手对应 ee1（operator 内部键 `right`），右手对应 ee0（内部键 `left`）。
+
+在 `/home/robot/VLA/FluxVLA_follower`、`fluxvla` 环境查询，以下命令只读状态：
+
+```bash
+# 左夹爪
+python fluxvla/engines/operators/zx_gripper.py \
+  --port /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0EMMMM-if00-port0 \
+  --id 1 --state
+
+# 右夹爪
+python fluxvla/engines/operators/zx_gripper.py \
+  --port /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_5c9323064b6eef11a2c4e7c2c169b110-if00-port0 \
+  --id 1 --state
+```
+
+空载小幅动作验证时，将对应命令的 `--state` 改为
+`--position-raw 1000 --speed 5 --torque 60`，完成后再单独发送
+`--position-raw 0 --speed 5 --torque 60`。原始位置值不是毫米。
+两侧均由现场观察确认所属机械臂；左侧另有位置0、实际反馈3、无报警的到位日志。
+
+本轮曾在左夹爪空载动作中出现 B=`0x1000`，手册定义为工件掉落报警；
+其触发原因未确认，不能把它当成量程越界。报警时先查状态，不反复清除后盲目重试。
+确需清除时，单独使用 `--reset-alarm --state`；清除本身不发送新的位置目标。
+
+**此配置是已核对的设备清单，尚未自动接入双臂 VR 夹爪控制。**
+两只夹爪的完整行程、开合方向及 raw→mm 标定未验收；当前仅有一台外部相机。
+后续录制接线不能将它复制成两路相机，也不能把知行 raw 直接填入旧数据的夹爪毫米字段。
+
+## 之前的运行命令与配置记录
+
 2026-10-26：VR、双臂控制与推理已整合到 `FluxVLA` 的 `kaanh_follower`。原 VR 目录保留作回退。
 无 `--config` 的控制台沿用默认共享连接；双臂配置默认直连。不要同时启动推理与 VR 驱动同一机器人。
 

@@ -153,6 +153,94 @@ class SessionTests(unittest.TestCase):
     def start(self):
         self.session.command('start'); self.settle(); self.update(); self.update()
 
+    def test_hud_modifier_and_recenter_update_without_waiting_for_timer(self):
+        session = self.session
+        send = self.runtime.teleoperator.send_feedback
+        session._hud(100.)
+        send.reset_mock()
+        session._hud(100.01)
+        send.assert_not_called()
+        self.seq += 1
+        session.before_step(hands(self.seq, modifier=True, x=.9), actions())
+        session._hud(100.02)
+        controls = send.call_args.args[0]['controls']
+        self.assertTrue(controls['visible'])
+        self.assertFalse(controls['ready'])
+        self.assertEqual(controls['prompt'], 'CENTER LEFT STICK')
+        self.seq += 1
+        session.before_step(hands(self.seq, modifier=True), actions())
+        session._hud(100.03)
+        self.assertTrue(send.call_args.args[0]['controls']['ready'])
+        self.seq += 1
+        session.before_step(hands(self.seq), actions())
+        session._hud(100.04)
+        self.assertFalse(send.call_args.args[0]['controls']['visible'])
+
+    def test_hud_directions_match_episode_state_and_confirmation(self):
+        session = self.session
+        self.assertEqual(session._hud_controls()['directions']['right']['label'], 'START')
+        self.start()
+        menu = session._hud_controls()['directions']
+        self.assertEqual(menu['right']['label'], 'SAVE')
+        self.assertEqual(menu['down']['label'], 'STOP CAPTURE')
+        self.assertFalse(menu['up']['enabled'])
+        session.command('discard')
+        self.assertEqual(session._hud_controls()['directions']['left']['label'], 'CONFIRM DISCARD')
+        session._hud(time.monotonic())
+        self.assertEqual(self.runtime.teleoperator.send_feedback.call_args.args[0]['pending'], 'discard')
+        session.command('stop')
+        self.assertEqual(session.state, 'review')
+        self.assertFalse(session._hud_controls()['directions']['down']['enabled'])
+        session.fail('camera unplugged')
+        session.state = 'failed'
+        self.assertFalse(session._hud_controls()['directions']['right']['enabled'])
+
+    def test_hud_reset_and_disk_busy_offer_only_valid_controls(self):
+        session = self.session
+        session.command('reset')
+        self.assertEqual(session._hud_controls()['directions']['up']['label'], 'CONFIRM RESET')
+        session.pending = None
+        session.reset_thread = object()
+        try:
+            directions = session._hud_controls()['directions']
+            self.assertEqual([k for k, v in directions.items() if v['enabled']], ['down'])
+            self.assertEqual(directions['down']['label'], 'CANCEL RESET')
+        finally: session.reset_thread = None
+        session.future = object()
+        try: self.assertFalse(any(v['enabled'] for v in session._hud_controls()['directions'].values()))
+        finally: session.future = None
+
+    def test_hud_save_success_expires_without_blocking_or_auto_start(self):
+        self.start(); self.session.command('save'); self.settle()
+        session = self.session
+        session._hud(session._saved_until - .1)
+        payload = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual((payload['phase'], payload['episode']), ('saved', 1))
+        session._hud(session._saved_until + .01)
+        payload = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual((payload['phase'], payload['episode']), ('idle', 2))
+        self.assertEqual(payload['hint'], 'Ready for next episode')
+        self.assertEqual(session.state, 'idle')
+        self.assertIsNone(session.future)
+
+    def test_button_check_shows_menu_without_debug_dump_or_device_commands(self):
+        session = self.session
+        session.button_check = True; session.state = 'button_check'
+        self.update(modifier=True)
+        self.update(modifier=True, x=1.)
+        payload = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual(payload['hint'], 'BUTTON EVENT: right')
+        self.assertTrue(payload['controls']['visible'])
+        self.assertEqual(payload['controls']['directions']['up']['label'], 'RESET')
+        self.assertNotIn('pressed=', payload['hint'])
+        self.assertEqual(session.frames, 0)
+        self.assertIsNone(session.future)
+        self.robot.start_follower.assert_not_called()
+        self.update(age=1.)
+        payload = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertFalse(payload['controls']['visible'])
+        self.assertIn('INPUT LOST', payload['controls']['prompt'])
+
     def test_record_save_two_episodes_discard_and_same_frame_values(self):
         self.start(); self.session.command('save'); self.settle()
         self.assertEqual(self.session.state,'idle')

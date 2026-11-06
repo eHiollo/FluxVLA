@@ -92,6 +92,7 @@ class RecordingSession:
         self.frames = 0; self.elapsed = 0.; self._first_sample = self._last_sample = None
         self._camera_sequences = {}; self.repeated_images = 0
         self.ready_sample = None; self.raw = {}; self._last_hud = 0.
+        self._hud_signature = None; self._saved_until = 0.; self._saved_episode = None
         self.pending = None; self.pending_at = 0.; self.stopping = False
         self.commands = queue.Queue(maxsize=16)
         self.quit_requested = False; self._closing = threading.Event()
@@ -263,6 +264,9 @@ class RecordingSession:
             else:
                 self.state = 'idle'; self.stopping = False
                 self.notice = f'Episode {value+1} saved' if operation == 'saving' else 'Episode discarded; ready'
+            if operation == 'saving':
+                self._saved_until = time.monotonic() + 1.5
+                self._saved_episode = value + 1
             self.error = ''
             LOG.info('录制：%s %s', self.state, self.notice)
         except Exception as exc:
@@ -377,24 +381,67 @@ class RecordingSession:
                     task=self.task, repeated_images=self.repeated_images,
                     effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
 
-    def _hud(self, now):
-        if now-self._last_hud < 1/self.options['hud_hz']: return
-        self._last_hud = now
-        status = self.status()
+    def _hud_controls(self):
+        """Presentation of the existing command state machine, never executes commands."""
+        pressed = bool(self.raw.get('right', {}).get('xlevr.buttons', {}).get(self.buttons.button))
+        directions = {key: dict(label='UNAVAILABLE', enabled=False)
+                      for key in ('up', 'down', 'left', 'right')}
+        def show(key, label, enabled=True):
+            directions[key] = dict(label=label, enabled=enabled)
         if self.button_check:
-            status['health'] = 'NO ROBOT / NO GRIPPERS / NO CAMERAS'
-            status['hint'] = '\n'.join(
-                f'{side}: pressed={[i for i,v in enumerate(hand.get("xlevr.buttons",{}).get("raw_pressed",[])) if v]} '
-                f'A={bool(hand.get("xlevr.buttons",{}).get("a"))} B={bool(hand.get("xlevr.buttons",{}).get("b"))}'
-                for side,hand in self.raw.items()) + '\n' + self.notice
-            LOG.info('按键检查：%s；mapping=%s', status['hint'],
-                     {side:hand.get('xlevr.buttons',{}).get('mapping') for side,hand in self.raw.items()})
-        elif self.buttons.mode and self.pending is None and not self.blocks_motion:
-            status['hint'] += '\nRIGHT start/save | LEFT redo | DOWN stop capture | UP reset'
-        phase = 'saved' if self.state == 'idle' and self.notice.endswith(' saved') else self.state
-        status.update(type='hud',phase=phase)
-        # Existing websocket sender queues asynchronously; HUD loss must not
-        # block motion or turn a good dataset into a robot exception.
+            for key, label in dict(up='RESET', down='STOP CAPTURE', left='DISCARD / REDO', right='START / SAVE').items():
+                show(key, label)
+        elif self.blocks_motion:
+            if self.reset_thread is not None: show('down', 'CANCEL RESET')
+        elif self.future is None:
+            if self.state == 'idle':
+                show('right', 'START' if self.ready_sample is not None else 'WAIT FOR DEVICES', self.ready_sample is not None)
+                show('up', 'RESET' if self._released() else 'RELEASE BOTH GRIPS', self._released())
+            elif self.state in ('recording', 'review', 'failed'):
+                show('left', 'DISCARD / REDO')
+                show('up', 'SAVE / DISCARD FIRST', False)
+                if self.state != 'failed':
+                    show('right', 'SAVE' if self.frames >= 2 else 'NEED 2 FRAMES', self.frames >= 2)
+                if self.state == 'recording': show('down', 'STOP CAPTURE')
+        if self.pending:
+            key = 'up' if self.pending == 'reset' else 'left'
+            if directions[key]['enabled']: show(key, 'CONFIRM ' + self.pending.upper())
+        if not self.input_fresh:
+            prompt = 'VR INPUT LOST - RELEASE CONTROLS'
+        elif not self.buttons.released:
+            prompt = 'RELEASE RIGHT ' + self.buttons.button.upper() + ' + CENTER LEFT STICK'
+        elif (self.buttons.mode and not self.buttons.armed) or (not pressed and self.buttons.block_left):
+            prompt = 'CENTER LEFT STICK'
+        elif pressed:
+            prompt = 'RIGHT ' + self.buttons.button.upper() + ' HELD - LEFT STICK MENU'
+        else:
+            prompt = 'HOLD RIGHT ' + self.buttons.button.upper() + ' FOR LEFT STICK MENU'
+        return dict(visible=pressed and self.input_fresh, prompt=prompt,
+                    ready=self.input_fresh and self.buttons.mode and self.buttons.armed,
+                    directions=directions)
+
+    def _hud(self, now):
+        status = self.status()
+        controls = self._hud_controls()
+        phase = 'saved' if (self.state == 'idle' and now < self._saved_until
+                            and self.pending is None and not self.error) else self.state
+        status.update(type='hud', phase=phase, controls=controls)
+        if phase == 'saved': status['episode'] = self._saved_episode
+        # Hide the old success notice after the short nonblocking acknowledgement.
+        if phase == 'idle' and self.notice.endswith(' saved'):
+            status['hint'] = 'Ready for next episode'
+        if self.button_check:
+            status['hint'] = self.notice or 'Button check only - no device motion'
+        # Clock/frame counts stay rate limited; input gates and state transitions do not.
+        signature = (phase, self.pending, self.error, status['hint'],
+                     json.dumps(controls, sort_keys=True))
+        if signature == self._hud_signature and now-self._last_hud < 1/self.options['hud_hz']:
+            return
+        self._last_hud = now; self._hud_signature = signature
+        if self.button_check:
+            LOG.info('按键检查：%s；buttons=%s', self.notice,
+                     {side:hand.get('xlevr.buttons', {}) for side,hand in self.raw.items()})
+        # Existing websocket sender queues asynchronously; no waiting on the control thread.
         try: self.runtime.teleoperator.send_feedback(status)
         except Exception: LOG.warning('HUD unavailable', exc_info=True)
 

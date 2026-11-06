@@ -74,7 +74,7 @@ AFRAME.registerComponent('controller-updater', {
         saved: '#26C6DA',
         save_failed: '#EF5350',
         stop: '#EF5350',
-        idle: '#90CAF9'
+        idle: '#FFFFFF', button_check: '#FFFFFF', starting: '#FFD54F', discarding: '#FFD54F'
       };
       const titles = {
         resetting: 'RESETTING / DOWN TO CANCEL', reset_failed: 'RESET FAILED',
@@ -90,20 +90,33 @@ AFRAME.registerComponent('controller-updater', {
         stop: 'STOP',
         idle: 'WAITING'
       };
-      const lines = [titles[phase] || phase.toUpperCase()];
-      if (Number.isFinite(data.episode)) {
-        const total = Number.isFinite(data.num_episodes) ? `/${data.num_episodes}` : '';
-        lines.push(`EP ${data.episode}${total}`);
-      }
+      // Keep the original phase vocabulary; separate status, body and command hints.
+      const setText = (id, value, color) => {
+        const node = document.querySelector(id);
+        if (node) {
+          node.setAttribute('value', value);
+          if (color) node.setAttribute('color', color);
+        }
+      };
+      el.setAttribute('value', data.pending ? `CONFIRM ${String(data.pending).toUpperCase()}` : (titles[phase] || phase.toUpperCase()));
+      el.setAttribute('color', data.pending ? '#FFD54F' : (colors[phase] || '#FFFFFF'));
+      const details = [];
+      if (Number.isFinite(data.episode) && data.episode > 0) details.push(`EP ${data.episode}`);
+      if (Number.isFinite(data.elapsed_s)) details.push(`TIME ${data.elapsed_s.toFixed(1)}s`);
       const remaining = this.formatHudRemaining(data.remaining_s);
-      if (remaining) lines.push(remaining);
-      if (Number.isFinite(data.elapsed_s)) lines.push(`TIME ${data.elapsed_s.toFixed(1)}s / ${data.frames || 0} frames`);
-      if (data.task) lines.push(String(data.task).slice(0, 60));
-      if (data.health) lines.push(String(data.health).slice(0, 100));
-      if (data.hint) lines.push(String(data.hint));
-      if (data.error) lines.push(`ERROR: ${String(data.error).slice(0,120)}`);
-      el.setAttribute('value', lines.join('\n'));
-      el.setAttribute('color', colors[phase] || '#90CAF9');
+      if (remaining) details.push(`LEFT ${remaining}`);
+      setText('#recordHudDetails', details.join(' / ') + (data.task ? '\n' + String(data.task).slice(0, 55) : ''), '#FFFFFF');
+      setText('#recordHudNotice', String(data.error || data.hint || '').slice(0, 125), data.error ? '#FF7070' : '#FFD54F');
+      const controls = data.controls || {};
+      setText('#recordHudPrompt', controls.prompt || '', controls.visible ? '#FFD54F' : '#FFFFFF');
+      const menu = document.querySelector('#recordHudDirections');
+      if (menu) menu.setAttribute('visible', !!controls.visible);
+      for (const direction of ['up', 'left', 'right', 'down']) {
+        const item = controls.directions?.[direction] || {};
+        const color = !item.enabled ? '#8B9199' : (controls.ready ? '#FFFFFF' : '#FFD54F');
+        setText('#recordHud' + direction[0].toUpperCase() + direction.slice(1),
+          direction.toUpperCase() + '\n' + (item.label || 'UNAVAILABLE'), color);
+      }
     };
 
     // --- WebSocket Setup ---

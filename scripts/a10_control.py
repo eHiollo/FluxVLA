@@ -21,7 +21,7 @@ from fluxvla.engines.operators.kaanh_commands import LOCAL_COMMANDS, add_local_c
 
 HELP = """可用指令：
   reconnect                     重新连接并查询状态，不重发控制指令（仅 shell）
-  启动控制台                    python scripts/a10_control.py shell（自动启动共享连接）
+  启动控制台                    python scripts/a10_control.py（默认 shell，允许控制，不自动使能）
   选择机器人配置                启动时加 --config configs/a10/a10_dual_arm_operator.py
   覆盖机器人地址                启动时加 --host IP；连接参数放在 shell 之前
   get [--raw]                   查看状态；--raw 显示完整回复
@@ -501,7 +501,7 @@ class A10Console:
 
 def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     parser = argparse.ArgumentParser(description='A10 真机通信控制台',
-                                     epilog='例如：--config configs/a10/a10_dual_arm_operator.py --allow-motion shell',
+                                     epilog='例如：--config configs/a10/a10_dual_arm_operator.py（默认进入 shell 并允许控制）',
                                      allow_abbrev=False)
     parser.add_argument('--config', type=Path,
                         help='机器人配置；默认 configs/a10/a10_operator.py，双臂使用 a10_dual_arm_operator.py')
@@ -514,7 +514,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
     parser.add_argument('--timeout', type=float, help='命令确认超时秒数；默认 5')
     access = parser.add_mutually_exclusive_group()
     access.add_argument('--read-only', action='store_true', help='只读；禁止设置和控制命令')
-    access.add_argument('--allow-motion', action='store_true', help='显式开启配置中的控制权限；不自动使能')
+    access.add_argument('--allow-motion', action='store_true', help='允许控制（交互控制台默认开启）；不自动使能')
     parser.add_argument('--command-timeout', type=float, default=None,
                         help='原生/透传控制器指令的回复等待秒数（默认：60；与 --timeout 独立）')
     connection_mode = parser.add_mutually_exclusive_group()
@@ -559,7 +559,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
                          joint_udp_port=args.joint_udp_port, timeout_s=args.timeout,
                          command_timeout_s=args.command_timeout, status_ws_port=args.status_ws_port)
         settings.update({key: value for key, value in overrides.items() if value is not None})
-        if args.allow_motion:
+        if interactive or args.allow_motion:
             settings['allow_motion'] = True
         shared = args.shared if args.shared is not None else (
             args.config is None or bool(settings.get('shared_control')))

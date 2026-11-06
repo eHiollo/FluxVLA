@@ -16,7 +16,23 @@
  终端二：启动机器人控制台
     启动kaanhbin程序
     conda activate fluxvla
-    python scripts/a10_control.py shell
+
+    单臂（192.168.0.125；与推理共享连接）：
+    python scripts/a10_control.py --config configs/a10/a10_operator.py --shared
+
+    双臂（192.168.0.150）：
+    python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
+
+    默认进入 shell 并允许控制，不自动使能；只读启动加 --read-only。
+
+    修改机器人 IP：在 shell 前加 --host 新IP，覆盖配置中的 operator.host。
+    不带 --config 时默认单臂配置 configs/a10/a10_operator.py。
+    切换单臂/双臂使用 --config；每个配置的 init_position 对应这台机器人。
+
+    控制台执行动作时，可直接输入：
+    stop
+    取消当前和停止前排队的命令，停止本地下发并请求退出 follower；控制台保留。
+    stop 只有收到 inactive + Stopped 反馈才报告机器人停止成功；它不是硬件急停。
 
  终端三：启动机器人控制
     python scripts/inference.py \

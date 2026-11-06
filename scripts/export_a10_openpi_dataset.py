@@ -1,4 +1,4 @@
-"""把 A10 LeRobot v3 数据导出为当前 OpenPI 使用的 v2.1，两路相机改名为 top/right。"""
+"""把 A10 LeRobot v3 数据导出为 v2.1；按单臂/双臂格式映射相机名称。"""
 import argparse
 import json
 from pathlib import Path

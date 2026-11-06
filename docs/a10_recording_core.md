@@ -1,5 +1,7 @@
 # A10 录制核心：保存数据，再交给 OpenPI 训练
 
+> 2026-11-06更新：已新增双臂14维/三路相机的独立格式、保存、校验和导出，见[双臂数据交接说明](a10_dual_dataset_handoff.md)。下文记录旧单臂格式及其既有验证；两个格式均未接入实时VR采集。OpenPI双臂policy留给训练设备适配。
+
 本轮完成的是“保存一集数据”的底座。它能接收已经准备好的关节、夹爪、VR动作和两路图片，保存成旧数据集的结构，再导出给当前 OpenPI 使用。
 
 **目前还没有把它接到实时 VR 采集循环里。** 现有 `teleoperate.py` 的运行方式不变，`--record-controller` 仍只是控制器诊断记录，不会生成训练数据。双臂采集、现场图像同步、手柄开始/重录按钮将在下一阶段接入。
@@ -89,7 +91,7 @@ with EpisodeWriter(**cfg.record) as writer:
 
 ## 4. 终端怎么检查和导出
 
-在 `FluxVLA_follower`、`fluxvla` 环境运行。依赖已列入 `requirements-a10.txt`，不需要在 FluxVLA 环境安装另一套 LeRobot。
+在 `/home/robot/VLA/FluxVLA`、`fluxvla` 环境运行。依赖已列入 `requirements-a10.txt`，不需要在 FluxVLA 环境安装另一套 LeRobot。
 
 检查已有旧数据的数值、索引和元数据（不解码视频）：
 

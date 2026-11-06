@@ -845,3 +845,17 @@ python scripts/export_a10_openpi_dataset.py \
 ```
 
 导出目标必须不存在，原数据不会修改；输出供当前 OpenPI 的 v2.1 reader 使用，训练前重新计算 norm_stats。
+
+
+### 双臂数据校验与导出（录制底座已支持，实时采集尚未接入）
+
+在FluxVLA主目录运行；只有真实录制目录产生且写入器关闭后才使用以下命令。它们不启动设备，`--record-controller`也不会生成训练数据。
+
+```bash
+python scripts/validate_a10_dataset.py work_dirs/a10/datasets/a10_dual_record
+python scripts/export_a10_openpi_dataset.py \
+  --source work_dirs/a10/datasets/a10_dual_record \
+  --output work_dirs/a10/datasets/a10_dual_record_openpi
+```
+
+输出目录必须不存在；完整约定见[双臂数据交接说明](a10_dual_dataset_handoff.md)。14维顺序是物理左臂+左夹爪、物理右臂+右夹爪，夹爪0张开/1闭合，训练端需独立适配policy。

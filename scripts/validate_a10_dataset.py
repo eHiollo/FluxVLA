@@ -1,4 +1,4 @@
-"""检查旧单臂 A10 数据格式、索引、任务、统计和视频对齐。"""
+"""检查 A10 单臂/双臂数据格式、索引、任务、统计和视频对齐。"""
 import argparse
 import json
 from pathlib import Path

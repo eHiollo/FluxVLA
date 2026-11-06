@@ -1,4 +1,4 @@
-"""Offline validation and OpenPI v2.1 export of the legacy single-arm contract."""
+"""Offline validation and OpenPI v2.1 export of versioned A10 single/dual-arm contracts."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -17,12 +17,34 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .episode_writer import (
-    ACTION_NAMES, CAMERAS, STATE_NAMES, aggregate_stats, episode_stats,
+    aggregate_stats, episode_stats,
     json_write, load_v3, safe_path, sync_dir, table_schema,
 )
 
-IMAGE_ALIASES = dict(zip((f'observation.images.{c}' for c in CAMERAS),
-                        ('observation.images.top', 'observation.images.right')))
+from .a10_recording_schema import get_schema, schema_from_info
+
+IMAGE_ALIASES = get_schema().image_aliases  # legacy public alias
+
+
+def checked_schema(root, info):
+    spec = schema_from_info(info)
+    if spec.dual:
+        filename = ('recording_contract.json' if info['codebase_version'] == 'v3.0'
+                    else 'source_recording_contract.json')
+        contract = json.loads((Path(root) / 'meta' / filename).read_text())
+        if any(contract.get(key) != value for key, value in spec.contract().items()):
+            raise ValueError('Dual recording contract mismatch (order/units/action semantics)')
+        if contract.get('fps') != 30 or contract.get('synthetic') != (Path(root)/'SIMULATED_DATA.json').exists():
+            raise ValueError('Dual recording contract fps/synthetic marker mismatch')
+        expected_cameras = set(spec.cameras)
+        if set(contract.get('cameras', {})) != expected_cameras:
+            raise ValueError('Dual recording contract camera mismatch')
+        for camera, settings in contract['cameras'].items():
+            key = f'observation.images.{camera}'
+            if info['codebase_version'] == 'v2.1': key = spec.image_aliases[key]
+            if info['features'][key]['shape'] != [settings['height'], settings['width'], 3]:
+                raise ValueError('Dual camera dimensions differ from recording contract')
+    return spec
 
 
 @contextmanager
@@ -109,13 +131,14 @@ def validate_dataset(root, *, check_videos=True, _locked=False):
         raise ValueError('Unfinished recording/commit exists; recover it before validation')
     info, episodes, tasks = dataset_metadata(root)
     if info['fps'] != 30:
-        raise ValueError('Expected legacy A10 30 fps')
+        raise ValueError('Expected A10 30 fps')
     features = info['features']; version = info['codebase_version']
-    keys = list(IMAGE_ALIASES if version == 'v3.0' else IMAGE_ALIASES.values())
-    expected = table_schema().names
+    spec = checked_schema(root, info); aliases = spec.image_aliases
+    keys = list(aliases if version == 'v3.0' else aliases.values())
+    expected = table_schema(spec.name).names
     if set(features) != set(expected) | set(keys):
-        raise ValueError('Unexpected feature names (expected single-arm legacy schema)')
-    for key, names in (('observation.state', STATE_NAMES), ('action', ACTION_NAMES)):
+        raise ValueError('Unexpected feature names for the selected A10 schema')
+    for key, names in (('observation.state', list(spec.state_names)), ('action', list(spec.action_names))):
         if features[key]['shape'] != [len(names)] or features[key]['dtype'] != 'float32' or features[key]['names'] != names:
             raise ValueError(f'Invalid feature contract: {key}')
     for key in keys:
@@ -135,17 +158,19 @@ def validate_dataset(root, *, check_videos=True, _locked=False):
             table = pq.read_table(path); cached_path = path
         data_counts[path] = table.num_rows
         rows = [r for r in table.to_pylist() if r['episode_index'] == eid]
-        if len(rows) != count or set(table.column_names) != set(table_schema().names):
+        if len(rows) != count or set(table.column_names) != set(table_schema(spec.name).names):
             raise ValueError(f'Episode {eid}: data columns/frame count mismatch')
-        for field in table_schema():
+        for field in table_schema(spec.name):
             actual = table.schema.field(field.name).type
             if pa.types.is_fixed_size_list(field.type):
                 if not (pa.types.is_list(actual) or pa.types.is_fixed_size_list(actual)) or actual.value_type != pa.float32():
                     raise ValueError(f'Invalid column type: {field.name}')
             elif actual != field.type: raise ValueError(f'Invalid column type: {field.name}')
-        for k, length in (('observation.state', 7), ('action', 8)):
+        for k, length in (('observation.state', len(spec.state_names)), ('action', len(spec.action_names))):
             values = np.asarray([r[k] for r in rows])
             if values.shape != (count, length) or not np.isfinite(values).all(): raise ValueError(f'Invalid {k} in episode {eid}')
+        if spec.dual:
+            for r in rows: spec.validate_values(r['observation.state'], r['action'])
         if [r['frame_index'] for r in rows] != list(range(count)) or [r['index'] for r in rows] != list(range(total,total+count)):
             raise ValueError(f'Episode {eid}: frame/global indexes mismatch')
         if not np.allclose([r['timestamp'] for r in rows], np.arange(count)/30, atol=1e-4, rtol=0):
@@ -190,7 +215,7 @@ def validate_dataset(root, *, check_videos=True, _locked=False):
                 raise ValueError(f'Global statistics mismatch: {key}/{name}')
     if total != info['total_frames'] or sum(data_counts.values()) != total:
         raise ValueError('Dataset total_frames mismatch or unreferenced rows in data files')
-    return dict(version=version, episodes=len(episodes), frames=total, fps=30,
+    return dict(schema=spec.name, version=version, episodes=len(episodes), frames=total, fps=30,
                 videos_checked=check_videos, synthetic=(root/'SIMULATED_DATA.json').exists())
 
 
@@ -223,12 +248,13 @@ def export_openpi_dataset(source, destination):
 
 
 def _export(source, stage, info, episodes, tasks):
+    spec = checked_schema(source, info); aliases = spec.image_aliases
     out = copy.deepcopy(info)
-    out.update(codebase_version='v2.1', total_videos=len(episodes)*2,
+    out.update(codebase_version='v2.1', total_videos=len(episodes)*len(spec.cameras),
                total_chunks=(len(episodes)+999)//1000,
                data_path='data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet',
                video_path='videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4', chunks_size=1000)
-    for old, new in IMAGE_ALIASES.items():
+    for old, new in aliases.items():
         out['features'][new] = out['features'].pop(old)
         # Uniform output codec, also when the original v3 video contains several episodes.
         out['features'][new]['info']['video.codec'] = 'h264'
@@ -238,9 +264,9 @@ def _export(source, stage, info, episodes, tasks):
         eid = ep['episode_index']
         rows = [r for r in pq.read_table(data_path(source,info,ep)).to_pylist() if r['episode_index']==eid]
         path = data_path(stage,out,ep); path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pylist(rows,schema=table_schema()),path)
+        pq.write_table(pa.Table.from_pylist(rows,schema=table_schema(spec.name)),path)
         statistics = episode_stats(ep)
-        for old, new in IMAGE_ALIASES.items():
+        for old, new in aliases.items():
             path, start, end = video_segment(source,info,ep,old)
             target, _, _ = video_segment(stage,out,ep,new); target.parent.mkdir(parents=True,exist_ok=True)
             # Decode sequentially: seeking in merged clips can land on the wrong keyframe.
@@ -266,7 +292,8 @@ def _export(source, stage, info, episodes, tasks):
     write_jsonl(stage/'meta/tasks.jsonl',[dict(task_index=k,task=v) for k,v in tasks.items()])
     write_jsonl(stage/'meta/episodes_stats.jsonl',[dict(episode_index=i,stats=s) for i,s in enumerate(all_stats)])
     json_write(stage/'meta/stats.json',aggregate_stats(all_stats))
-    json_write(stage/'meta/export_manifest.json',dict(source=str(source),camera_aliases=IMAGE_ALIASES,
+    json_write(stage/'meta/export_manifest.json',dict(source=str(source),schema=spec.name,camera_aliases=aliases,
+        action_source=spec.contract()['action_source'], action_time_offset_frames=0 if spec.dual else None,
         training_actions='observation.state', raw_action_preserved=True,
         video='Reencoded H.264 per episode; source image statistics retained. Recompute OpenPI norm stats.'))
     for rel in ('SIMULATED_DATA.json','meta/recording_contract.json','meta/xlevr_diagnostics'):
@@ -275,4 +302,4 @@ def _export(source, stage, info, episodes, tasks):
         dst=stage/target_rel
         if src.is_dir(): shutil.copytree(src,dst)
         elif src.is_file(): dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
-    return dict(episodes=len(episodes),frames=info['total_frames'],version='v2.1')
+    return dict(schema=spec.name,episodes=len(episodes),frames=info['total_frames'],version='v2.1')

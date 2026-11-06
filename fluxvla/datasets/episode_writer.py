@@ -1,4 +1,4 @@
-"""A10 single-arm LeRobot v3 writer, adapted from projects/a10/recording.py.
+"""A10 single/dual-arm LeRobot v3 writer, adapted from projects/a10/recording.py.
 
 No robot/VR dependency. One producer, a bounded encoder queue, one staged
 episode and an explicit recoverable commit. The wire protocol is NOT `action`.
@@ -23,13 +23,14 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-CAMERAS = ('base_0_rgb', 'right_wrist_0_rgb')
-STATE_NAMES = [f'joint_{i}.pos' for i in range(1, 7)] + ['gripper.pos']
-ACTION_NAMES = ['ee.enabled', 'ee.delta_x', 'ee.delta_y', 'ee.delta_z',
-                'ee.delta_rx', 'ee.delta_ry', 'ee.delta_rz', 'gripper.pos']
-CONTRACT = dict(version=1, state_units=['rad'] * 6 + ['mm'],
-                action_units=['bool_float'] + ['m'] * 3 + ['rad'] * 3 + ['normalized'],
-                action_source='legacy_vr_mapper_delta', training_source='observation.state')
+from .a10_recording_schema import get_schema
+
+# Backward-compatible names used by existing single-arm callers/tests.
+_LEGACY = get_schema()
+CAMERAS = _LEGACY.cameras
+STATE_NAMES = list(_LEGACY.state_names)
+ACTION_NAMES = list(_LEGACY.action_names)
+CONTRACT = _LEGACY.contract()
 
 
 def json_write(path, value):
@@ -93,9 +94,10 @@ def aggregate_stats(episodes):
     return result
 
 
-def table_schema():
-    return pa.schema([('observation.state', pa.list_(pa.float32(), 7)),
-                      ('action', pa.list_(pa.float32(), 8)), ('timestamp', pa.float32()),
+def table_schema(schema="a10_single_v1"):
+    spec = get_schema(schema)
+    return pa.schema([('observation.state', pa.list_(pa.float32(), len(spec.state_names))),
+                      ('action', pa.list_(pa.float32(), len(spec.action_names))), ('timestamp', pa.float32()),
                       *[(k, pa.int64()) for k in ('frame_index', 'episode_index', 'task_index', 'index')]])
 
 
@@ -122,12 +124,14 @@ class EpisodeWriter:
     or rolls forward a checksummed commit; it never removes a saved episode.
     """
     def __init__(self, root, cameras, fps=30, *, resume=False, recover=False,
-                 queue_size=32, max_episode_frames=18000, synthetic=False):
+                 queue_size=32, max_episode_frames=18000, synthetic=False,
+                 schema="a10_single_v1", device_metadata=None):
+        self.schema = get_schema(schema)
         self.root = Path(root).resolve(); self.cameras = copy.deepcopy(cameras)
         if type(fps) is not int or fps != 30:
-            raise ValueError('Legacy A10 schema requires fps=30')
-        if set(cameras) != set(CAMERAS):
-            raise ValueError(f'Expected cameras {CAMERAS}')
+            raise ValueError('A10 recording requires fps=30')
+        if set(cameras) != set(self.schema.cameras):
+            raise ValueError(f'Expected cameras {self.schema.cameras}')
         for c in cameras.values():
             if any(type(c.get(k)) is not int or c[k] <= 0 or c[k] % 2 for k in ('width', 'height')):
                 raise ValueError('Camera dimensions must be positive even integers')
@@ -149,7 +153,11 @@ class EpisodeWriter:
         self.active = None; self._thread = None; self._closed = False; self._error = None
         self._stage = self.root / '.recording/active'
         try:
-            contract = dict(CONTRACT, cameras=self.cameras, fps=fps, synthetic=synthetic, video_codec='h264')
+            contract = dict(self.schema.contract(), cameras=self.cameras, fps=fps, synthetic=synthetic, video_codec='h264')
+            if self.schema.dual:
+                contract['device_metadata'] = copy.deepcopy(device_metadata or {})
+            elif device_metadata is not None:
+                raise ValueError('device_metadata is only supported by the dual schema')
             if resume:
                 saved = json.loads((self.root / 'meta/recording_contract.json').read_text())
                 if saved != contract: raise ValueError('Recording contract differs (units/cameras/fps/synthetic)')
@@ -172,8 +180,8 @@ class EpisodeWriter:
             self._lock.close(); raise
 
     def _new_info(self):
-        features = {'observation.state': dict(dtype='float32', shape=[7], names=STATE_NAMES),
-                    'action': dict(dtype='float32', shape=[8], names=ACTION_NAMES)}
+        features = {'observation.state': dict(dtype='float32', shape=[len(self.schema.state_names)], names=list(self.schema.state_names)),
+                    'action': dict(dtype='float32', shape=[len(self.schema.action_names)], names=list(self.schema.action_names))}
         for key in ('timestamp', 'frame_index', 'episode_index', 'index', 'task_index'):
             features[key] = dict(dtype='float32' if key == 'timestamp' else 'int64', shape=[1], names=None)
         for name, c in self.cameras.items():
@@ -181,7 +189,8 @@ class EpisodeWriter:
                 names=['height', 'width', 'channels'], info={'video.height': c['height'], 'video.width': c['width'],
                 'video.codec': 'h264', 'video.pix_fmt': 'yuv420p', 'video.fps': self.fps,
                 'video.channels': 3, 'video.is_depth_map': False, 'has_audio': False})
-        return dict(codebase_version='v3.0', robot_type='a10_follower', total_episodes=0, total_frames=0,
+        return dict(**({'a10_recording_schema': self.schema.name} if self.schema.dual else {}),
+                    codebase_version='v3.0', robot_type='a10_follower', total_episodes=0, total_frames=0,
                     total_tasks=0, chunks_size=1000, data_files_size_in_mb=100, video_files_size_in_mb=200,
                     fps=self.fps, features=features, splits={'train': '0:0'},
                     data_path='data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet',
@@ -210,11 +219,8 @@ class EpisodeWriter:
         if self._error is not None: raise RuntimeError('Episode failed; discard or preserve it') from self._error
         try:
             state = np.array(state, dtype=np.float32, copy=True); action = np.array(action, dtype=np.float32, copy=True)
-            if state.shape != (7,) or action.shape != (8,) or not np.isfinite(state).all() or not np.isfinite(action).all():
-                raise ValueError('Expected finite 7D actual state and 8D legacy VR action')
-            if state[-1] < 0 or action[0] not in (0., 1.) or abs(action[-1]) > 1:
-                raise ValueError('Invalid gripper width / enabled flag / normalized gripper action')
-            if set(images) != set(CAMERAS): raise ValueError('Both configured RGB images are required')
+            self.schema.validate_values(state, action)
+            if set(images) != set(self.schema.cameras): raise ValueError('All configured RGB images are required')
             frames = {}
             for name, c in self.cameras.items():
                 img = np.asarray(images[name])
@@ -296,9 +302,9 @@ class EpisodeWriter:
                   **{'data/chunk_index':chunk, 'data/file_index':file, 'meta/episodes/chunk_index':chunk, 'meta/episodes/file_index':file})
         commit = self.active / 'publish'; commit.mkdir(exist_ok=True)
         (commit / data_rel).parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pylist(rows, schema=table_schema()), commit / data_rel)
+        pq.write_table(pa.Table.from_pylist(rows, schema=table_schema(self.schema.name)), commit / data_rel)
         statistics = {k: stats([r[k] for r in rows]) for k in rows[0]}
-        for name in CAMERAS:
+        for name in self.schema.cameras:
             key = f'observation.images.{name}'; rel = f'videos/{key}/chunk-{chunk:03d}/file-{file:03d}.mp4'
             # Decode completed video before committing it, including all timestamps.
             with av.open(str(self.active / f'{name}.mp4')) as video:

@@ -1,9 +1,9 @@
 """Local commands: add each command module here to expose it in the console."""
 
-from . import m_init
+from . import m_init, stop
 
 
-LOCAL_COMMANDS = {'m_init': m_init}
+LOCAL_COMMANDS = {'m_init': m_init, 'stop': stop}
 
 
 def add_local_command_parsers(subparsers):

@@ -18,6 +18,7 @@ import time
 from fractions import Fraction
 
 import av
+import cv2
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -263,9 +264,16 @@ class EpisodeWriter:
                 state, action, images, stamp, details = item; index = len(self._rows)
                 for name, image in images.items():
                     container, stream = streams[name]; self._encode_frame(name, image, stream, container, index)
-                    pixels = image.reshape(-1, 3).astype(np.float64) / 255.; s = self._image_stats[name]
-                    s['sum'] += pixels.sum(axis=0); s['square'] += (pixels**2).sum(axis=0)
-                    s['min'] = np.minimum(s['min'], pixels.min(axis=0)); s['max'] = np.maximum(s['max'], pixels.max(axis=0)); s['pixels'] += len(pixels)
+                    # OpenCV accumulates uint8 channel moments in native code.
+                    # Avoid three full float64 pixel arrays/reductions per frame;
+                    # they cannot sustain 3x640x480 at 30Hz on the target host.
+                    mean, std = cv2.meanStdDev(image)
+                    mean, std = mean[:, 0]/255., std[:, 0]/255.
+                    bounds = np.array([cv2.minMaxLoc(c)[:2] for c in cv2.split(image)])/255.
+                    pixels = image.shape[0]*image.shape[1]; s = self._image_stats[name]
+                    s['sum'] += mean*pixels; s['square'] += (std**2+mean**2)*pixels
+                    s['min'] = np.minimum(s['min'], bounds[:, 0])
+                    s['max'] = np.maximum(s['max'], bounds[:, 1]); s['pixels'] += pixels
                 self._rows.append(dict(**{'observation.state': state.tolist(), 'action': action.tolist()},
                                        timestamp=index / self.fps, frame_index=index))
                 sidecar.write(json.dumps(dict(frame_index=index, capture_monotonic_s=stamp, details=details), allow_nan=False) + '\n')

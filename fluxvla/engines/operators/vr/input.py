@@ -151,7 +151,8 @@ class VRInput:
             if self.calibration_view is not None else
             '  双臂：左/右侧键分别接管左/右臂；松开仅对应臂减速保持；Ctrl+C 结束\n'
             '  可选知行夹爪：左右摇杆X分别控制，向右张开/向左闭合，启动或断流恢复后先回中；开关以配置为准\n'
-            '  本模式不启用录制或摇杆重置'
+            + ('  录制已启用：右手功能键+左摇杆；以头显提示为准' if getattr(self, 'recording_enabled', False)
+             else '  本模式不启用录制或摇杆重置')
             if self.config.arm == 'both' else
             '  右手 squeeze=粗调，前扳机=精调，右手摇杆 x 控制夹爪\n'
             '  左手摇杆：上=重置参考，下=停止；右/左的录制事件由录制流程处理'

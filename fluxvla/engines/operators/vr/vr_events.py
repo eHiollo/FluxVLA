@@ -71,3 +71,69 @@ class VREventHandler:
             "VR recording controls (left thumbstick): "
             "right=next episode / start recording, left=re-record, down=stop, up=reset request"
         )
+
+
+class RecordingButtons:
+    """Right modifier + left stick; fresh neutral before/after mode changes.
+
+    Releases/reconnects cannot replay commands. Direction edges require a neutral
+    sample, diagonal input is ignored. Left gripper stays gated until recentered.
+    """
+    def __init__(self, modifier_button='a', threshold=.7, neutral=.2, max_age_s=.25):
+        if modifier_button not in ('a', 'b', 'thumbstick'):
+            raise ValueError('modifier_button must be a, b or thumbstick')
+        if not 0 < neutral < threshold <= 1 or not 0 < max_age_s <= 1:
+            raise ValueError('Invalid recording button thresholds')
+        self.button = modifier_button
+        self.threshold, self.neutral, self.max_age_s = threshold, neutral, max_age_s
+        self.reset()
+
+    def reset(self):
+        self.released = False
+        self.mode = False
+        self.armed = False
+        self.block_left = True
+        self.last_sequences = None
+
+    def update(self, raw):
+        import math
+        try:
+            hands = [raw[side] for side in ('left', 'right')]
+            if any(not math.isfinite(h['xlevr.sample_age_s']) or
+                   not 0 <= h['xlevr.sample_age_s'] <= self.max_age_s for h in hands):
+                raise ValueError('stale')
+            x = float(hands[0].get('xlevr.thumbstick', {}).get('x', 0))
+            y = float(hands[0].get('xlevr.thumbstick', {}).get('y', 0))
+            if not all(math.isfinite(v) and abs(v) <= 1 for v in (x, y)):
+                raise ValueError('invalid axes')
+            seq = tuple(h['xlevr.sample_sequence'] for h in hands)
+            pressed = bool(hands[1].get('xlevr.buttons', {}).get(self.button, False))
+        except (KeyError, TypeError, ValueError):
+            self.reset()
+            return dict(command=None, block_left=True, fresh=False, mode=False)
+        centered = abs(x) <= self.neutral and abs(y) <= self.neutral
+        command = None
+        restarted = self.last_sequences is not None and any(a < b for a, b in zip(seq, self.last_sequences))
+        if restarted:
+            self.reset()  # browser/session sequence restarted
+        duplicate = seq == self.last_sequences
+        self.last_sequences = seq
+        if not self.released:
+            if not pressed and centered:
+                self.released = True; self.block_left = False
+        elif not pressed:
+            self.mode = False; self.armed = False
+            if centered: self.block_left = False
+        else:
+            self.block_left = True
+            if not self.mode:
+                self.mode = True; self.armed = False
+            if centered:
+                self.armed = True
+            elif self.armed and not duplicate:
+                self.armed = False  # diagonals also require recentering
+                if abs(y) <= self.neutral and abs(x) >= self.threshold:
+                    command = 'right' if x > 0 else 'left'
+                elif abs(x) <= self.neutral and abs(y) >= self.threshold:
+                    command = 'down' if y > 0 else 'up'
+        return dict(command=command, block_left=self.block_left, fresh=True, mode=self.mode, restarted=restarted)

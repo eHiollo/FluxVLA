@@ -72,13 +72,18 @@ def initialize_grippers(robot, targets_mm):
     return False
 
 
-def move_to_init(robot, progress=None):
+def move_to_init(robot, progress=None, *, cancel_event=None):
     """Block until arm arrival and confirmed follower stop; never raw fallback."""
     configure_init_motion(
         robot, joint_dofs=robot.joint_dofs,
         init_position=getattr(robot, 'init_position', None),
         init_gripper_positions=getattr(robot, 'init_gripper_positions', None),
         init_motion=getattr(robot, 'init_motion', None))
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError('Initialization cancelled externally')
+
+    check_cancelled()
     target = joint_map(robot.init_position, robot.joint_dofs, 'init_position')
     if not robot._init_motion_lock.acquire(blocking=False):
         raise RuntimeError('Initialization is already running')
@@ -92,9 +97,12 @@ def move_to_init(robot, progress=None):
     try:
         robot._claim_init_motion()
         claimed = True
+        check_cancelled()
         robot._prepare_init_motion()
+        check_cancelled()
         joint_map(robot._read_init_joints(), robot.joint_dofs, 'actual joints')
         robot._traj_stop_event.clear()
+        check_cancelled()
         attempted = True
         result['phase'] = 'start_follower'
         if progress:
@@ -103,6 +111,7 @@ def move_to_init(robot, progress=None):
         settings = robot.init_motion
         deadline = time.monotonic() + settings['arrival_timeout_s']
         result['phase'] = 'sending'
+        check_cancelled()
         if robot._traj_stop_event.is_set():
             raise InterruptedError('Initialization cancelled')
         robot.send_joints(target)
@@ -115,6 +124,7 @@ def move_to_init(robot, progress=None):
         matches = 0
         result['phase'] = 'arrival'
         while time.monotonic() < deadline:
+            check_cancelled()
             if robot._traj_stop_event.is_set():
                 raise InterruptedError('Initialization cancelled')
             if time.monotonic() >= next_feedback:
@@ -132,6 +142,7 @@ def move_to_init(robot, progress=None):
                 next_feedback = time.monotonic() + settings['feedback_interval_s']
             if robot._traj_stop_event.is_set():
                 raise InterruptedError('Initialization cancelled')
+            check_cancelled()
             if time.monotonic() >= next_send:
                 # Repeat the final absolute target; motion planning stays in the controller.
                 robot.send_joints(target)

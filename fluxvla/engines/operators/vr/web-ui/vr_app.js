@@ -65,6 +65,7 @@ AFRAME.registerComponent('controller-updater', {
       if (!el) return;
       const phase = String(data.phase || 'idle').toLowerCase();
       const colors = {
+        resetting: '#FFD54F', failed: '#EF5350', reset_failed: '#EF5350', review: '#FFB300',
         reset: '#FFD54F',
         initial_reset: '#FFD54F',
         recording: '#66BB6A',
@@ -76,6 +77,9 @@ AFRAME.registerComponent('controller-updater', {
         idle: '#90CAF9'
       };
       const titles = {
+        resetting: 'RESETTING / DOWN TO CANCEL', reset_failed: 'RESET FAILED',
+        failed: 'INVALID EPISODE', review: 'CAPTURE STOPPED', starting: 'STARTING',
+        discarding: 'DISCARDING', button_check: 'BUTTON CHECK / NO MOTION',
         reset: 'RESET',
         initial_reset: 'RESET',
         recording: 'RECORDING',
@@ -93,7 +97,11 @@ AFRAME.registerComponent('controller-updater', {
       }
       const remaining = this.formatHudRemaining(data.remaining_s);
       if (remaining) lines.push(remaining);
+      if (Number.isFinite(data.elapsed_s)) lines.push(`TIME ${data.elapsed_s.toFixed(1)}s / ${data.frames || 0} frames`);
+      if (data.task) lines.push(String(data.task).slice(0, 60));
+      if (data.health) lines.push(String(data.health).slice(0, 100));
       if (data.hint) lines.push(String(data.hint));
+      if (data.error) lines.push(`ERROR: ${String(data.error).slice(0,120)}`);
       el.setAttribute('value', lines.join('\n'));
       el.setAttribute('color', colors[phase] || '#90CAF9');
     };
@@ -159,6 +167,7 @@ AFRAME.registerComponent('controller-updater', {
           }
           this.websocket = null; // Clear the reference
           this.reportVRStatus(false);
+          this.applyHud({phase:'stop',hint:'VR DISCONNECTED / release controls before reconnecting'});
           // Reconnect transport without refreshing/restarting the XR session.
           this.retryWebSocket();
         };
@@ -635,11 +644,13 @@ AFRAME.registerComponent('controller-updater', {
                 };
                 // 侧边按钮
                 leftController.buttons = {
-                    a: !!leftGamepad.buttons[3]?.pressed,
-                    b: !!leftGamepad.buttons[4]?.pressed,
+                    a: leftGamepad.mapping === 'xr-standard' && !!leftGamepad.buttons[4]?.pressed,
+                    b: leftGamepad.mapping === 'xr-standard' && !!leftGamepad.buttons[5]?.pressed,
                     squeeze: this.leftGripDown,
                     squeeze_value: Number(leftGamepad.buttons[1]?.value ?? 0),
-                    thumbstick: !!leftGamepad.buttons[2]?.pressed,
+                    thumbstick: leftGamepad.mapping === 'xr-standard' && !!leftGamepad.buttons[3]?.pressed,
+                    mapping: leftGamepad.mapping,
+                    raw_pressed: Array.from(leftGamepad.buttons, b => !!b.pressed),
                     menu: !!leftGamepad.buttons[6]?.pressed
                 };
             }
@@ -715,11 +726,13 @@ AFRAME.registerComponent('controller-updater', {
                 };
                 // 侧边按钮
                 rightController.buttons = {
-                    a: !!rightGamepad.buttons[3]?.pressed,
-                    b: !!rightGamepad.buttons[4]?.pressed,
+                    a: rightGamepad.mapping === 'xr-standard' && !!rightGamepad.buttons[4]?.pressed,
+                    b: rightGamepad.mapping === 'xr-standard' && !!rightGamepad.buttons[5]?.pressed,
                     squeeze: this.rightGripDown,
                     squeeze_value: Number(rightGamepad.buttons[1]?.value ?? 0),
-                    thumbstick: !!rightGamepad.buttons[2]?.pressed,
+                    thumbstick: rightGamepad.mapping === 'xr-standard' && !!rightGamepad.buttons[3]?.pressed,
+                    mapping: rightGamepad.mapping,
+                    raw_pressed: Array.from(rightGamepad.buttons, b => !!b.pressed),
                     menu: !!rightGamepad.buttons[6]?.pressed
                 };
             }

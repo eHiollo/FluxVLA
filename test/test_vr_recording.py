@@ -1,0 +1,329 @@
+"""Synthetic recording/VR lifecycle tests; never opens real device endpoints."""
+import copy
+import json
+import tempfile
+import threading
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import numpy as np
+from mmengine import Config
+
+from fluxvla.datasets.episode_writer import EpisodeWriter
+from fluxvla.datasets.a10_recording_io import validate_dataset
+from fluxvla.engines.operators.camera_operator import BufferedCameraOperator
+from fluxvla.engines.operators.vr.recording import RecordingSession
+from fluxvla.engines.operators.vr.vr_events import RecordingButtons
+from fluxvla.engines.operators.vr.runtime import build_runtime
+from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init, configure_init_motion
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def hands(seq, *, modifier=False, x=0., y=0., age=0., grip=False):
+    return {side: {'xlevr.sample_age_s':age, 'xlevr.sample_sequence':seq,
+                  'xlevr.thumbstick':{'x':x if side=='left' else .6, 'y':y if side=='left' else 0.},
+                  'xlevr.buttons':{'a':modifier if side=='right' else False,'squeeze':grip},
+                  'xlevr.grip_active':grip, 'xlevr.trigger':0.}
+            for side in ('left','right')}
+
+
+def actions():
+    return {side:{'gripper.pos':.6, '_xlevr.anchor_command':{'gripper':.6}} for side in ('left','right')}
+
+
+class ButtonTests(unittest.TestCase):
+    def test_neutral_gates_edges_diagonals_and_gripper_restore(self):
+        b=RecordingButtons()
+        self.assertTrue(b.update(hands(1,modifier=True,x=1))['block_left'])
+        self.assertIsNone(b.update(hands(2,modifier=True))['command'])
+        self.assertFalse(b.update(hands(3))['block_left'])
+        self.assertIsNone(b.update(hands(4,modifier=True,x=1))['command'])
+        b.update(hands(5,modifier=True))
+        self.assertEqual(b.update(hands(6,modifier=True,x=1))['command'],'right')
+        self.assertIsNone(b.update(hands(7,modifier=True,x=1))['command'])
+        b.update(hands(8,modifier=True))
+        self.assertIsNone(b.update(hands(9,modifier=True,x=1,y=1))['command'])
+        self.assertIsNone(b.update(hands(10,modifier=True,y=1))['command'])
+        b.update(hands(11,modifier=True))
+        self.assertEqual(b.update(hands(12,modifier=True,y=-1))['command'],'up')
+        self.assertTrue(b.update(hands(13,x=1))['block_left'])
+        self.assertFalse(b.update(hands(14))['block_left'])
+
+    def test_stale_duplicate_and_reconnect_cannot_replay(self):
+        b=RecordingButtons(); b.update(hands(1)); b.update(hands(2,modifier=True))
+        self.assertEqual(b.update(hands(3,modifier=True,x=-1))['command'],'left')
+        b.update(hands(3,modifier=True))
+        self.assertIsNone(b.update(hands(3,modifier=True,x=-1))['command'])
+        self.assertFalse(b.update(hands(4,age=1))['fresh'])
+        self.assertIsNone(b.update(hands(5,modifier=True,x=-1))['command'])
+        b.update(hands(6)); b.update(hands(7,modifier=True))
+        result=b.update(hands(0,modifier=True,x=-1))
+        self.assertTrue(result['restarted']); self.assertIsNone(result['command'])
+
+
+class CameraTests(unittest.TestCase):
+    def test_bounded_background_snapshot_and_cleanup(self):
+        closed=[]
+        class Camera:
+            def __init__(self, settings): self.name=settings['device']
+            def read_rgb(self):
+                time.sleep(.003); return np.zeros((16,16,3),dtype=np.uint8)
+            def close(self): closed.append(self.name)
+        cameras=BufferedCameraOperator({'a':{'device':'a'},'b':{'device':'b'}},camera_factory=Camera)
+        self.assertEqual(closed,[]); cameras.start()
+        try:
+            deadline=time.monotonic()+1
+            while min(map(len,cameras.histories.values()))<4 and time.monotonic()<deadline: time.sleep(.01)
+            frames=cameras.snapshot(time.monotonic())
+            self.assertEqual(set(frames),{'a','b'})
+            self.assertTrue(all(len(v)<=4 for v in cameras.histories.values()))
+            self.assertFalse(frames['a']['image'].flags.writeable)
+        finally: cameras.close()
+        self.assertEqual(set(closed),{'a','b'})
+
+    def test_camera_fault_visible_and_snapshot_does_not_wait(self):
+        entered=threading.Event(); release=threading.Event()
+        class Camera:
+            def __init__(self, _): pass
+            def read_rgb(self): entered.set(); release.wait(2); raise OSError('unplugged')
+            def close(self): pass
+        cameras=BufferedCameraOperator({'a':{'device':'a'}},camera_factory=Camera); cameras.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            with self.assertRaisesRegex(RuntimeError,'Waiting'): cameras.snapshot(time.monotonic())
+            release.set(); cameras._threads[0].join(1)
+            with self.assertRaisesRegex(RuntimeError,'unplugged'): cameras.snapshot(time.monotonic())
+        finally: release.set(); cameras.close()
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.root=Path(self.temp.name)/'data'
+        cfg=Config.fromfile(str(ROOT/'configs/a10/a10_dual_arm_record.py')).to_dict()
+        cfg['record']['root']=str(self.root)
+        cfg['capture'].update(terminal=False, max_clock_drift_s=10., max_sample_gap_s=10.)
+        for group in ('record',''):
+            cams=cfg['record']['cameras'] if group else cfg['cameras']
+            for c in cams.values(): c.update(width=16,height=16)
+        self.channels={}
+        for side in ('left','right'):
+            meta=cfg['record']['device_metadata']['grippers'][side]
+            channel=Mock(serial=meta['identity']['serial'],device_id=meta['device_id'],
+                         low=0,high=9000,opened=0,closed=9000)
+            channel.snapshot.side_effect=lambda: dict(actual_raw=4500,feedback_monotonic_s=time.monotonic(),
+                                                     error=None,enabled=True,alarm_a=0,alarm_b=0)
+            self.channels[side]=channel
+        self.robot=Mock(allow_motion=True,camera_operator=None,follower_stop_pending=False)
+        self.runtime=SimpleNamespace(teleoperator=Mock(is_dual=True,hand_to_arm={'left':'right','right':'left'}),
+            execute=True,observe_only=False,control_mode='reference',robot=self.robot,
+            _zx_channels=self.channels,_frame_index=0,last_frame=None,last_sdk_command=None,last_reference_result=None)
+        self.session=RecordingSession(self.runtime,cfg)
+        # Storage is explicitly synthetic in tests; bypass live startup only here.
+        self.writer=EpisodeWriter(self.root,cfg['record']['cameras'],schema='a10_dual_v1',synthetic=True)
+        self.session.writer=self.writer
+        self.session.pool=ThreadPoolExecutor(max_workers=1)
+        self.session.cameras=Mock()
+        self.seq=0
+        def camera_snapshot(t):
+            return {n:dict(image=np.zeros((16,16,3),np.uint8),received_monotonic_s=time.monotonic(),sequence=self.seq)
+                    for n in cfg['cameras']}
+        self.session.cameras.snapshot.side_effect=camera_snapshot
+        self.update()
+
+    def tearDown(self):
+        self.session.before_close(); self.session.close(); self.temp.cleanup()
+
+    def update(self, **kwargs):
+        self.seq+=1; now=time.monotonic()
+        self.runtime.last_frame=dict(has_error=False,received_monotonic_s=now,arms={
+            'left':dict(ee_id=0,joints=[.2]*6,received_monotonic_s=now),
+            'right':dict(ee_id=1,joints=[.1]*6,received_monotonic_s=now)})
+        self.session.before_step(hands(self.seq,**kwargs),actions())
+        self.session.after_step()
+
+    def settle(self):
+        if self.session.future: self.session.future.result(timeout=3)
+        self.session._poll_future()
+
+    def start(self):
+        self.session.command('start'); self.settle(); self.update(); self.update()
+
+    def test_record_save_two_episodes_discard_and_same_frame_values(self):
+        self.start(); self.session.command('save'); self.settle()
+        self.assertEqual(self.session.state,'idle')
+        self.start(); self.session.command('discard')
+        self.assertEqual(self.session.pending,'discard')
+        self.session.command('discard'); self.settle()
+        self.assertEqual(self.writer.info['total_episodes'],1)
+        self.start(); self.session.command('save'); self.settle()
+        self.session.close()
+        report=validate_dataset(self.root)
+        self.assertEqual(report['episodes'],2)
+        import pyarrow.parquet as pq
+        row=pq.read_table(self.root/'data/chunk-000/file-000.parquet').to_pylist()[0]
+        np.testing.assert_allclose(row['observation.state'],[.1]*6+[.5]+[.2]*6+[.5])
+        self.assertEqual(row['action'],row['observation.state'])
+
+    def test_stop_is_review_and_resume_requires_new_episode(self):
+        self.start(); count=self.session.frames
+        self.session.command('stop'); self.update()
+        self.assertEqual(self.session.state,'review'); self.assertEqual(count,self.session.frames)
+        self.session.command('start'); self.assertEqual(self.session.state,'review')
+        self.session.command('right'); self.settle(); self.assertEqual(self.session.state,'idle')
+        self.robot.stop_follower.assert_not_called()
+
+    def test_camera_stale_fault_prevents_publication(self):
+        self.start()
+        self.session.cameras.snapshot.side_effect=RuntimeError('left wrist unplugged')
+        self.update(); self.assertEqual(self.session.state,'failed')
+        self.session.command('save'); self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'],0)
+        self.session.command('discard'); self.session.command('discard'); self.settle()
+        self.assertEqual(self.session.state,'idle')
+
+    def test_gap_and_skew_are_not_silently_accepted(self):
+        self.start(); self.session._last_sample-=100
+        self.update(); self.assertEqual(self.session.state,'failed')
+        self.session.command('discard'); self.session.command('discard'); self.settle()
+        self.channels['left'].snapshot.side_effect=lambda: dict(actual_raw=4000,feedback_monotonic_s=time.monotonic()-1,
+                                                               enabled=True,error=None,alarm_a=0,alarm_b=0)
+        self.update(); self.session.command('start')
+        self.assertEqual(self.session.state,'idle')
+
+    def test_save_is_asynchronous_and_start_is_rejected_while_saving(self):
+        self.start(); entered=threading.Event(); release=threading.Event(); save=self.writer.save
+        def slow(): entered.set(); release.wait(2); return save()
+        with patch.object(self.writer,'save',slow):
+            self.session.command('save'); self.assertTrue(entered.wait(1))
+            try:
+                self.update(); self.session.command('start')
+                self.assertEqual(self.session.state,'saving')
+            finally: release.set(); self.settle()
+        self.assertEqual(self.session.state,'idle')
+
+    def test_gripper_gate_only_changes_physical_left(self):
+        self.session.before_step(hands(10),actions())
+        action=actions(); self.session.before_step(hands(11,modifier=True,x=1),action)
+        self.assertEqual(action['right']['gripper.pos'],0.)  # physical left = internal right
+        self.assertEqual(action['left']['gripper.pos'],.6)
+        action=actions(); self.session.before_step(hands(12,x=1),action)
+        self.assertEqual(action['right']['gripper.pos'],0.)
+        action=actions(); self.session.before_step(hands(13),action)
+        self.assertEqual(action['right']['gripper.pos'],.6)
+
+    def test_confirmation_expiry_disconnect_and_motion_guard(self):
+        self.start(); self.session.command('discard'); self.session.pending_at-=20
+        self.update(); self.assertIsNone(self.session.pending)
+        self.session.command('discard'); self.update(age=1)
+        self.assertIsNone(self.session.pending); self.assertEqual(self.session.state,'failed')
+        self.session.command('reset'); self.assertIsNone(self.session.reset_thread)
+
+    def test_reset_requires_release_and_second_confirmation_is_exclusive(self):
+        self.update(grip=True); self.session.command('reset'); self.assertIsNone(self.session.pending)
+        self.update(); self.session.command('reset'); self.assertEqual(self.session.pending,'reset')
+        entered=threading.Event(); release=threading.Event()
+        def init(robot, cancel_event):
+            entered.set(); release.wait(2)
+            if cancel_event.is_set(): raise InterruptedError('cancelled')
+            return dict(completed=True)
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init',init):
+            self.session.command('reset'); self.assertTrue(entered.wait(1))
+            try:
+                action=actions()
+                self.assertTrue(self.session.before_step(hands(20),action))
+                self.assertTrue(all(a['gripper.pos']==0 for a in action.values()))
+                self.session.command('start'); self.assertEqual(self.session.state,'resetting')
+            finally: release.set(); self.session.reset_thread.join(2)
+            self.session._poll_reset()
+        self.assertEqual(self.session.state,'idle')
+        self.assertTrue(self.runtime._dual_require_release)
+        self.robot.wait_stopped.assert_called()
+
+    def test_reset_cancel_on_stale_input_latches_failure(self):
+        entered=threading.Event()
+        def init(robot,cancel_event):
+            entered.set(); cancel_event.wait(2); raise InterruptedError('cancelled')
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init',init):
+            self.session.command('reset'); self.session.command('reset')
+            self.assertTrue(entered.wait(1)); self.session.before_step(hands(30,age=1),actions())
+            self.session.reset_thread.join(2); self.session._poll_reset()
+        self.assertTrue(self.session.blocks_motion)
+        self.robot.stop_all_actions.assert_called_once()
+
+    def test_real_runtime_hooks_capture_and_block_robot_during_reset(self):
+        from test_vr_dual_runtime import configuration, DualRobot, HandInput, hand
+        from fluxvla.engines.operators.vr_operator import VROperator
+        from fluxvla.engines.operators.vr.runtime import DualVRTeleopRuntime
+        class Robot(DualRobot):
+            camera_operator = None
+            def get_frame(self):
+                frame = super().get_frame()
+                for name, arm in frame['arms'].items():
+                    arm.update(ee_id=0 if name=='left' else 1, joints=[.2 if name=='left' else .1]*6)
+                return frame
+        cfg=configuration()
+        vr=VROperator(**{k:v for k,v in cfg.input.items() if k!='type'})
+        vr.input=HandInput(); vr.send_feedback=Mock()
+        robot=Robot()
+        rt=DualVRTeleopRuntime(vr,robot,execute=True,control_mode='reference',
+                              max_position_step_m=.005,max_rotation_step_rad=.015)
+        for channel in self.channels.values(): channel.options={'input_timeout_s':.25}
+        rt._zx_channels=self.channels
+        rt.recording=self.session; self.session.runtime=rt; self.session._last_hud=0.
+        rt.connect()
+        try:
+            def tick(seq):
+                vr.input.rows={side:hand(seq,False) for side in ('left','right')}
+                rt.step()
+            tick(1)
+            self.session.commands.put('start'); tick(2); self.settle()
+            tick(3); tick(4)
+            self.assertEqual(self.session.frames,2)
+            self.session.commands.put('save'); tick(5); self.settle()
+            self.assertEqual(self.writer.info['total_episodes'],1)
+            self.session.reset_failed=True
+            with patch.object(robot,'get_frame',side_effect=AssertionError('robot IO while reset owns it')):
+                tick(6)
+            self.assertGreaterEqual(vr.send_feedback.call_count,1)
+        finally:
+            rt.close()
+
+    def test_quit_retains_unfinished_episode(self):
+        self.start(); self.session.command('quit'); self.session.close()
+        self.assertTrue(self.session.quit_requested)
+        self.assertTrue((self.root/'.recording/active').exists())
+        self.assertFalse((self.root/'data').exists())
+
+
+class InitCancelTest(unittest.TestCase):
+    def test_external_cancel_is_not_cleared_during_prepare(self):
+        event=threading.Event()
+        robot=Mock(command_mode='cartesian',follower_stop_pending=False)
+        robot._init_motion_lock=threading.Lock()
+        robot._traj_stop_event=threading.Event()
+        robot._prepare_init_motion.side_effect=event.set
+        robot._read_init_joints.return_value={'arm':np.zeros(6)}
+        configure_init_motion(robot,joint_dofs={'arm':6},init_position={'arm':[0]*6},init_motion={})
+        with self.assertRaises(InterruptedError): move_to_init(robot,cancel_event=event)
+        robot.start_follower.assert_not_called(); robot.send_joints.assert_not_called()
+        self.assertFalse(robot._init_motion_lock.locked())
+
+
+class EntryTest(unittest.TestCase):
+    def test_button_preview_is_robot_free_and_live_requires_grippers(self):
+        from scripts.teleoperate import main
+        args=['--config',str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),
+              '--record-config',str(ROOT/'configs/a10/a10_dual_arm_record.py'),'--preview']
+        with patch('fluxvla.engines.operators.vr.recording.RecordingSession.connect',side_effect=AssertionError('IO')):
+            self.assertEqual(main(args+['--check-record-buttons']),0)
+            with self.assertRaisesRegex(ValueError,'live dual'): main(args)
+            self.assertEqual(main(args+['--cfg-options','teleop.vr_only=False','teleop.observe_only=False',
+                                       'teleop.operator.allow_motion=True','teleop.zx_grippers.enabled=True']),0)
+
+
+if __name__=='__main__': unittest.main()

@@ -146,3 +146,64 @@ class CameraOperator:
 
     def __exit__(self, *_exc):
         self.close()
+
+
+class BufferedCameraOperator:
+    """Bounded RGB histories with HOST receive times (not exposure timestamps).
+
+    Each worker owns one camera. Snapshot never waits for USB; ordinary synchronous
+    CameraOperator callers are unchanged. Constructing this class opens nothing.
+    """
+    def __init__(self, cameras, history_size=4, camera_factory=RGBCamera):
+        from collections import deque
+        if not cameras or type(history_size) is not int or history_size < 2:
+            raise ValueError('Configure cameras and history_size >= 2')
+        if any(c.get('exclusive_per_read') for c in cameras.values()):
+            raise ValueError('Recording requires persistent simultaneous camera streams')
+        self.cameras = {n: camera_factory(c) for n, c in cameras.items()}
+        self.histories = {n: deque(maxlen=history_size) for n in cameras}
+        self.errors = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._threads = []
+
+    def start(self):
+        if self._threads or self._stop.is_set():
+            raise RuntimeError('Camera workers cannot be restarted')
+        for name, camera in self.cameras.items():
+            thread = threading.Thread(target=self._capture, args=(name, camera),
+                                      name=f'record-camera-{name}', daemon=True)
+            self._threads.append(thread); thread.start()
+
+    def _capture(self, name, camera):
+        sequence = 0
+        try:
+            while not self._stop.is_set():
+                rgb = camera.read_rgb()
+                stamp = time.monotonic()
+                rgb.setflags(write=False)
+                with self._lock:
+                    self.histories[name].append(dict(image=rgb, received_monotonic_s=stamp,
+                                                     sequence=sequence))
+                sequence += 1
+        except Exception as exc:
+            with self._lock: self.errors[name] = str(exc)
+        finally:
+            try: camera.close()
+            except Exception as exc:
+                with self._lock: self.errors[name] = str(exc)
+
+    def snapshot(self, reference_time):
+        with self._lock:
+            if self.errors:
+                raise RuntimeError(f'Camera errors: {self.errors}')
+            if any(not frames for frames in self.histories.values()):
+                raise RuntimeError('Waiting for all three camera streams')
+            return {name: dict(min(frames, key=lambda f: abs(f['received_monotonic_s']-reference_time)))
+                    for name, frames in self.histories.items()}
+
+    def close(self):
+        self._stop.set()
+        for thread in self._threads: thread.join(1.)
+        if any(thread.is_alive() for thread in self._threads):
+            raise RuntimeError('Camera capture is blocked; worker not stopped (robot cleanup already requested)')

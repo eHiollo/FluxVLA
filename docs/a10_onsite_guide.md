@@ -650,3 +650,8 @@ python -m fluxvla.projects.a10 validate --root datasets/a10/onsite_trial_001 --e
 持续推理：在原运行命令中设置 `inference.max_publish_step=None`，取消总步数上限。输入 p 后回车在当前块结束后停止；Ctrl+C 请求停止 follower。当前没有自动识别抓取成功，完成任务后需现场停止。
 
 来回拉动诊断：A10 cycle 增加 observed_qpos（推理前实际状态）、previous_last_action（上一块发送的末目标）、first_action/last_action（本块首尾）、tracking_error_at_observation_rad（实际六轴减上块末目标）。这些日志用于区分观测时残余跟踪误差与模型目标跳变；同步发送不等于机械臂已到位。
+
+
+## 双臂VR录制与手柄复位（2026-11-06）
+
+采集入口已接入，使用右手A作为功能键、左摇杆四方向操作录制。先进行无设备按钮检查，现场再验证录制与m_init。请按[双臂VR数据采集指南](a10_vr_recording.md)执行；保存/停止采样不等于停止机械臂，复位另行确认。

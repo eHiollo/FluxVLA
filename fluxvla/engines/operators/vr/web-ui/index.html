@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="styles.css"></head><body>
 <div id="modeNotice" style="position:fixed;z-index:10;padding:12px;background:#ffffffdd;border-radius:8px">
 <strong>FluxVLA · A10 VR</strong><br>进入 VR 后使用右手侧键控制机械臂、摇杆控制夹爪。<br>
-左手摇杆：右=开始/保存，左=重录，下=停止，上=复位。<br>
+双臂采集：按住右手A，再拨左摇杆：右=开始/保存，左=重录，下=停止采集，上=复位。<br>进入/退出功能键模式须左摇杆回中；未启用采集时摇杆只控制夹爪。<br>
 相机、机器人地址和运动参数在平台配置中设置。
 </div>
     <a-scene vr-mode-ui="enabled: true;">
@@ -16,9 +16,9 @@
 
       <!-- Headset tracking entity -->
       <a-entity id="headset" camera>
-        <a-entity id="recordHudRoot" position="0 0.18 -0.72" scale="0.03 0.03 0.03">
-          <a-plane width="6.4" height="2.6" color="#000000" opacity="0.55" position="0 0 -0.04" material="shader: flat; transparent: true; opacity: 0.55"></a-plane>
-          <a-text id="recordHud" value="WAITING" color="#90CAF9" align="center" width="6" wrap-count="16" baseline="center"></a-text>
+        <a-entity id="recordHudRoot" position="0 0.18 -0.72" scale="0.065 0.065 0.065">
+          <a-plane width="6.4" height="4.6" color="#000000" opacity="0.55" position="0 0 -0.04" material="shader: flat; transparent: true; opacity: 0.55"></a-plane>
+          <a-text id="recordHud" value="WAITING" color="#90CAF9" align="center" width="6" wrap-count="42" baseline="center"></a-text>
         </a-entity>
         <a-text id="headsetInfo" value="" position="0 -0.16 -0.72" rotation="0 0 0" scale="0.035 0.035 0.035" color="#777777" align="center"></a-text>
       </a-entity>

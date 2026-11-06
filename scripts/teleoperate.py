@@ -13,6 +13,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
+    parser.add_argument('--record-config', type=Path, help='双臂数据采集配置；启用手柄录制/HUD和备用终端命令')
+    parser.add_argument('--record-options', nargs='+', action=DictAction, help='覆盖录制配置，如 record.resume=True capture.task=...')
+    parser.add_argument('--check-record-buttons', action='store_true', help='配合--record-config，只检查VR按钮，不连接机器人/夹爪/相机')
     parser.add_argument('--record-controller', action='store_true',
                         help='同一5999连接开启控制器高频记录；需实机模式或 --observe')
     parser.add_argument('--preview', action='store_true', help='只检查配置，不启动服务或连接设备')
@@ -32,6 +35,14 @@ def main(argv=None):
     parser.add_argument('--samples', type=int, default=10, help='只读控制器检查的采样次数，默认 10')
     parser.add_argument('--report', type=Path, help='只读控制器检查报告 JSON 路径')
     args = parser.parse_args(argv)
+    if args.record_options and not args.record_config:
+        parser.error('--record-options requires --record-config')
+    if args.check_record_buttons and not args.record_config:
+        parser.error('--check-record-buttons requires --record-config')
+    if args.record_config and any((args.observe, args.verify_calibration, args.inspect_controller, args.calibrate_pose)):
+        parser.error('数据录制不能与观察/标定/控制器检查模式混用；检查按钮使用--check-record-buttons')
+    if args.check_record_buttons and args.record_controller:
+        parser.error('按键检查不能开启控制器记录')
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
@@ -90,7 +101,22 @@ def main(argv=None):
         return 0
     if args.observe:
         cfg.teleop.update(vr_only=False, observe_only=True, control_mode='reference')
+    if args.check_record_buttons:
+        cfg.teleop.update(vr_only=True, observe_only=False)
+        cfg.teleop.zx_grippers.enabled = False
     runtime = build_runtime(cfg.teleop)
+    if args.record_config:
+        if cfg.teleop.get('fps', 30) != 30:
+            parser.error('双臂数据录制要求teleop.fps=30')
+        from fluxvla.engines.operators.vr.recording import RecordingSession
+        record_config = Config.fromfile(str(args.record_config))
+        if args.record_options: record_config.merge_from_dict(args.record_options)
+        record_cfg = record_config.to_dict()
+        runtime.recording = RecordingSession(runtime, record_cfg, button_check=args.check_record_buttons)
+        runtime.vr.recording_enabled = True
+        print(f'数据入口：schema={record_cfg["record"]["schema"]}，task={record_cfg["capture"]["task"]}，'
+              f'目录={record_cfg["record"]["root"]}，右手功能键={runtime.recording.buttons.button}；'
+              f'只读按键检查={args.check_record_buttons}')
     if args.preview:
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'

@@ -149,6 +149,23 @@ class DualRecordingTest(unittest.TestCase):
         info.pop('a10_recording_schema'); info_path.write_text(json.dumps(info))
         with self.assertRaises(ValueError): validate_dataset(self.root)
 
+    def test_native_image_statistics_match_actual_rgb_pixels(self):
+        pixels=[]
+        with self.writer() as writer:
+            writer.start('moments')
+            for i in range(4):
+                state,action,images=dual_frame(i,frames=4)
+                image=(np.arange(16*16*3).reshape(16,16,3)+i*17).astype(np.uint8)
+                pixels.append(image.reshape(-1,3)/255.)
+                writer.append(state,action,{n:image for n in SPEC.cameras})
+            writer.save()
+        actual=json.loads((self.root/'meta/stats.json').read_text())
+        values=np.concatenate(pixels)
+        expected=dict(mean=values.mean(0),std=values.std(0),min=values.min(0),max=values.max(0))
+        for name in SPEC.cameras:
+            for key, value in expected.items():
+                np.testing.assert_allclose(np.asarray(actual[f'observation.images.{name}'][key]).reshape(3),value,atol=1e-10)
+
     def test_config_reuses_device_identities_without_usb_paths(self):
         from mmengine import Config
         root=Path(__file__).resolve().parents[2]

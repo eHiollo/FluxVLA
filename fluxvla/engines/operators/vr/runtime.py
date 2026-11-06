@@ -518,12 +518,14 @@ class VRTeleopRuntime:
         self.last_reference_result = None
         started = time.monotonic()
         self.last_gripper_command = None
+        recording = getattr(self, 'recording', None)
         raw, action = {}, {}
         error = None
         try:
             if not self._connected or not self.vr.is_connected:
                 raise ConnectionError('VR input is not connected')
-            self._poll_controller_recording()
+            if recording is None or not recording.blocks_motion:
+                self._poll_controller_recording()
             if self.teleoperator is not None:
                 action = self.teleoperator.get_action()
                 raw = self.teleoperator.last_raw
@@ -531,11 +533,20 @@ class VRTeleopRuntime:
                 raw = self.vr.get_action()
                 action = self.mapper(raw)
             self._input_read_time = time.monotonic()
-            return self._step(raw, action)
+            blocked = recording.before_step(raw, action) if recording is not None else False
+            result = action if blocked else self._step(raw, action)
+            if recording is not None: recording.after_step()
+            return result
         except BaseException as exc:
+            if recording is not None and recording.state == 'recording':
+                recording.fail(f'Control interrupted: {exc}')
             self._cancel_accessories()
             error = f'{type(exc).__name__}: {exc}'
-            if self.control_mode == 'reference' and self.execute:
+            if recording is not None and recording.blocks_motion:
+                recording.reset_cancel.set()
+                if recording.reset_thread is not None:
+                    self.robot.cancel_current_command()
+            elif self.control_mode == 'reference' and self.execute:
                 self._require_release = True
                 try:
                     self._stop_reference()
@@ -567,6 +578,7 @@ class VRTeleopRuntime:
                               reference_control=self.last_reference_result,
                               controller_speed_override=self.speed_status,
                               controller_recording=self.controller_recording,
+                              dataset_recording=recording.status() if recording is not None else None,
                               client_monotonic_ns=time.monotonic_ns(), client_wall_ns=time.time_ns(),
                               stop_status=self.last_stop_status)
                 self._diagnostics.write(record)
@@ -794,6 +806,9 @@ class VRTeleopRuntime:
             raise ValueError('max_steps must be a positive integer')
         try:
             self.connect()
+            recording = getattr(self, 'recording', None)
+            if recording is not None: recording.connect()
+            next_tick = time.monotonic()
             count = 0
             while max_steps is None or count < max_steps:
                 started = time.monotonic()
@@ -803,7 +818,8 @@ class VRTeleopRuntime:
                     break
                 action = self.step()
                 count += 1
-                if not self.execute and count % fps == 0:
+                if recording is not None and recording.quit_requested: break
+                if recording is None and not self.execute and count % fps == 0:
                     if getattr(self.teleoperator, 'is_dual', False):
                         print({arm: {'enabled': value.get('ee.enabled'),
                                      'anchor': value.get('_xlevr.anchor_command')}
@@ -813,12 +829,23 @@ class VRTeleopRuntime:
                             'ee.enabled', 'ee.delta_x', 'ee.delta_y', 'ee.delta_z',
                             'ee.delta_rx', 'ee.delta_ry', 'ee.delta_rz',
                             'gripper.pos')}, flush=True)
-                time.sleep(max(0., 1. / fps - (time.monotonic() - started)))
+                if recording is None:
+                    time.sleep(max(0., 1. / fps - (time.monotonic() - started)))
+                else:
+                    next_tick += 1. / fps
+                    if next_tick < time.monotonic(): next_tick = time.monotonic()
+                    time.sleep(max(0., next_tick-time.monotonic()))
             return count
         except KeyboardInterrupt:
             return 0
         finally:
-            self.close()
+            recording = getattr(self, 'recording', None)
+            try:
+                if recording is not None: recording.before_close()
+            finally:
+                try: self.close()
+                finally:
+                    if recording is not None: recording.close()
 
     def close(self):
         """Request follower stop before closing links; preserve stop errors."""

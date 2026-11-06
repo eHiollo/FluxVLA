@@ -847,7 +847,7 @@ python scripts/export_a10_openpi_dataset.py \
 导出目标必须不存在，原数据不会修改；输出供当前 OpenPI 的 v2.1 reader 使用，训练前重新计算 norm_stats。
 
 
-### 双臂数据校验与导出（录制底座已支持，实时采集尚未接入）
+### 双臂数据校验与导出（实时入口见下一节，实机待验收）
 
 在FluxVLA主目录运行；只有真实录制目录产生且写入器关闭后才使用以下命令。它们不启动设备，`--record-controller`也不会生成训练数据。
 
@@ -859,3 +859,32 @@ python scripts/export_a10_openpi_dataset.py \
 ```
 
 输出目录必须不存在；完整约定见[双臂数据交接说明](a10_dual_dataset_handoff.md)。14维顺序是物理左臂+左夹爪、物理右臂+右夹爪，夹爪0张开/1闭合，训练端需独立适配policy。
+
+
+### 双臂VR采集：右手A功能键（2026-11-06）
+
+先检查按钮，不连接机器人/夹爪/相机：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --check-record-buttons
+```
+
+确认实体右A对应后，由现场操作者启动真实采集：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True \
+    teleop.zx_grippers.enabled=True
+```
+
+按住右A，左摇杆回中后：右=开始/保存；左=丢弃确认；下=停止采样待处理；上=复位确认。模式内屏蔽左夹爪新输入，松A后回中恢复。复位需先处理本集、释放两手侧键/扳机。备用终端：start/save/discard/reset/stop/status/quit。
+
+首次使用空输出目录；续录在命令末尾追加 `--record-options record.resume=True`，任务和输出目录也可通过 `capture.task` / `record.root` 覆盖。中断恢复、HUD及日志见[采集指南](a10_vr_recording.md)。

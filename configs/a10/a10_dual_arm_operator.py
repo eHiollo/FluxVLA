@@ -12,6 +12,7 @@ operator = dict(
     type='A10Operator', host='192.168.0.150',
     ws_port=5999, status_ws_port=5999, udp_port=9998, joint_udp_port=9999,
     status_poll_interval_s=None, timeout_s=2.,
+    joint_follower_velocity_percent=100,  # follower_aj parameter; not set_jog_vel.
     allow_motion=False, command_mode='cartesian', cartesian_wire_format='pe321',
     feedback_joint_unit='deg', feedback_position_unit='mm',
     # TEMPLATE mappings, to verify against actual dual-controller GET replies.
@@ -22,11 +23,10 @@ operator = dict(
     # Row order follows the controller Cartesian group, NOT dict insertion order.
     cartesian_target_order=['right', 'left'],
     joint_target_order=['right', 'left'],
-    # Absolute joint radians; right/id 0, then left/id 1.
+    # Site targets in degrees, converted to operator radians; right/id 0, left/id 1.
     init_position=dict(
-        right=[-2.044251792983398, -0.8144404421506339, 2.385708007843569,
-               -0.6513219702592439, -1.2242612038114224, -0.24410174918392694],
-        left=[0., 0., 2.6179938779914944, -1.832595714594046, -1.5707963267948966, 0.],
+        right=[q * (3.141592653589793 / 180.) for q in (21, 38, -131, 28, 111, -3)],
+        left=[q * (3.141592653589793 / 180.) for q in (-18, -36, 128, -18, -106, -5)],
     ),
     init_gripper_positions=dict(right=0., left=0.),
 )

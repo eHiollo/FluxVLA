@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import select
 import socket
 import struct
 import threading
@@ -395,6 +396,8 @@ class _FollowerConnection:
         self.timeout_s = timeout_s
         self.joint_udp_port = joint_udp_port
         self.ws = self.udp = self.joint_udp = None
+        self._request_pending = threading.Event()
+        self.command_cancelled = None
 
     def connect(self):
         from websockets.sync.client import connect
@@ -417,6 +420,9 @@ class _FollowerConnection:
             raise
 
     def send_command(self, command):
+        if (self.command_cancelled is not None and self.command_cancelled.is_set()
+                and command.split(maxsplit=1)[0] not in ('get', 'stop_follower', 'manual_stop')):
+            raise InterruptedError('当前命令已取消，未发送控制器命令')
         if self.ws is None:
             raise ConnectionError('A10 operator is not connected')
         try:
@@ -428,6 +434,7 @@ class _FollowerConnection:
     def request(self, command, *, status=False, timeout_s=None, raw=False):
         budget = self.timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + budget
+        self._request_pending.set()
         try:
             self.send_command(command)
             for _ in range(32):
@@ -454,6 +461,17 @@ class _FollowerConnection:
                 raise TimeoutError(
                     f'A10 command {command!r} reply timed out after {budget:.3f}s') from exc
             raise
+        finally:
+            self._request_pending.clear()
+
+    def interrupt(self):
+        """Wake a blocked receive; the requesting thread closes the stale socket."""
+        ws = self.ws
+        if self._request_pending.is_set() and ws is not None:
+            try:
+                ws.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def close(self):
         ws, udp, joint_udp = self.ws, self.udp, self.joint_udp
@@ -500,8 +518,8 @@ class A10Operator(BaseOperator):
     the XML control-group row order, not inferred from left/right or ee_id.
     Two arms share one connection/follower; all targets must be supplied in
     one call. Joint targets flatten in joint_target_order (default ascending
-    ee_id). Dual gripper and inference trajectory commands are unsupported;
-    The local m_init command generates a complete joint group through send_joints.
+    ee_id). Dual gripper trajectories remain unsupported. The local m_init
+    command repeats its configured absolute target through send_joints.
     A10State.arms / get_frame()['arms'] expose named model feedback. Legacy
     flat fields remain available only for a single configured arm.
     """
@@ -514,6 +532,7 @@ class A10Operator(BaseOperator):
                  allow_motion=False, arm_name='right', feedback_joint_unit='deg',
                  feedback_position_unit=None, gripper_feedback_path=None,
                  joint_udp_port=9999, command_mode='cartesian',
+                 joint_follower_velocity_percent=None,
                  cameras=None, gripper=None, gripper_transport='controller',
                  continue_on_gripper_timeout=False,
                  trajectory_feedback_interval_s=0.1,
@@ -532,6 +551,11 @@ class A10Operator(BaseOperator):
             raise ValueError('Ports must be integers within 1..65535')
         if joint_udp_port == udp_port:
             raise ValueError('Cartesian and joint UDP ports must differ')
+        if (joint_follower_velocity_percent is not None
+                and (type(joint_follower_velocity_percent) is not int
+                     or not 1 <= joint_follower_velocity_percent <= 100)):
+            raise ValueError('joint_follower_velocity_percent must be an integer within 1..100 or None')
+        self.joint_follower_velocity_percent = joint_follower_velocity_percent
         if command_mode not in _FOLLOWER_MODES:
             raise ValueError('command_mode must be cartesian or joint')
         if cartesian_wire_format not in ('pq', 'pe321'):
@@ -657,6 +681,7 @@ class A10Operator(BaseOperator):
         self._status_error = None
         self._status_lock = threading.Lock()
         self._io_lock = threading.RLock()
+        self._command_cancelled = threading.Event()
         self._confirmed_active = False
         self._started_here = False
         self._start_confirmed = False
@@ -818,11 +843,54 @@ class A10Operator(BaseOperator):
             raise TimeoutError(f'A10 status feedback older than {self.status_max_age_s:.3f}s')
         return state
 
-    def _require_motion(self):
+    def _require_motion(self, *, allow_cancelled=False):
         if not self.allow_motion:
             raise PermissionError('A10 allow_motion is false')
+        if not allow_cancelled and self._command_cancelled.is_set():
+            raise InterruptedError('当前命令已取消，禁止继续下发动作')
         if not self.is_connected:
             raise ConnectionError('A10 operator is not connected')
+
+    def begin_console_command(self):
+        """Only a newly submitted console command clears the cancellation latch."""
+        self._command_cancelled.clear()
+        self._connection.command_cancelled = self._command_cancelled
+
+    def cancel_current_command(self):
+        """Latch cancellation without waiting for the command's I/O lock."""
+        self._command_cancelled.set()
+        self._connection.command_cancelled = self._command_cancelled
+        self._traj_stop_event.set()
+        self._connection.interrupt()
+
+    def stop_all_actions(self):
+        """Cancel sends, request follower exit AND controller motion stop.
+
+        stop_follower only clears the SDK's running flag. A running real-time
+        plan can remain active, so explicit console stop also sends manual_stop.
+        Only fresh inactive + Stopped feedback confirms completion.
+        """
+        self.cancel_current_command()
+        if not self.allow_motion:
+            raise PermissionError('A10 allow_motion is false')
+        with self._io_lock:
+            self.last_stop_confirmed = False
+            if not self.is_connected:
+                # Recover only the transport needed to send stop. Never replay
+                # a command, enable a motor or reopen accessories here.
+                self._connection.connect()
+            self._confirmed_active = self._start_confirmed = False
+            if self.shared_control:
+                self._connection.call('stop')
+            else:
+                self._connection.send_command('stop_follower')
+                self._connection.send_command('manual_stop')
+            state = self.wait_stopped()
+            self._started_here = False
+            self._follower_mode = None
+            self._reset_cartesian_encoding()
+            self.last_stop_confirmed = True
+            return state
 
     def get_state(self, *, timeout_s=None):
         with self._io_lock:
@@ -867,7 +935,7 @@ class A10Operator(BaseOperator):
             # sending. m_init and arbitrary commands are not follower starts.
             was_inactive = state.follower_active is False
             command_name = command.split(maxsplit=1)[0]
-            if was_inactive and command_name in ('follower_cart', 'follower_aj'):
+            if was_inactive and command_name in ('follower_cart', 'follower_aj', 'follower_aj_tg'):
                 self._started_here = True
             try:
                 reply = self._connection.request(
@@ -948,7 +1016,10 @@ class A10Operator(BaseOperator):
         deadline = time.monotonic() + budget
         state = None
         while time.monotonic() < deadline:
-            state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if state is not None and remaining < min(.02, budget / 10):
+                break
+            state = self.get_state(timeout_s=max(.001, remaining))
             if state.has_error:
                 raise A10ControllerError('Controller reports a fault while confirming stop')
             info = state.raw['ret_context'].get('robot_msg', {})
@@ -964,8 +1035,14 @@ class A10Operator(BaseOperator):
 
     def _wait_mode(self, active):
         deadline = time.monotonic() + self.timeout_s
+        state = None
         while time.monotonic() < deadline:
-            state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+            if active:
+                self._require_motion()
+            remaining = deadline - time.monotonic()
+            if state is not None and remaining < min(.02, self.timeout_s / 10):
+                break
+            state = self.get_state(timeout_s=max(.001, remaining))
             stopped = (active or not self.is_multi_arm or
                        state.raw['ret_context'].get('robot_msg', {}).get('motion') == 'Stopped')
             if (state.follower_active is active and stopped
@@ -983,9 +1060,13 @@ class A10Operator(BaseOperator):
                 raise A10ControllerError('Controller reports a fault')
             time.sleep(min(.02, max(0., deadline - time.monotonic())))
         self._confirmed_active = False
+        info = {} if state is None else state.raw['ret_context'].get('robot_msg', {})
+        detail = (f'; last follower_active={None if state is None else state.follower_active}, '
+                  f'mode={None if state is None else state.follower_mode}, '
+                  f'motion={info.get("motion")}, activate={info.get("activate")}')
         if not active and self.is_multi_arm:
-            raise TimeoutError('Dual follower stop requires inactive + Stopped feedback')
-        raise TimeoutError('Follower mode change was not confirmed')
+            raise TimeoutError('Dual follower stop requires inactive + Stopped feedback' + detail)
+        raise TimeoutError('Follower mode change was not confirmed' + detail)
 
 
 
@@ -1084,6 +1165,8 @@ class A10Operator(BaseOperator):
         if mode not in _FOLLOWER_MODES:
             raise ValueError('mode must be cartesian or joint')
         command, feedback_mode = _FOLLOWER_MODES[mode]
+        if mode == 'joint' and self.joint_follower_velocity_percent is not None:
+            command += f' --vel_percent={self.joint_follower_velocity_percent}'
         with self._io_lock:
             self._require_motion()
             if self._started_here:
@@ -1100,7 +1183,11 @@ class A10Operator(BaseOperator):
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
             info = state.raw['ret_context'].get('robot_msg', {})
             if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
-                raise RuntimeError('Follower start requires Enabled and Stopped feedback')
+                raise RuntimeError(
+                    'Follower start requires Enabled and Stopped feedback; '
+                    f'activate={info.get("activate")}, motion={info.get("motion")}, '
+                    f'follower_active={state.follower_active}. '
+                    '若 motion=Running，请先输入 stop 结束控制器当前命令并确认 Stopped')
             coordinate = state.raw['ret_context']['motion_msg'].get('jog_coordinate')
             if mode == 'cartesian' and coordinate not in ('Base', 'Tool', 'Wobj'):
                 raise RuntimeError(
@@ -1138,7 +1225,7 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             self._sdk_tool_adapter = None
             self._sdk_tool_adapters = None
-            self._require_motion()
+            self._require_motion(allow_cancelled=True)
             if self.shared_control:
                 lease = self._connection.lease('status')
                 if (self.shared_control.get('role') != 'console'
@@ -1391,12 +1478,30 @@ class A10Operator(BaseOperator):
                 raise RuntimeError(f'{mode} follower start has not been confirmed')
             udp = self._connection.udp if mode == 'Cart' else self._connection.joint_udp
             try:
+                if mode == 'Axis':
+                    self._check_joint_follower_reply()
                 if udp.send(packet) != len(packet):
                     raise ConnectionError('Incomplete UDP datagram send')
             except OSError:
                 self._confirmed_active = False
                 raise
         # UDP has no application ACK. This return does not mean execution.
+
+    def _check_joint_follower_reply(self):
+        """Surface direct SDK rejection datagrams; silence is not acceptance.
+
+        FollowerAjParam replies on a dimension mismatch, but sends no success
+        ACK. Read only already available data, without delaying the stream.
+        Shared transport uses a proxy socket and is not inspected here.
+        """
+        if self.shared_control or self._connection.joint_udp is None:
+            return
+        udp = self._connection.joint_udp
+        if select.select([udp], [], [], 0)[0]:
+            packet = udp.recv(65535)
+            self._confirmed_active = False
+            detail = _unpack(packet).decode('utf-8', errors='replace')[:500]
+            raise A10ProtocolError(f'关节 follower UDP 返回：{detail}；已停止继续下发目标')
 
     def send_gripper(self, gripper_targets, wait=False):
         """Explicit USB or controller route; only USB can wait for actual arrival."""
@@ -1438,6 +1543,7 @@ class A10Operator(BaseOperator):
             self._require_motion()
             if check_state and self.get_state().has_error:
                 raise A10ControllerError('Controller reports a fault')
+            self._require_motion()
             if self.gripper_operator is not None:
                 return self._gripper_call(
                     lambda: self.gripper_operator.set_position_mm(position, wait=wait))
@@ -1477,7 +1583,7 @@ class A10Operator(BaseOperator):
                 or state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled'
                 or not self._confirmed_active or self._follower_mode != 'Axis'):
             raise RuntimeError('Joint follower permission lost during trajectory')
-        if state.actual_joints_rad is None:
+        if any(state.arms[name].actual_joints_rad is None for name in self.arm_names):
             raise A10ProtocolError('Trajectory requires actual joint feedback')
         if check_gripper:
             self._read_gripper_state(timeout=timeout_s)
@@ -1497,11 +1603,10 @@ class A10Operator(BaseOperator):
         target duration remains dt; USB gripper is sent only on the first copy.
         Caller owns follower start/stop (the runner stops in its finally).
         """
-        self._require_single_arm('joint trajectories')
         if async_exec is not False:
             raise NotImplementedError('A10 trajectories support async_exec=False only')
         if head_trajectory is not None:
-            raise ValueError('A10 single arm has no head trajectory')
+            raise ValueError('A10 has no head trajectory')
         if isinstance(dt, bool) or not math.isfinite(dt) or dt <= 0:
             raise ValueError('dt must be positive and finite')
         if type(joint_target_repeat) is not int or joint_target_repeat <= 0:
@@ -1509,24 +1614,30 @@ class A10Operator(BaseOperator):
         send_dt = dt / joint_target_repeat
         if not math.isfinite(send_dt) or send_dt <= 0:
             raise ValueError('joint send interval must be positive and finite')
-        if not isinstance(arm_trajectories, Mapping) or set(arm_trajectories) != {self.arm_name}:
-            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
-        raw = np.asarray(arm_trajectories[self.arm_name])
-        if raw.ndim != 2 or raw.shape[1] != 6 or not len(raw) or raw.dtype.kind not in 'iuf':
-            raise ValueError('Arm trajectory must be numeric nonempty [T,6] radians')
-        joints = np.array(raw, dtype=np.float64, copy=True)
-        with np.errstate(over='ignore'):
-            if not np.isfinite(joints).all() or not np.isfinite(np.rad2deg(joints)).all():
-                raise ValueError('Arm trajectory must remain finite after degree conversion')
-        if not math.isfinite(len(joints) * dt):
+        if not isinstance(arm_trajectories, Mapping) or set(arm_trajectories) != set(self.arm_names):
+            raise ValueError(f'Expected exactly these arms: {self.arm_names}')
+        joints = {}
+        for name in self.arm_names:
+            raw = np.asarray(arm_trajectories[name])
+            if raw.ndim != 2 or raw.shape[1] != self.joint_dofs[name] or not len(raw) or raw.dtype.kind not in 'iuf':
+                raise ValueError(f'{name} trajectory must be numeric nonempty [T,{self.joint_dofs[name]}] radians')
+            joints[name] = np.array(raw, dtype=np.float64, copy=True)
+            with np.errstate(over='ignore'):
+                if not np.isfinite(joints[name]).all() or not np.isfinite(np.rad2deg(joints[name])).all():
+                    raise ValueError('Arm trajectory must remain finite after degree conversion')
+        row_count = len(joints[self.arm_names[0]])
+        if any(len(q) != row_count for q in joints.values()):
+            raise ValueError('All arm trajectories must have the same number of rows')
+        if not math.isfinite(row_count * dt):
             raise ValueError('Trajectory duration must be finite')
         widths = None
         if gripper_trajectories is not None and not (isinstance(gripper_trajectories, Mapping) and not gripper_trajectories):
+            self._require_single_arm('timed gripper trajectories')
             if (not isinstance(gripper_trajectories, Mapping)
                     or set(gripper_trajectories) != {self.arm_name}):
                 raise ValueError(f'Expected exactly one gripper: {self.arm_name}')
             raw = np.asarray(gripper_trajectories[self.arm_name])
-            if raw.shape != (len(joints),) or raw.dtype.kind not in 'iuf':
+            if raw.shape != (row_count,) or raw.dtype.kind not in 'iuf':
                 raise ValueError('Gripper trajectory must be numeric [T] matching arm length')
             widths = np.array(raw, dtype=np.float64, copy=True)
             if (not np.isfinite(widths).all() or np.any(widths < 0)
@@ -1557,6 +1668,7 @@ class A10Operator(BaseOperator):
                     raise RuntimeError('Confirmed owned joint follower required for trajectory')
                 self._trajectory_owner = threading.get_ident()
                 self._traj_stop_event.clear()
+                self._require_target_owner()
                 feedback_timeout = self.trajectory_feedback_timeout_s
                 # Between chunks no send deadline is running. Use the normal
                 # command budget, including after a long model inference.
@@ -1564,9 +1676,9 @@ class A10Operator(BaseOperator):
             started = last_feedback = time.monotonic()
             wall_started = started
             phase = 'sending'
-            for slot in range(len(joints) * joint_target_repeat):
+            for slot in range(row_count * joint_target_repeat):
                 index, repeat_index = divmod(slot, joint_target_repeat)
-                target = joints[index]
+                target = {name: q[index] for name, q in joints.items()}
                 deadline = started + slot * send_dt
                 self._traj_stop_event.wait(max(0., deadline - time.monotonic()))
                 with self._io_lock:
@@ -1592,7 +1704,8 @@ class A10Operator(BaseOperator):
                                  else getattr(self, '_last_trajectory_feedback', None))
                         row = dict(slot=slot, action_index=index, repeat_index=repeat_index,
                                    scheduled_monotonic_s=deadline,
-                                   target_joints_rad=target.tolist(),
+                                   target_joints_rad=({name: q.tolist() for name, q in target.items()}
+                                                     if self.is_multi_arm else target[self.arm_name].tolist()),
                                    target_gripper_mm=None if widths is None else float(widths[index]),
                                    joint_sent=False, gripper_sent=False,
                                    feedback=self._feedback_trace(state))
@@ -1603,7 +1716,7 @@ class A10Operator(BaseOperator):
                         row['lateness_s'] = send_started - deadline
                         row['joint_send_gap_s'] = (None if self._last_joint_send_monotonic_s is None
                                                   else send_started - self._last_joint_send_monotonic_s)
-                    self.send_joints({self.arm_name: target})
+                    self.send_joints(target)
                     joint_packets_sent += 1
                     self._last_joint_send_monotonic_s = send_started
                     if row is not None:
@@ -1627,7 +1740,7 @@ class A10Operator(BaseOperator):
                         sent += 1
                     if time.monotonic() > deadline + send_dt:
                         raise TimeoutError(f'Trajectory slot {slot} exceeded its time budget')
-            self._traj_stop_event.wait(max(0., started + len(joints) * dt - time.monotonic()))
+            self._traj_stop_event.wait(max(0., started + row_count * dt - time.monotonic()))
             with self._io_lock:
                 self._require_target_owner()
                 # A final check also catches faults in shorter-than-monitor chunks.
@@ -1642,7 +1755,7 @@ class A10Operator(BaseOperator):
             raise
         finally:
             with self._io_lock:
-                self.last_trajectory = dict(selected=len(joints), sent=sent,
+                self.last_trajectory = dict(selected=row_count, sent=sent,
                     joint_packets_sent=joint_packets_sent, gripper_targets_sent=gripper_targets_sent,
                     joint_target_repeat=joint_target_repeat, joint_send_dt_s=send_dt,
                     joint_publish_hz=1. / send_dt, model_action_dt_s=dt,
@@ -1699,9 +1812,21 @@ class A10Operator(BaseOperator):
             self._prepare_shared_console_command()
             if self.follower_stop_pending:
                 self.stop_follower()
+            self._check_init_speed(self.get_state())
+
+    @staticmethod
+    def _check_init_speed(state):
+        context = state.raw['ret_context']
+        mode = context.get('robot_msg', {}).get('op_mode')
+        percent = (context.get('motion_msg', {}).get('jog_vel') if mode == 'Manual'
+                   else context.get('program_msg', {}).get('vel') if mode == 'Auto' else None)
+        if type(percent) in (int, float) and percent == 0:
+            raise RuntimeError(f'控制器 {mode} 速度倍率为 0%，无法回位；请在控制器设置合适速度后重试')
 
     def _read_init_joints(self):
+        self._check_joint_follower_reply()
         state = self.get_state()
+        self._check_init_speed(state)
         if state.has_error or state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled':
             raise A10ControllerError('Initialization requires healthy Enabled feedback')
         if self._started_here and not self._confirmed_active:

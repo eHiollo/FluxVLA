@@ -53,6 +53,33 @@ class A10PeripheralTest(unittest.TestCase):
         self.capture.release.assert_called()
         self.assertFalse(operator.is_connected)
 
+    def test_gripper_write_timeout_keeps_last_measured_observation(self):
+        from serial import SerialTimeoutException
+        operator = self.operator(continue_on_gripper_timeout=True)
+        before = operator.get_frame()
+        with patch.object(self.serial, 'write', side_effect=SerialTimeoutException('Write timeout')) as write:
+            frame = operator.get_frame()
+            self.assertTrue(frame['gripper_feedback_stale'])
+            self.assertEqual(frame['qpos'][-1], before['qpos'][-1])
+            self.assertEqual(frame['gripper_received_monotonic_s'], before['gripper_received_monotonic_s'])
+            operator.send_gripper({'right': 55})
+            operator.get_frame()
+            self.assertEqual(write.call_count, 1)
+        self.assertTrue(operator.is_connected)
+        operator.close()
+
+    def test_gripper_read_timeout_continues_but_protocol_error_still_raises(self):
+        operator = self.operator(continue_on_gripper_timeout=True)
+        self.serial.override = b''
+        self.assertTrue(operator.get_frame()['gripper_feedback_stale'])
+        operator.close()
+        self.serial.override = None
+        self.serial.is_open = True
+        operator = self.operator(continue_on_gripper_timeout=True)
+        self.serial.override = b'bad!'
+        with self.assertRaises(Exception):
+            operator.get_frame()
+
     def test_usb_wait_range_and_read_only_gate(self):
         operator = self.operator()
         self.assertAlmostEqual(operator.send_gripper({'right': 55}, wait=True).position_mm, 55, delta=.05)
@@ -137,6 +164,25 @@ class A10TrajectoryTest(unittest.TestCase):
                        gripper_trajectories={'right': np.arange(count) + 40.}, dt=.04)
         options.update(overrides)
         return operator.execute_trajectory(**options)
+
+    def test_timed_out_gripper_send_does_not_abort_joint_trajectory(self):
+        import time
+        from serial import SerialTimeoutException
+        operator = self.started_operator(continue_on_gripper_timeout=True, record_trajectory_trace=True)
+        original = self.serial.write
+        def write(packet):
+            if packet[4] == 0x83:
+                time.sleep(.06)  # Longer than a trajectory slot.
+                raise SerialTimeoutException('Write timeout')
+            return original(packet)
+        with patch.object(self.serial, 'write', side_effect=write):
+            self.execute(operator, count=3)
+        self.assertEqual(operator.last_trajectory['joint_packets_sent'], 3)
+        self.assertEqual(operator.last_trajectory['gripper_targets_sent'], 0)
+        self.assertTrue(all(not row['gripper_sent'] for row in operator.last_trajectory['trace']))
+        self.assertTrue(operator.get_frame()['gripper_feedback_stale'])
+        operator.stop_follower()
+        operator.close()
 
     def test_trace_records_send_times_feedback_and_cross_chunk_gap(self):
         import time

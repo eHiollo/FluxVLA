@@ -30,6 +30,8 @@ class SharedFollowerConnection:
         self.ws = self.udp = self.joint_udp = None
         self._sock = self._reader = None
         self._lock = threading.RLock()
+        self._request_pending = threading.Event()
+        self.command_cancelled = None
 
     def connect(self):
         try:
@@ -53,12 +55,17 @@ class SharedFollowerConnection:
 
     def call(self, op, *, timeout_s=None, **data):
         with self._lock:
+            if (self.command_cancelled is not None and self.command_cancelled.is_set()
+                    and op in ('command', 'request')
+                    and data.get('command', '').split(maxsplit=1)[0] not in ('get', 'stop_follower', 'manual_stop')):
+                raise InterruptedError('当前命令已取消，未发送共享控制命令')
             if self._sock is None:
                 raise ConnectionError('Shared A10 connection is closed')
             request = dict(op=op, session_id=self.session_id,
                            role=self.shared.get('role', 'inference'),
                            status_channel=self.status_channel, **data)
             request['timeout_s'] = self.timeout_s if timeout_s is None else timeout_s
+            self._request_pending.set()
             try:
                 self._sock.settimeout(request['timeout_s'] + 1.)
                 self._sock.sendall(json.dumps(request, ensure_ascii=False).encode() + b'\n')
@@ -69,6 +76,8 @@ class SharedFollowerConnection:
             except (OSError, ValueError):
                 self.close()
                 raise
+            finally:
+                self._request_pending.clear()
             if 'error' in response:
                 from ..operators.a10_operator import A10ControllerError, A10ProtocolError
                 kinds = dict(InterruptedError=InterruptedError, PermissionError=PermissionError,
@@ -76,6 +85,14 @@ class SharedFollowerConnection:
                              A10ControllerError=A10ControllerError, A10ProtocolError=A10ProtocolError)
                 raise kinds.get(response.get('error_type'), RuntimeError)(response['error'])
             return response.get('result')
+
+    def interrupt(self):
+        sock = self._sock
+        if self._request_pending.is_set() and sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def request(self, command, *, status=False, timeout_s=None, raw=False):
         return self.call('request', command=command, status=status, raw=raw, timeout_s=timeout_s)

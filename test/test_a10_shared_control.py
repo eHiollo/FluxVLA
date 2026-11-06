@@ -8,6 +8,7 @@ from fluxvla.engines.operators.a10_operator import A10Operator, _FollowerConnect
 from fluxvla.engines.communication.a10_shared_connection import SharedFollowerConnection
 from fluxvla.engines.communication.a10_shared_server import SharedControl, SharedControlServer, ConsoleSharedControl
 from test_a10_operator import FakeController, status_reply
+from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init
 
 
 class SharedControlTest(unittest.TestCase):
@@ -92,6 +93,17 @@ class SharedControlTest(unittest.TestCase):
         inference.stop_follower()
         self.assertFalse(console.get_state().follower_active)
         self.assertTrue(console.is_connected)
+
+    def test_local_init_preempts_inference_and_stops_its_own_follower(self):
+        inference, console = self.client('inference'), self.client('console')
+        inference.start_follower()
+        console.init_position = {'right': console.get_state().actual_joints_rad.copy()}
+        result = move_to_init(console)
+        self.assertTrue(result['completed'])
+        commands = [c for c in self.controller.commands if c != 'get']
+        self.assertEqual(commands, ['follower_aj', 'stop_follower', 'follower_aj', 'stop_follower'])
+        with self.assertRaises((InterruptedError, RuntimeError)):
+            inference.send_joints({'right': [0.] * 6})
 
     def test_auto_reuses_service_for_control_and_status_without_extra_robot_connections(self):
         from unittest.mock import patch

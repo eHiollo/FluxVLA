@@ -50,17 +50,22 @@ class SharedControl:
                 self.status.connect()  # Read-only recovery; never repeats control commands.
             return self.status.request('get', status=True)
 
-    def mode_command(self, command, active):
+    def mode_command(self, command, active, *, stop_motion=False):
         if self.control.ws is None:
             self.control.connect()
         self.control.send_command(command)
+        if stop_motion:
+            self.control.send_command('manual_stop')
         deadline = time.monotonic() + self.timeout_s
         while time.monotonic() < deadline:
             reply = self.control.request('get', status=True,
                                          timeout_s=max(.001, deadline - time.monotonic()))
             state = _parse_state(reply, joint_unit='deg', position_unit=None, gripper_feedback_path=None)
-            mode = 'Axis' if command.split(maxsplit=1)[0] == 'follower_aj' else 'Cart'
-            if state.follower_active is active and (not active or state.follower_mode == mode):
+            mode = 'Axis' if command.split(maxsplit=1)[0] in ('follower_aj', 'follower_aj_tg') else 'Cart'
+            if (state.follower_active is active and (not active or state.follower_mode == mode)
+                    and (not stop_motion or (
+                        not state.has_error and
+                        state.raw['ret_context'].get('robot_msg', {}).get('motion') == 'Stopped'))):
                 return reply
             time.sleep(.01)
         raise TimeoutError('Shared service could not confirm follower mode change')
@@ -115,6 +120,23 @@ class SharedControl:
             return self.read_state()
         if op == 'lease' and request['operation'] == 'status':
             return dict(owns=self.owner == session_id, stopped_by_service=session_id in self.stopped)
+        if op == 'stop':
+            if role != 'console':
+                raise PermissionError('Only the console may issue a global stop')
+            owner = self.owner
+            if owner is not None:
+                self.revoked.add(owner)
+            # A native command may be holding the control lock while awaiting
+            # a long reply. Isolate that socket before obtaining the lock.
+            self.control.interrupt()
+            with self._control_lock:
+                self._speed_restore_allowed.clear()
+                reply = self.mode_command('stop_follower', False, stop_motion=True)
+                if owner is not None:
+                    self.stopped.add(owner)
+                self.owner = None
+                self.note('console_stop', session_id=session_id, confirmed=True)
+                return reply
         if op == 'target':
             while not self._control_lock.acquire(timeout=.02):
                 if self.owner != session_id or session_id in self.revoked:
@@ -162,7 +184,7 @@ class SharedControl:
                 raise ValueError(f'Unknown shared operation: {op}')
             command = request['command']
             name = command.split(maxsplit=1)[0]
-            if name in ('follower_aj', 'follower_cart'):
+            if name in ('follower_aj', 'follower_aj_tg', 'follower_cart'):
                 self.claim(session_id, role)
                 return self.mode_command(command, True)
             if name == 'stop_follower':

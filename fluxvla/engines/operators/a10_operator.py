@@ -1,7 +1,8 @@
-"""A10 single-controller operator for KAANH single/dual Cartesian followers.
+"""A10 single-controller operator for KAANH joint and Cartesian followers.
 
-Wire layout follows the user-supplied robot.7z reference. Controller-side
-planning stays on the controller. This module does not open connections at
+Wire layout follows the user-supplied robot.7z reference. Local initialization
+repeats configured joint targets; motion planning stays on the controller.
+This module does not open connections at
 import/construction, automatically enable motors, interpret VR increments, or invent a
 seventh joint. Legacy Cartesian packets retain their original encoding. Native
 Tool follower integrates cumulative component differences in current tool axes;
@@ -13,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import select
 import socket
 import struct
 import threading
@@ -28,7 +30,7 @@ from scipy.spatial.transform import Rotation
 from ..utils.root import OPERATORS
 from .base_operator import BaseOperator
 from .camera_operator import CameraOperator
-from .gripper_operator import GripperOperator
+from .gripper_operator import GripperOperator, GripperError, GripperTimeoutError
 
 __all__ = ['A10Operator', 'A10State', 'A10ArmState', 'A10ProtocolError', 'A10ControllerError']
 
@@ -394,6 +396,8 @@ class _FollowerConnection:
         self.timeout_s = timeout_s
         self.joint_udp_port = joint_udp_port
         self.ws = self.udp = self.joint_udp = None
+        self._request_pending = threading.Event()
+        self.command_cancelled = None
 
     def connect(self):
         from websockets.sync.client import connect
@@ -416,6 +420,9 @@ class _FollowerConnection:
             raise
 
     def send_command(self, command):
+        if (self.command_cancelled is not None and self.command_cancelled.is_set()
+                and command.split(maxsplit=1)[0] not in ('get', 'stop_follower', 'manual_stop')):
+            raise InterruptedError('当前命令已取消，未发送控制器命令')
         if self.ws is None:
             raise ConnectionError('A10 operator is not connected')
         try:
@@ -427,6 +434,7 @@ class _FollowerConnection:
     def request(self, command, *, status=False, timeout_s=None, raw=False):
         budget = self.timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + budget
+        self._request_pending.set()
         try:
             self.send_command(command)
             for _ in range(32):
@@ -453,6 +461,17 @@ class _FollowerConnection:
                 raise TimeoutError(
                     f'A10 command {command!r} reply timed out after {budget:.3f}s') from exc
             raise
+        finally:
+            self._request_pending.clear()
+
+    def interrupt(self):
+        """Wake a blocked receive; the requesting thread closes the stale socket."""
+        ws = self.ws
+        if self._request_pending.is_set() and ws is not None:
+            try:
+                ws.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def close(self):
         ws, udp, joint_udp = self.ws, self.udp, self.joint_udp
@@ -498,7 +517,9 @@ class A10Operator(BaseOperator):
     joint_indices (six entries) and tcp_index. ``cartesian_target_order`` is
     the XML control-group row order, not inferred from left/right or ee_id.
     Two arms share one connection/follower; all targets must be supplied in
-    one call. Dual joint, gripper and trajectory commands are unsupported.
+    one call. Joint targets flatten in joint_target_order (default ascending
+    ee_id). Dual gripper trajectories remain unsupported. The local m_init
+    command repeats its configured absolute target through send_joints.
     A10State.arms / get_frame()['arms'] expose named model feedback. Legacy
     flat fields remain available only for a single configured arm.
     """
@@ -511,13 +532,17 @@ class A10Operator(BaseOperator):
                  allow_motion=False, arm_name='right', feedback_joint_unit='deg',
                  feedback_position_unit=None, gripper_feedback_path=None,
                  joint_udp_port=9999, command_mode='cartesian',
+                 joint_follower_velocity_percent=None,
                  cameras=None, gripper=None, gripper_transport='controller',
+                 continue_on_gripper_timeout=False,
                  trajectory_feedback_interval_s=0.1,
                  trajectory_feedback_timeout_s=0.1,
                  trajectory_max_lateness_s=None, status_poll_interval_s=None,
                  status_max_age_s=0.5, status_ws_port=5888,
                  command_timeout_s=60.0, record_trajectory_trace=False, shared_control=None,
-                 cartesian_wire_format='pq', arms=None, cartesian_target_order=None):
+                 cartesian_wire_format='pq', arms=None, cartesian_target_order=None,
+                 joint_target_order=None, init_position=None,
+                 init_gripper_positions=None, init_motion=None):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -526,6 +551,11 @@ class A10Operator(BaseOperator):
             raise ValueError('Ports must be integers within 1..65535')
         if joint_udp_port == udp_port:
             raise ValueError('Cartesian and joint UDP ports must differ')
+        if (joint_follower_velocity_percent is not None
+                and (type(joint_follower_velocity_percent) is not int
+                     or not 1 <= joint_follower_velocity_percent <= 100)):
+            raise ValueError('joint_follower_velocity_percent must be an integer within 1..100 or None')
+        self.joint_follower_velocity_percent = joint_follower_velocity_percent
         if command_mode not in _FOLLOWER_MODES:
             raise ValueError('command_mode must be cartesian or joint')
         if cartesian_wire_format not in ('pq', 'pe321'):
@@ -541,13 +571,31 @@ class A10Operator(BaseOperator):
         self._arm_specs, self.cartesian_target_order = _normalize_arms(arms, arm_name, cartesian_target_order)
         self.arm_names = tuple(self._arm_specs) if self._arm_specs is not None else (arm_name,)
         self.is_multi_arm = len(self.arm_names) > 1
-        if self.is_multi_arm and command_mode != 'cartesian':
-            raise NotImplementedError('Dual-arm joint follower is not supported by the current controller')
+        arm_ids = ({name: spec['ee_id'] for name, spec in self._arm_specs.items()}
+                   if self._arm_specs is not None else {arm_name: 0})
+        order = (sorted(self.arm_names, key=arm_ids.__getitem__)
+                 if joint_target_order is None else joint_target_order)
+        if (not isinstance(order, (list, tuple)) or len(order) != len(self.arm_names)
+                or any(not isinstance(name, str) for name in order)
+                or set(order) != set(self.arm_names)):
+            raise ValueError('joint_target_order must list every configured arm exactly once')
+        self.joint_target_order = tuple(order)
+        self.joint_dofs = {name: 6 for name in self.arm_names}
+        self.init_position = None
+        if init_position is not None:
+            if not isinstance(init_position, Mapping) or set(init_position) != set(self.arm_names):
+                raise ValueError('init_position must provide every configured arm')
+            self.init_position = {name: _vector(init_position[name], 6, f'{name} init_position')
+                                  for name in self.arm_names}
+        self.init_gripper_positions = ({name: 0. for name in self.arm_names}
+                                       if init_gripper_positions is None else dict(init_gripper_positions))
+        self.init_motion = {} if init_motion is None else dict(init_motion)
+        self.last_init_motion = None
         if self.is_multi_arm and (gripper is not None or gripper_transport != 'controller'
                                   or gripper_feedback_path is not None):
-            raise NotImplementedError('Dual-arm gripper routing is not configured; use Cartesian arm targets only')
+            raise NotImplementedError('Dual-arm gripper routing is not configured')
         if self.is_multi_arm:
-            self.capabilities = frozenset({'relative_cartesian_follower'})
+            self.capabilities = frozenset({'relative_cartesian_follower', 'absolute_joint_follower'})
         if feedback_joint_unit not in ('deg', 'rad'):
             raise ValueError('feedback_joint_unit must be deg or rad')
         if feedback_position_unit not in (None, 'mm', 'm'):
@@ -570,6 +618,8 @@ class A10Operator(BaseOperator):
                 or any(not isinstance(k, str) or not k or k in reserved for k in cameras)):
             raise ValueError('Camera names must be nonempty and not overwrite robot fields')
         self.camera_operator = None if cameras is None else CameraOperator(cameras)
+        self.continue_on_gripper_timeout = bool(continue_on_gripper_timeout)
+        self._gripper_timed_out = False
         self.gripper_transport = gripper_transport
         self.gripper_operator = (GripperOperator(**dict(gripper))
                                  if gripper_transport == 'usb' else None)
@@ -631,6 +681,7 @@ class A10Operator(BaseOperator):
         self._status_error = None
         self._status_lock = threading.Lock()
         self._io_lock = threading.RLock()
+        self._command_cancelled = threading.Event()
         self._confirmed_active = False
         self._started_here = False
         self._start_confirmed = False
@@ -680,6 +731,7 @@ class A10Operator(BaseOperator):
                 try:
                     self._connect_robot_transport()
                     if self.gripper_operator is not None:
+                        self._gripper_timed_out = False
                         self.gripper_operator.connect()
                     if self.status_poll_interval_s is not None:
                         if self.shared_control:
@@ -791,9 +843,11 @@ class A10Operator(BaseOperator):
             raise TimeoutError(f'A10 status feedback older than {self.status_max_age_s:.3f}s')
         return state
 
-    def _require_motion(self):
+    def _require_motion(self, *, allow_cancelled=False):
         if not self.allow_motion:
             raise PermissionError('A10 allow_motion is false')
+        if not allow_cancelled and self._command_cancelled.is_set():
+            raise InterruptedError('当前命令已取消，禁止继续下发动作')
         if not self.is_connected:
             raise ConnectionError('A10 operator is not connected')
 
@@ -829,6 +883,47 @@ class A10Operator(BaseOperator):
 
     def heartbeat_runtime_recording(self):
         return self._runtime_recording_request('record_heartbeat')
+
+    def begin_console_command(self):
+        """Only a newly submitted console command clears the cancellation latch."""
+        self._command_cancelled.clear()
+        self._connection.command_cancelled = self._command_cancelled
+
+    def cancel_current_command(self):
+        """Latch cancellation without waiting for the command's I/O lock."""
+        self._command_cancelled.set()
+        self._connection.command_cancelled = self._command_cancelled
+        self._traj_stop_event.set()
+        self._connection.interrupt()
+
+    def stop_all_actions(self):
+        """Cancel sends, request follower exit AND controller motion stop.
+
+        stop_follower only clears the SDK's running flag. A running real-time
+        plan can remain active, so explicit console stop also sends manual_stop.
+        Only fresh inactive + Stopped feedback confirms completion.
+        """
+        self.cancel_current_command()
+        if not self.allow_motion:
+            raise PermissionError('A10 allow_motion is false')
+        with self._io_lock:
+            self.last_stop_confirmed = False
+            if not self.is_connected:
+                # Recover only the transport needed to send stop. Never replay
+                # a command, enable a motor or reopen accessories here.
+                self._connection.connect()
+            self._confirmed_active = self._start_confirmed = False
+            if self.shared_control:
+                self._connection.call('stop')
+            else:
+                self._connection.send_command('stop_follower')
+                self._connection.send_command('manual_stop')
+            state = self.wait_stopped()
+            self._started_here = False
+            self._follower_mode = None
+            self._reset_cartesian_encoding()
+            self.last_stop_confirmed = True
+            return state
 
     def get_state(self, *, timeout_s=None):
         with self._io_lock:
@@ -873,7 +968,7 @@ class A10Operator(BaseOperator):
             # sending. m_init and arbitrary commands are not follower starts.
             was_inactive = state.follower_active is False
             command_name = command.split(maxsplit=1)[0]
-            if was_inactive and command_name in ('follower_cart', 'follower_aj'):
+            if was_inactive and command_name in ('follower_cart', 'follower_aj', 'follower_aj_tg'):
                 self._started_here = True
             try:
                 reply = self._connection.request(
@@ -904,6 +999,8 @@ class A10Operator(BaseOperator):
 
         These sequential reads are not synchronized sensor samples. Missing
         configured hardware raises; targets are never substituted for feedback.
+        Opt-in gripper timeout continuation retains the last measured width and
+        its timestamp, marks it stale, and skips USB traffic until reconnect.
         get_state() remains the unmodified controller-only status interface.
         """
         del slop
@@ -921,7 +1018,8 @@ class A10Operator(BaseOperator):
                                             received_monotonic_s=arm.received_monotonic_s)
                                  for name, arm in state.arms.items()}
                 if self.gripper_operator is not None:
-                    grip = self.gripper_operator.read_state()
+                    grip = self._read_gripper_state()
+                    frame['gripper_feedback_stale'] = self._gripper_timed_out
                     width = grip.position_mm
                     frame['gripper_received_monotonic_s'] = grip.timestamp
                 frame['gripper_mm'] = width
@@ -951,7 +1049,10 @@ class A10Operator(BaseOperator):
         deadline = time.monotonic() + budget
         state = None
         while time.monotonic() < deadline:
-            state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if state is not None and remaining < min(.02, budget / 10):
+                break
+            state = self.get_state(timeout_s=max(.001, remaining))
             if state.has_error:
                 raise A10ControllerError('Controller reports a fault while confirming stop')
             info = state.raw['ret_context'].get('robot_msg', {})
@@ -967,8 +1068,14 @@ class A10Operator(BaseOperator):
 
     def _wait_mode(self, active):
         deadline = time.monotonic() + self.timeout_s
+        state = None
         while time.monotonic() < deadline:
-            state = self.get_state(timeout_s=max(.001, deadline - time.monotonic()))
+            if active:
+                self._require_motion()
+            remaining = deadline - time.monotonic()
+            if state is not None and remaining < min(.02, self.timeout_s / 10):
+                break
+            state = self.get_state(timeout_s=max(.001, remaining))
             stopped = (active or not self.is_multi_arm or
                        state.raw['ret_context'].get('robot_msg', {}).get('motion') == 'Stopped')
             if (state.follower_active is active and stopped
@@ -986,9 +1093,13 @@ class A10Operator(BaseOperator):
                 raise A10ControllerError('Controller reports a fault')
             time.sleep(min(.02, max(0., deadline - time.monotonic())))
         self._confirmed_active = False
+        info = {} if state is None else state.raw['ret_context'].get('robot_msg', {})
+        detail = (f'; last follower_active={None if state is None else state.follower_active}, '
+                  f'mode={None if state is None else state.follower_mode}, '
+                  f'motion={info.get("motion")}, activate={info.get("activate")}')
         if not active and self.is_multi_arm:
-            raise TimeoutError('Dual follower stop requires inactive + Stopped feedback')
-        raise TimeoutError('Follower mode change was not confirmed')
+            raise TimeoutError('Dual follower stop requires inactive + Stopped feedback' + detail)
+        raise TimeoutError('Follower mode change was not confirmed' + detail)
 
 
 
@@ -1086,9 +1197,9 @@ class A10Operator(BaseOperator):
         mode = self.command_mode if mode is None else mode
         if mode not in _FOLLOWER_MODES:
             raise ValueError('mode must be cartesian or joint')
-        if mode == 'joint':
-            self._require_single_arm('joint follower')
         command, feedback_mode = _FOLLOWER_MODES[mode]
+        if mode == 'joint' and self.joint_follower_velocity_percent is not None:
+            command += f' --vel_percent={self.joint_follower_velocity_percent}'
         with self._io_lock:
             self._require_motion()
             if self._started_here:
@@ -1107,8 +1218,10 @@ class A10Operator(BaseOperator):
             if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
                 raise RuntimeError(
                     'Follower start requires Enabled and Stopped feedback; '
-                    f"got activate={info.get('activate')!r}, motion={info.get('motion')!r}. "
-                    'Confirm Enabled and Stopped on the pendant or A10 console before VR takeover.')
+                    f'activate={info.get("activate")}, motion={info.get("motion")}, '
+                    f'follower_active={state.follower_active}. '
+                    'Confirm Enabled and Stopped on the pendant or A10 console before VR takeover. '
+                    '若 motion=Running，请先输入 stop 结束控制器当前命令并确认 Stopped')
             coordinate = state.raw['ret_context']['motion_msg'].get('jog_coordinate')
             if mode == 'cartesian' and coordinate not in ('Base', 'Tool', 'Wobj'):
                 raise RuntimeError(
@@ -1146,7 +1259,7 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             self._sdk_tool_adapter = None
             self._sdk_tool_adapters = None
-            self._require_motion()
+            self._require_motion(allow_cancelled=True)
             if self.shared_control:
                 lease = self._connection.lease('status')
                 if (self.shared_control.get('role') != 'console'
@@ -1399,12 +1512,30 @@ class A10Operator(BaseOperator):
                 raise RuntimeError(f'{mode} follower start has not been confirmed')
             udp = self._connection.udp if mode == 'Cart' else self._connection.joint_udp
             try:
+                if mode == 'Axis':
+                    self._check_joint_follower_reply()
                 if udp.send(packet) != len(packet):
                     raise ConnectionError('Incomplete UDP datagram send')
             except OSError:
                 self._confirmed_active = False
                 raise
         # UDP has no application ACK. This return does not mean execution.
+
+    def _check_joint_follower_reply(self):
+        """Surface direct SDK rejection datagrams; silence is not acceptance.
+
+        FollowerAjParam replies on a dimension mismatch, but sends no success
+        ACK. Read only already available data, without delaying the stream.
+        Shared transport uses a proxy socket and is not inspected here.
+        """
+        if self.shared_control or self._connection.joint_udp is None:
+            return
+        udp = self._connection.joint_udp
+        if select.select([udp], [], [], 0)[0]:
+            packet = udp.recv(65535)
+            self._confirmed_active = False
+            detail = _unpack(packet).decode('utf-8', errors='replace')[:500]
+            raise A10ProtocolError(f'关节 follower UDP 返回：{detail}；已停止继续下发目标')
 
     def send_gripper(self, gripper_targets, wait=False):
         """Explicit USB or controller route; only USB can wait for actual arrival."""
@@ -1418,6 +1549,27 @@ class A10Operator(BaseOperator):
             raise NotImplementedError('Controller gripper arrival feedback is not verified')
         return self._send_gripper_target(position, wait=wait)
 
+    def _gripper_call(self, operation):
+        if self._gripper_timed_out:
+            return None
+        try:
+            return operation()
+        except GripperError as exc:
+            from serial import SerialTimeoutException
+            timeout = isinstance(exc, GripperTimeoutError) or isinstance(
+                exc.__cause__, SerialTimeoutException)
+            if (not self.continue_on_gripper_timeout or not timeout
+                    or self.gripper_operator.last_state is None):
+                raise
+            self._gripper_timed_out = True
+            logging.getLogger(__name__).warning(
+                '夹爪超时，继续推理：沿用最后实测开度，本次会话暂停夹爪通信。%s', exc)
+            return None
+
+    def _read_gripper_state(self, **kwargs):
+        state = self._gripper_call(lambda: self.gripper_operator.read_state(**kwargs))
+        return self.gripper_operator.last_state if state is None else state
+
     def _send_gripper_target(self, position, *, wait=False, check_state=True):
         self._require_single_arm('gripper commands')
         with self._io_lock:
@@ -1425,8 +1577,10 @@ class A10Operator(BaseOperator):
             self._require_motion()
             if check_state and self.get_state().has_error:
                 raise A10ControllerError('Controller reports a fault')
+            self._require_motion()
             if self.gripper_operator is not None:
-                return self.gripper_operator.set_position_mm(position, wait=wait)
+                return self._gripper_call(
+                    lambda: self.gripper_operator.set_position_mm(position, wait=wait))
             return self._connection.request(f'g_move --pos={position:.12g}')
 
     def _require_target_owner(self):
@@ -1463,10 +1617,10 @@ class A10Operator(BaseOperator):
                 or state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled'
                 or not self._confirmed_active or self._follower_mode != 'Axis'):
             raise RuntimeError('Joint follower permission lost during trajectory')
-        if state.actual_joints_rad is None:
+        if any(state.arms[name].actual_joints_rad is None for name in self.arm_names):
             raise A10ProtocolError('Trajectory requires actual joint feedback')
         if check_gripper:
-            self.gripper_operator.read_state(timeout=timeout_s)
+            self._read_gripper_state(timeout=timeout_s)
 
     def execute_trajectory(self, arm_trajectories, gripper_trajectories=None,
                            head_trajectory=None, dt=0.1, async_exec=False,
@@ -1483,11 +1637,10 @@ class A10Operator(BaseOperator):
         target duration remains dt; USB gripper is sent only on the first copy.
         Caller owns follower start/stop (the runner stops in its finally).
         """
-        self._require_single_arm('joint trajectories')
         if async_exec is not False:
             raise NotImplementedError('A10 trajectories support async_exec=False only')
         if head_trajectory is not None:
-            raise ValueError('A10 single arm has no head trajectory')
+            raise ValueError('A10 has no head trajectory')
         if isinstance(dt, bool) or not math.isfinite(dt) or dt <= 0:
             raise ValueError('dt must be positive and finite')
         if type(joint_target_repeat) is not int or joint_target_repeat <= 0:
@@ -1495,24 +1648,30 @@ class A10Operator(BaseOperator):
         send_dt = dt / joint_target_repeat
         if not math.isfinite(send_dt) or send_dt <= 0:
             raise ValueError('joint send interval must be positive and finite')
-        if not isinstance(arm_trajectories, Mapping) or set(arm_trajectories) != {self.arm_name}:
-            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
-        raw = np.asarray(arm_trajectories[self.arm_name])
-        if raw.ndim != 2 or raw.shape[1] != 6 or not len(raw) or raw.dtype.kind not in 'iuf':
-            raise ValueError('Arm trajectory must be numeric nonempty [T,6] radians')
-        joints = np.array(raw, dtype=np.float64, copy=True)
-        with np.errstate(over='ignore'):
-            if not np.isfinite(joints).all() or not np.isfinite(np.rad2deg(joints)).all():
-                raise ValueError('Arm trajectory must remain finite after degree conversion')
-        if not math.isfinite(len(joints) * dt):
+        if not isinstance(arm_trajectories, Mapping) or set(arm_trajectories) != set(self.arm_names):
+            raise ValueError(f'Expected exactly these arms: {self.arm_names}')
+        joints = {}
+        for name in self.arm_names:
+            raw = np.asarray(arm_trajectories[name])
+            if raw.ndim != 2 or raw.shape[1] != self.joint_dofs[name] or not len(raw) or raw.dtype.kind not in 'iuf':
+                raise ValueError(f'{name} trajectory must be numeric nonempty [T,{self.joint_dofs[name]}] radians')
+            joints[name] = np.array(raw, dtype=np.float64, copy=True)
+            with np.errstate(over='ignore'):
+                if not np.isfinite(joints[name]).all() or not np.isfinite(np.rad2deg(joints[name])).all():
+                    raise ValueError('Arm trajectory must remain finite after degree conversion')
+        row_count = len(joints[self.arm_names[0]])
+        if any(len(q) != row_count for q in joints.values()):
+            raise ValueError('All arm trajectories must have the same number of rows')
+        if not math.isfinite(row_count * dt):
             raise ValueError('Trajectory duration must be finite')
         widths = None
         if gripper_trajectories is not None and not (isinstance(gripper_trajectories, Mapping) and not gripper_trajectories):
+            self._require_single_arm('timed gripper trajectories')
             if (not isinstance(gripper_trajectories, Mapping)
                     or set(gripper_trajectories) != {self.arm_name}):
                 raise ValueError(f'Expected exactly one gripper: {self.arm_name}')
             raw = np.asarray(gripper_trajectories[self.arm_name])
-            if raw.shape != (len(joints),) or raw.dtype.kind not in 'iuf':
+            if raw.shape != (row_count,) or raw.dtype.kind not in 'iuf':
                 raise ValueError('Gripper trajectory must be numeric [T] matching arm length')
             widths = np.array(raw, dtype=np.float64, copy=True)
             if (not np.isfinite(widths).all() or np.any(widths < 0)
@@ -1543,6 +1702,7 @@ class A10Operator(BaseOperator):
                     raise RuntimeError('Confirmed owned joint follower required for trajectory')
                 self._trajectory_owner = threading.get_ident()
                 self._traj_stop_event.clear()
+                self._require_target_owner()
                 feedback_timeout = self.trajectory_feedback_timeout_s
                 # Between chunks no send deadline is running. Use the normal
                 # command budget, including after a long model inference.
@@ -1550,9 +1710,9 @@ class A10Operator(BaseOperator):
             started = last_feedback = time.monotonic()
             wall_started = started
             phase = 'sending'
-            for slot in range(len(joints) * joint_target_repeat):
+            for slot in range(row_count * joint_target_repeat):
                 index, repeat_index = divmod(slot, joint_target_repeat)
-                target = joints[index]
+                target = {name: q[index] for name, q in joints.items()}
                 deadline = started + slot * send_dt
                 self._traj_stop_event.wait(max(0., deadline - time.monotonic()))
                 with self._io_lock:
@@ -1578,7 +1738,8 @@ class A10Operator(BaseOperator):
                                  else getattr(self, '_last_trajectory_feedback', None))
                         row = dict(slot=slot, action_index=index, repeat_index=repeat_index,
                                    scheduled_monotonic_s=deadline,
-                                   target_joints_rad=target.tolist(),
+                                   target_joints_rad=({name: q.tolist() for name, q in target.items()}
+                                                     if self.is_multi_arm else target[self.arm_name].tolist()),
                                    target_gripper_mm=None if widths is None else float(widths[index]),
                                    joint_sent=False, gripper_sent=False,
                                    feedback=self._feedback_trace(state))
@@ -1589,23 +1750,31 @@ class A10Operator(BaseOperator):
                         row['lateness_s'] = send_started - deadline
                         row['joint_send_gap_s'] = (None if self._last_joint_send_monotonic_s is None
                                                   else send_started - self._last_joint_send_monotonic_s)
-                    self.send_joints({self.arm_name: target})
+                    self.send_joints(target)
                     joint_packets_sent += 1
                     self._last_joint_send_monotonic_s = send_started
                     if row is not None:
                         row['joint_sent'] = True
                         row['joint_send_finished_s'] = time.monotonic()
                     if widths is not None and repeat_index == 0:
+                        grip_started = time.monotonic()
                         self._send_gripper_target(float(widths[index]), check_state=False)
-                        gripper_targets_sent += 1
+                        if self._gripper_timed_out:
+                            # Resume after the failed USB transaction without a
+                            # catch-up burst or a secondary slot-budget failure.
+                            delay = time.monotonic() - grip_started
+                            started += delay
+                            deadline += delay
+                        else:
+                            gripper_targets_sent += 1
                         if row is not None:
-                            row['gripper_sent'] = True
+                            row['gripper_sent'] = not self._gripper_timed_out
                             row['gripper_send_finished_s'] = time.monotonic()
                     if repeat_index == joint_target_repeat - 1:
                         sent += 1
                     if time.monotonic() > deadline + send_dt:
                         raise TimeoutError(f'Trajectory slot {slot} exceeded its time budget')
-            self._traj_stop_event.wait(max(0., started + len(joints) * dt - time.monotonic()))
+            self._traj_stop_event.wait(max(0., started + row_count * dt - time.monotonic()))
             with self._io_lock:
                 self._require_target_owner()
                 # A final check also catches faults in shorter-than-monitor chunks.
@@ -1620,7 +1789,7 @@ class A10Operator(BaseOperator):
             raise
         finally:
             with self._io_lock:
-                self.last_trajectory = dict(selected=len(joints), sent=sent,
+                self.last_trajectory = dict(selected=row_count, sent=sent,
                     joint_packets_sent=joint_packets_sent, gripper_targets_sent=gripper_targets_sent,
                     joint_target_repeat=joint_target_repeat, joint_send_dt_s=send_dt,
                     joint_publish_hz=1. / send_dt, model_action_dt_s=dt,
@@ -1642,15 +1811,16 @@ class A10Operator(BaseOperator):
         return self._trajectory_owner is not None
 
     def send_joints(self, arm_targets):
-        """Send six absolute joint radians via joint follower UDP (wire degrees).
+        """Send a complete joint group via follower UDP (wire degrees).
 
-        No gripper, implicit hold, interpolation, retry, or arrival ACK. Client
-        targets must match controller joint order; controller plans motion.
+        Flatten arms in joint_target_order, with six joints per A10 arm.
+        No gripper, implicit hold, interpolation, retry, or arrival ACK.
         """
-        self._require_single_arm('joint targets')
-        if not isinstance(arm_targets, Mapping) or set(arm_targets) != {self.arm_name}:
-            raise ValueError(f'Expected exactly one arm: {self.arm_name}')
-        radians = _vector(arm_targets[self.arm_name], 6, 'joint targets in radians')
+        if not isinstance(arm_targets, Mapping) or set(arm_targets) != set(self.arm_names):
+            raise ValueError(f'Expected exactly these arms: {self.arm_names}')
+        targets = {name: _vector(arm_targets[name], self.joint_dofs[name],
+                                 f'{name} joint targets in radians') for name in self.arm_names}
+        radians = np.concatenate([targets[name] for name in self.joint_target_order])
         with np.errstate(over='ignore'):
             degrees = np.rad2deg(radians)
         if not np.isfinite(degrees).all():
@@ -1658,6 +1828,44 @@ class A10Operator(BaseOperator):
         values = ','.join(format(float(v), '.17g') for v in degrees)
         payload = f'jp --motor_pos=[{values}]'.encode('utf-8')
         self._send_follower_target(_pack(payload, command=False), 'Axis')
+
+    def _claim_init_motion(self):
+        with self._io_lock:
+            if not self._trajectory_lock.acquire(blocking=False):
+                raise RuntimeError('A trajectory is already running')
+            self._trajectory_owner = threading.get_ident()
+
+    def _release_init_motion(self):
+        with self._io_lock:
+            self._trajectory_owner = None
+        self._trajectory_lock.release()
+
+    def _prepare_init_motion(self):
+        with self._io_lock:
+            self._require_motion()
+            self._prepare_shared_console_command()
+            if self.follower_stop_pending:
+                self.stop_follower()
+            self._check_init_speed(self.get_state())
+
+    @staticmethod
+    def _check_init_speed(state):
+        context = state.raw['ret_context']
+        mode = context.get('robot_msg', {}).get('op_mode')
+        percent = (context.get('motion_msg', {}).get('jog_vel') if mode == 'Manual'
+                   else context.get('program_msg', {}).get('vel') if mode == 'Auto' else None)
+        if type(percent) in (int, float) and percent == 0:
+            raise RuntimeError(f'控制器 {mode} 速度倍率为 0%，无法回位；请在控制器设置合适速度后重试')
+
+    def _read_init_joints(self):
+        self._check_joint_follower_reply()
+        state = self.get_state()
+        self._check_init_speed(state)
+        if state.has_error or state.raw['ret_context'].get('robot_msg', {}).get('activate') != 'Enabled':
+            raise A10ControllerError('Initialization requires healthy Enabled feedback')
+        if self._started_here and not self._confirmed_active:
+            raise A10ControllerError('Initialization joint follower is no longer active')
+        return {name: arm.actual_joints_rad for name, arm in state.arms.items()}
 
     def gohome(self):
         raise NotImplementedError('No verified home command for this follower adapter')

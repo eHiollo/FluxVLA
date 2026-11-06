@@ -44,6 +44,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from numbers import Integral, Real
+from pathlib import Path
 import struct
 import threading
 import time
@@ -66,6 +67,10 @@ STATUS_FLAGS = {
 
 class ZXGripperError(RuntimeError):
     """Transport or malformed Modbus response."""
+
+
+class ZXGripperInputExpired(ZXGripperError):
+    """Input expired before a motion write; never retry the stale target."""
 
 
 class ZXGripperTimeout(ZXGripperError, TimeoutError):
@@ -144,10 +149,13 @@ class ZXGripper:
     """Exclusive Modbus client; transactions and target updates are serialized."""
 
     def __init__(self, port=DEFAULT_PORT, *, baudrate=115200, timeout=0.2,
-                 trace=None, max_position_raw=8900):
+                 trace=None, max_position_raw=8900,
+                 expected_usb_serial=None, expected_usb_interface=None):
         if not isinstance(port, str) or not port:
             raise ValueError('port must be a nonempty device path')
         self.port = port
+        self.expected_usb_serial = expected_usb_serial
+        self.expected_usb_interface = expected_usb_interface
         self.baudrate = _integer(baudrate, 'baudrate', 1, 4000000)
         self.max_position_raw = _integer(max_position_raw, 'max_position_raw', 1, 0xFFFFFFFF)
         if (isinstance(timeout, bool) or not isinstance(timeout, Real)
@@ -167,6 +175,8 @@ class ZXGripper:
 
     def _connect(self):
         if self._serial is None:
+            if self.expected_usb_serial is not None:
+                self.verify_usb_identity()
             import serial
             try:
                 self._serial = serial.Serial(
@@ -176,6 +186,20 @@ class ZXGripper:
             except (OSError, serial.SerialException) as exc:
                 raise ZXGripperError(f'Cannot open {self.port}: {exc}') from exc
         return self
+
+    def verify_usb_identity(self):
+        node = Path('/sys/class/tty') / Path(self.port).resolve().name
+        interface = None
+        for parent in node.resolve().parents:
+            if (parent / 'bInterfaceNumber').exists() and interface is None:
+                interface = (parent / 'bInterfaceNumber').read_text().strip().lower()
+            if (parent / 'idVendor').exists():
+                serial_file = parent / 'serial'
+                serial = serial_file.read_text().strip() if serial_file.exists() else None
+                if serial != self.expected_usb_serial or interface != self.expected_usb_interface:
+                    raise ZXGripperError('USB identity does not match the configured gripper')
+                return
+        raise ZXGripperError(f'Cannot verify USB identity: {self.port}')
 
     def disconnect(self):
         """Close the port only; never release a held object."""
@@ -283,11 +307,13 @@ class ZXGripper:
             device_id, int(position * self.max_position_raw + 0.5), **options)
 
     def set_position_raw(self, device_id, position, *, speed=10, torque=60,
-                         wait=False, move_timeout=10):
+                         wait=False, move_timeout=10, motion_deadline_s=None, motion_cancel_event=None):
         """Update the latest target, returning a command ID or (wait=True) state.
 
         wait=False waits for bounded serial ACKs only, not mechanical motion.
         Repeated identical targets retain the existing command and holding force.
+        Optional monotonic motion_deadline_s / motion_cancel_event are checked
+        before motion writes. Expiry does not undo a target already triggered.
         """
         device_id = _integer(device_id, 'device_id', 1, 247)
         position = _integer(position, 'position', 0, self.max_position_raw)
@@ -296,19 +322,31 @@ class ZXGripper:
         if type(wait) is not bool:
             raise ValueError('wait must be bool')
         _wait_timeout(move_timeout)
+        if motion_deadline_s is not None and (isinstance(motion_deadline_s, bool) or
+                not isinstance(motion_deadline_s, Real) or not math.isfinite(motion_deadline_s)):
+            raise ValueError('motion_deadline_s must be finite')
+        def check_deadline():
+            if ((motion_deadline_s is not None and time.monotonic() >= motion_deadline_s)
+                    or (motion_cancel_event is not None and motion_cancel_event.is_set())):
+                raise ZXGripperInputExpired('VR input expired/cancelled before motion write')
         with self._io_lock:
+            check_deadline()
             alarm_a, alarm_b = self.read_registers(device_id, ALARM_REGISTER, 2)
             if alarm_a or alarm_b:
                 raise ZXGripperError(f'Motion blocked by alarms: {alarm_a:#06x}, {alarm_b:#06x}')
+            check_deadline()
             signature = (position, speed, torque)
             previous = self._commands.get(device_id)
             if previous is None or previous[:3] != signature:
                 # An uncertain partial write must not leave a reusable cached target.
                 self._commands.pop(device_id, None)
                 self.write_register(device_id, 0x0108, 0)
+                check_deadline()
                 self.write_registers(device_id, 0x0102,
                                      (position >> 16, position & 0xFFFF, speed, torque, 1000, 1000))
+                check_deadline()
                 self.write_register(device_id, 0x0100, 1)
+                check_deadline()
                 self.write_register(device_id, 0x0108, 1)
                 self._command_sequence += 1
                 self._commands[device_id] = (*signature, self._command_sequence, time.monotonic())

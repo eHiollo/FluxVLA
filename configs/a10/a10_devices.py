@@ -39,7 +39,7 @@ cameras = dict(
 # device_id 用于 read_state/set_position_raw。
 # speed/torque 是本轮小范围验证的百分比参数，不是 mm/s 或牛顿。
 # 两只夹爪使用独立串口，所以内部 ID 都为 1 可以正常工作。
-# 已现场观察小范围动作；完整行程、开合方向和 raw->mm 标定仍待确认。
+# 2026-11-06用户确认两侧工作行程0..9000，0完全张开、9000完全闭合；raw->mm尚未标定。
 # check是本侧允许的原始位置范围，不代表已确认的物理极限；可分级验证后调整。
 # --calibrate逐步记录开合端点并备份保存；None时拒绝--open/--close。
 grippers = dict(
@@ -47,14 +47,14 @@ grippers = dict(
         identity=dict(model='FT231X', serial='DU0EMMMM', usb_interface='00'),
         port='/dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0EMMMM-if00-port0',
         baudrate=115200, device_id=1, speed=5, torque=60,
-        check=dict(min_raw=0, max_raw=3000, open_raw=None, close_raw=None,
+        check=dict(min_raw=0, max_raw=9000, open_raw=0, close_raw=9000,
                    tolerance_raw=5, move_timeout_s=10),
     ),
     right=dict(
         identity=dict(model='CP2102N', serial='5c9323064b6eef11a2c4e7c2c169b110', usb_interface='00'),
         port='/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_5c9323064b6eef11a2c4e7c2c169b110-if00-port0',
         baudrate=115200, device_id=1, speed=5, torque=60,
-        check=dict(min_raw=0, max_raw=3000, open_raw=None, close_raw=None,
+        check=dict(min_raw=0, max_raw=9000, open_raw=0, close_raw=9000,
                    tolerance_raw=5, move_timeout_s=10),
     ),
 )

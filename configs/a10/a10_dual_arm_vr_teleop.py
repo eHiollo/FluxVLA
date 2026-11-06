@@ -1,10 +1,10 @@
 """Dual A10 VR: relative anchors + reference + SDK tool cumulative targets.
 
-Default VR-only; no recording, calibration, gripper or automatic motor enable.
+Default VR-only; no recording, pose calibration or automatic motor enable. ZX grippers are opt-in.
 Confirm the actual dual XML / GET row layout before opting into live motion.
 """
 
-_base_ = ['./a10_vr_teleop.py', './a10_dual_arm_operator.py']
+_base_ = ['./a10_vr_teleop.py', './a10_dual_arm_operator.py', './a10_devices.py']
 
 teleop = dict(
     vr_only=True, observe_only=False,
@@ -17,6 +17,10 @@ teleop = dict(
         max_linear_accel_m_s2=.4, max_angular_accel_rad_s2=.96,
         max_reference_lead_m=.02, max_reference_lead_rad=.12,
     ),
+    zx_grippers=dict(
+        enabled=False, devices={{_base_.grippers}},
+        target_rate_raw_s=1800., deadzone=.1, direction=dict(left=1, right=1),
+        max_lead_raw=300., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5),
     pose_calibration_path=None,
     # Onsite .150: physical left arm is ee 1 (operator key 'right'), right is ee 0.
     # Swap input bindings only; keep GET mappings and UDP row order unchanged.

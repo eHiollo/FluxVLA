@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import fields
 from pathlib import Path
+import math
 from types import SimpleNamespace
 
 from ..utils.root import OPERATORS
@@ -115,8 +116,13 @@ class VROperator(BaseTeleoperator):
                                  raw.get('xlevr.buttons', {}).get('squeeze'))
                 raw['xlevr.enabled'] = squeezed
                 mapped = self.mappers[hand](raw)
-                mapped['gripper.pos'] = 0.
-                mapped['_xlevr.anchor_command']['gripper'] = 0.
+                # Thumbsticks remain independent of the arm clutch. Each raw
+                # sample keeps its own freshness; no arm-name-based USB routing.
+                value = float(raw.get('xlevr.thumbstick', {}).get('x', 0.))
+                if not math.isfinite(value) or abs(value) > 1:
+                    raise ValueError('Dual VR thumbstick x must be finite within [-1, 1]')
+                mapped['gripper.pos'] = value
+                mapped['_xlevr.anchor_command']['gripper'] = value
                 self.last_action[self.hand_to_arm[hand]] = mapped
             return self.last_action
         self.last_raw = self.input.get_action()

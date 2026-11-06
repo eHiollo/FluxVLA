@@ -95,6 +95,7 @@ def main(argv=None):
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
               f'record_controller={runtime.record_controller}，'
+              f'zx_grippers={getattr(runtime, "zx_grippers_enabled", False)}，'
               '未启动服务或连接设备。')
         return 0
     runtime.run(fps=cfg.teleop.get('fps', 30),

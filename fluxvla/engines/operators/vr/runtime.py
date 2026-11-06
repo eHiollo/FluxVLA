@@ -6,10 +6,171 @@ import math
 import logging
 import time
 import json
+import threading
 from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+
+
+class _ZXGripperChannel:
+    """One USB owner, bounded target lead, latest input only; no foreground I/O."""
+
+    def __init__(self, side, device, options):
+        from ..zx_gripper import ZXGripper
+        self.side = side
+        self.options = dict(options)
+        self.device_id = device['device_id']
+        if type(self.device_id) is not int or not 1 <= self.device_id <= 247:
+            raise ValueError('ZX device_id must be within 1..247')
+        identity, check = device['identity'], device['check']
+        self.low, self.high = check['min_raw'], check['max_raw']
+        self.opened, self.closed = check['open_raw'], check['close_raw']
+        if (any(type(v) is not int for v in (self.low, self.high, self.opened, self.closed))
+                or not 0 <= self.low < self.high <= 0xFFFFFFFF
+                or not self.low <= self.opened <= self.high or not self.low <= self.closed <= self.high
+                or self.opened == self.closed):
+            raise ValueError('Confirm ZX gripper raw range and distinct open_raw/close_raw')
+        if not identity.get('serial') or not identity.get('usb_interface'):
+            raise ValueError('ZX grippers require USB serial and interface identity')
+        self.serial = identity['serial']
+        self.tolerance = check.get('tolerance_raw', 5)
+        if type(self.tolerance) is not int or not 0 <= self.tolerance <= self.high - self.low:
+            raise ValueError('Invalid ZX raw position tolerance')
+        self.speed, self.torque = device['speed'], device['torque']
+        if (type(self.speed) is not int or not 1 <= self.speed <= 5 or
+                type(self.torque) is not int or not 1 <= self.torque <= 60):
+            raise ValueError('ZX teleop starts with speed within 1..5 and torque within 1..60')
+        self.direction = options['direction'][side]
+        if self.direction not in (-1, 1) or isinstance(self.direction, bool):
+            raise ValueError('ZX direction must be 1 or -1 for each hand')
+        self.client = ZXGripper(device['port'], baudrate=device['baudrate'],
+                                max_position_raw=self.high, expected_usb_serial=self.serial,
+                                expected_usb_interface=identity['usb_interface'])
+        self._lock = threading.Lock()
+        self._stop, self._ready = threading.Event(), threading.Event()
+        self._thread = None
+        self._input = (0., 0.)
+        self._target = None
+        self._last_tick = None
+        self._need_center = True
+        self._active = False
+        self._last_sent = None
+        self._state = dict(phase='not_started', serial=self.serial, actual_raw=None,
+                           target_raw=None, last_sent_raw=None, error=None, feedback_monotonic_s=None)
+
+    def connect(self):
+        if self._thread is not None or self._stop.is_set():
+            raise RuntimeError('ZX channel cannot restart; create a new teleop session')
+        self._thread = threading.Thread(target=self._run, name='zx-gripper-' + self.side, daemon=True)
+        self._thread.start()
+        if not self._ready.wait(3.):
+            self.request_stop()
+            raise TimeoutError(f'ZX {self.side} startup did not complete')
+        self.check_health()
+
+    def submit(self, axis, deadline):
+        if not math.isfinite(axis) or abs(axis) > 1 or not math.isfinite(deadline):
+            raise ValueError('ZX joystick must be finite within [-1, 1], with a finite deadline')
+        with self._lock:
+            if not self._stop.is_set():
+                self._input = (float(axis), float(deadline))
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._state)
+
+    def check_health(self):
+        state = self.snapshot()
+        if state['error']:
+            raise RuntimeError(f"ZX {self.side}: {state['error']}")
+        stamp = state['feedback_monotonic_s']
+        if stamp is None or not 0 <= time.monotonic() - stamp <= self.options['feedback_timeout_s']:
+            raise RuntimeError(f'ZX {self.side}: feedback is stale')
+
+    def request_stop(self):
+        self._stop.set()
+        with self._lock:
+            self._input = (0., 0.)
+
+    def close(self):
+        self.request_stop()
+        if self._thread is not None:
+            self._thread.join(2.)
+            if self._thread.is_alive():
+                raise RuntimeError(f'ZX {self.side} serial worker did not finish; close unconfirmed')
+
+    def _choose_target(self, actual, now, axis, deadline):
+        dt = 0. if self._last_tick is None else max(0., min(now - self._last_tick, 2. / self.options['io_hz']))
+        self._last_tick = now
+        if now >= deadline:
+            self._need_center, self._active = True, False
+            self._target = float(actual)
+            return None, 'input_stale'
+        if abs(axis) <= self.options['deadzone']:
+            self._need_center, self._active = False, False
+            self._target = float(actual)
+            return None, 'centered'
+        if self._need_center:
+            return None, 'neutral_required'
+        if not self._active:
+            self._target, self._active = float(actual), True
+            return None, 'engaging'
+        sign = 1 if self.opened > self.closed else -1
+        desired = self._target + axis * self.direction * sign * self.options['target_rate_raw_s'] * dt
+        lead = self.options['max_lead_raw']
+        self._target = max(self.low, min(self.high, max(actual - lead, min(actual + lead, desired))))
+        return int(round(self._target)), 'tracking'
+
+    def _read(self):
+        before = time.monotonic()
+        state = self.client.read_state(self.device_id)
+        now = time.monotonic()
+        if now - before > self.options['feedback_timeout_s']:
+            raise TimeoutError('serial feedback read took too long')
+        if state.has_error:
+            raise RuntimeError(f'gripper alarm 0x{state.alarm_a:04X}/0x{state.alarm_b:04X}')
+        if not max(0, self.low - self.tolerance) <= state.position_raw <= self.high + self.tolerance:
+            raise RuntimeError('actual position exceeds the configured raw range')
+        with self._lock:
+            self._state.update(actual_raw=state.position_raw, feedback_monotonic_s=now,
+                               enabled=state.enabled, alarm_a=state.alarm_a, alarm_b=state.alarm_b,
+                               completion=state.completion)
+        return state, now
+
+    def _run(self):
+        from ..zx_gripper import ZXGripperInputExpired
+        try:
+            with self.client:
+                state, now = self._read()
+                self._target = float(np.clip(state.position_raw, self.low, self.high))
+                with self._lock:
+                    self._state.update(phase='neutral_required', target_raw=self._target)
+                self._ready.set()
+                while not self._stop.wait(1. / self.options['io_hz']):
+                    state, now = self._read()
+                    if self._stop.is_set():
+                        break
+                    with self._lock:
+                        axis, deadline = self._input
+                    target, phase = self._choose_target(state.position_raw, now, axis, deadline)
+                    if target is not None and target != self._last_sent:
+                        try:
+                            self.client.set_position_raw(self.device_id, target, speed=self.speed, torque=self.torque,
+                                                         motion_deadline_s=deadline, motion_cancel_event=self._stop)
+                            self._last_sent = target
+                        except ZXGripperInputExpired:
+                            self._need_center, self._active = True, False
+                            phase = 'input_expired_during_io'
+                    with self._lock:
+                        self._state.update(phase=phase, target_raw=self._target, last_sent_raw=self._last_sent,
+                                           input_axis=axis, input_deadline_s=deadline)
+        except Exception as exc:
+            with self._lock:
+                self._state.update(phase='failed', error=f'{type(exc).__name__}: {exc}')
+            self._stop.set()
+        finally:
+            self._ready.set()
 
 
 class VRTeleopRuntime:
@@ -222,6 +383,9 @@ class VRTeleopRuntime:
             logging.getLogger(__name__).error('倍率恢复未确认：%s', exc)
         self._speed_event()
 
+    def _cancel_accessories(self):
+        pass
+
     def connect(self):
         """Connect input/feedback, optionally set speed, and defer follower start."""
         if self._connected:
@@ -365,6 +529,7 @@ class VRTeleopRuntime:
             self._input_read_time = time.monotonic()
             return self._step(raw, action)
         except BaseException as exc:
+            self._cancel_accessories()
             error = f'{type(exc).__name__}: {exc}'
             if self.control_mode == 'reference' and self.execute:
                 self._require_release = True
@@ -700,16 +865,16 @@ class VRTeleopRuntime:
 class DualVRTeleopRuntime(VRTeleopRuntime):
     """Two independent clutches/controllers, one whole-group transport/lifecycle.
 
-    No dual calibration, gripper, IK or collision avoidance. A normal per-arm
+    Optional ZX grippers own independent USB workers. No dual pose calibration, IK or collision avoidance. A normal per-arm
     release shapes a bounded command stop; faults stop the entire group.
     """
 
-    def __init__(self, vr, robot=None, *, gripper=None, **settings):
+    def __init__(self, vr, robot=None, *, gripper=None, zx_grippers=None, **settings):
         from .control import VRPoseController
         if (not getattr(vr, 'is_dual', False) or settings.get('control_mode') != 'reference'
                 or settings.get('pose_mapping', 'anchor_relative') != 'anchor_relative'
                 or gripper is not None):
-            raise ValueError('Dual VR requires both hands, reference, anchor_relative and no gripper')
+            raise ValueError('Dual VR requires both hands, reference and anchor_relative; use zx_grippers for dual USB devices')
         self.arm_names = tuple(vr.hand_to_arm.values())
         if robot is not None and (not getattr(robot, 'is_multi_arm', False)
                                   or set(robot.arm_names) != set(self.arm_names)):
@@ -724,6 +889,81 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._dual_time = None
         self._dual_require_release = False
         self._dual_stop_failed = False
+        self._zx_channels = {}
+        config = dict(zx_grippers or {})
+        enabled = config.pop('enabled', False)
+        devices = config.pop('devices', {})
+        if type(enabled) is not bool:
+            raise ValueError('zx_grippers.enabled must be bool')
+        if enabled:
+            defaults = dict(target_rate_raw_s=1800., deadzone=.1, direction=dict(left=1, right=1),
+                            max_lead_raw=300., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5)
+            if set(config) - set(defaults):
+                raise ValueError('Unknown ZX teleop settings')
+            options = dict(defaults, **config)
+            for key in ('target_rate_raw_s', 'max_lead_raw', 'io_hz', 'input_timeout_s', 'feedback_timeout_s'):
+                if isinstance(options[key], bool) or not isinstance(options[key], (int, float)) or not math.isfinite(options[key]) or options[key] <= 0:
+                    raise ValueError(f'ZX {key} must be positive and finite')
+            if (isinstance(options['deadzone'], bool) or not isinstance(options['deadzone'], (int, float))
+                    or not 0 <= options['deadzone'] < 1 or options['io_hz'] > 50):
+                raise ValueError('ZX deadzone must be within [0,1) and io_hz <= 50')
+            if set(devices) != {'left', 'right'} or set(options['direction']) != {'left', 'right'}:
+                raise ValueError('ZX devices/direction require both physical left and right hands')
+            if (devices['left']['identity']['serial'] == devices['right']['identity']['serial'] or
+                    devices['left']['port'] == devices['right']['port']):
+                raise ValueError('ZX left/right must have distinct USB serials and ports')
+            channels = {side: _ZXGripperChannel(side, dict(devices[side]), options)
+                        for side in ('left', 'right')}
+            self._zx_channels = channels if self.execute else {}
+        self.zx_grippers_enabled = enabled
+
+    def connect(self):
+        try:
+            super().connect()
+            for channel in self._zx_channels.values():
+                channel.connect()
+            if self._zx_channels:
+                logging.getLogger(__name__).info(
+                    '两只知行夹爪已连接：左右摇杆X分别控制，向右张开、向左闭合；请先将摇杆回中。')
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def _cancel_accessories(self):
+        for channel in getattr(self, '_zx_channels', {}).values():
+            channel.request_stop()
+
+    def close(self):
+        self._cancel_accessories()
+        try:
+            super().close()
+        finally:
+            errors = []
+            for channel in getattr(self, '_zx_channels', {}).values():
+                try:
+                    channel.close()
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError('; '.join(errors))
+
+    def _step(self, raw, action):
+        if self._zx_channels:
+            self.last_gripper_command = {side: channel.snapshot() for side, channel in self._zx_channels.items()}
+            for channel in self._zx_channels.values():
+                channel.check_health()
+        result = self._step_arms(raw, action)
+        for side, channel in self._zx_channels.items():
+            sample = raw[side]
+            age = sample.get('xlevr.sample_age_s', -1.)
+            elapsed = max(0., time.monotonic() - self._input_read_time)
+            budget = channel.options['input_timeout_s']
+            valid = isinstance(age, (int, float)) and math.isfinite(age) and 0 <= age and age + elapsed <= budget
+            value = action[self.teleoperator.hand_to_arm[side]].get('gripper.pos', 0.)
+            channel.submit(float(value) if valid else 0., time.monotonic() + budget - age - elapsed if valid else 0.)
+        return result
+
 
     def _checked_frame(self, *, require_active):
         from .control import pose
@@ -797,7 +1037,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     raise RuntimeError(f'Dual VR {arm}: mapper_input_rejected')
         return requested, fresh
 
-    def _step(self, raw, action):
+    def _step_arms(self, raw, action):
         if not self.execute and not self.observe_only:
             return action  # VR-only maps both hands, never fabricates feedback.
         if self._dual_stop_failed:

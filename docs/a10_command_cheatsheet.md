@@ -1,8 +1,11 @@
 # A10 常用命令速查
 
+2026-11-06起统一在 `/home/robot/VLA/FluxVLA` 的 `kaanh_follower` 分支开发和运行。
+原开发工作树已解除分支占用并保留作备份；切换前已打开的控制台请退出后重开。
+
 ## 换 USB 接口后检查设备
 
-在 `/home/robot/VLA/FluxVLA_follower`、`fluxvla` 环境运行：
+在 `/home/robot/VLA/FluxVLA`、`fluxvla` 环境运行：
 
 ```bash
 # 1. 日常检查：按序列号核对三台相机和两只夹爪的USB转接器
@@ -131,7 +134,7 @@ python scripts/a10_devices.py --gripper left --close
 之前的机械臂速度/加速度等覆盖参数可以继续保留。下面是不带额外机械臂调参的基本命令：
 
 ```bash
-cd /home/robot/VLA/FluxVLA_follower
+cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
@@ -249,7 +252,7 @@ target_rate_raw_s是目标变化速度，不代表实际开合速度；实际速
 两只夹爪内部 ID 同为1没有冲突，因为串口不同；这个 ID 不是机械臂的 ee_id。
 当前双臂控制器中左手对应 ee1（operator 内部键 `right`），右手对应 ee0（内部键 `left`）。
 
-在 `/home/robot/VLA/FluxVLA_follower`、`fluxvla` 环境查询，以下命令只读状态：
+在 `/home/robot/VLA/FluxVLA`、`fluxvla` 环境查询，以下命令只读状态：
 
 ```bash
 # 左夹爪
@@ -712,7 +715,7 @@ operator 模板默认禁止运动；交互控制台默认允许控制，`--read-
 本次在 `kaanh_follower` 的独立目录开发，原 `FluxVLA` 目录的 `console` 分支可继续改代码：
 
 ```bash
-cd /home/robot/VLA/FluxVLA_follower
+cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 ```
 
@@ -787,7 +790,7 @@ python scripts/teleoperate.py \
 先验证5秒记录，不启动机械臂、不要求连接VR手柄（仍会启动VR网页服务）：
 
 ```bash
-cd /home/robot/VLA/FluxVLA_follower
+cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \

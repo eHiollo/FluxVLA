@@ -1172,3 +1172,24 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 使用现有配置测试核对两侧15%、目标速率3000、领先量600及检查清单5%；
   VR知行22项和设备检查45项共67项通过，不带速度覆盖的实机配置preview通过。
   本轮未连接真实设备或发送动作。命令速查及VR说明已同步，用户CLI.txt未修改或纳入提交。
+
+
+### 2026-11-06：整合分支迁回FluxVLA主目录
+
+- 核对同事的89c2563合并提交：kaanh_follower已完整包含console，无需再次合并。
+  沿用合并后的既有VR别名：内部left=ID0、right=ID1，手柄绑定反向对应物理左右；
+  关节初始点按ID0前6轴、ID1后6轴保存，未再次改名或交换目标。
+- 主目录切换前为干净的console/d1c1070；旧FluxVLA_follower只有用户CLI.txt未提交。
+  双方CLI、原始补丁、HEAD和工作树列表备份至
+  /home/robot/VLA/FluxVLA_migration_backups/20261106_150312。
+  旧工作树在同一89c2563提交解除分支占用，保留为detached HEAD备份；
+  /home/robot/VLA/FluxVLA现使用kaanh_follower，console分支及FluxVLA_vr工作树保留。
+- 将用户旧工作树CLI.txt原样带到主目录并保持未提交，未纳入本轮文档提交。
+  旧工作树49个主目录缺少的运行文件复制到对应work_dirs并逐个SHA256校验，包括VR历史日志和相机检查图；
+  两个同内容TLS文件不重复覆盖，一份重名的旧teleop_diagnostics.jsonl保留主目录版本。
+  文件清单在备份runtime_files.json中，源目录全部保留。主目录现有模型、数据和本地配置未覆盖。
+- 主目录验证：VR知行、双臂VR、控制器高频记录、设备检查共125项模拟/本机回环测试通过；
+  实机VR配置preview通过，确认模块从主目录导入，m_init构造的两组角度与用户12轴目标一致。
+  没有连接实机或下发动作。未扩展为对全部console/推理功能的完整回归或实机验收。
+- 命令速查5处旧工作树入口已更新为主目录。迁回时主目录已有控制台进程，未替用户关闭或重启；
+  该进程继续使用原已加载对象，后续使用新配置需由用户退出后重新启动。

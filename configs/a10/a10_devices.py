@@ -31,7 +31,7 @@ cameras = dict(
     right_wrist_0_rgb=dict(
         identity=dict(model='D405', serial='255323070551', usb_interface='00', video_index=4),
         device='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_255323070551-video-index4',
-        width=640, height=480, fps=30, rotate_180=False,
+        width=640, height=480, fps=30, rotate_180=True,
     ),
 )
 

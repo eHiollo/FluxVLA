@@ -153,7 +153,7 @@ class DeviceVisualTests(unittest.TestCase):
     def setUp(self):
         self.config, _ = m.load_config(SOURCE)
         left = self.config['grippers']['left']
-        left.update(speed=5, check=dict(positions_raw=(0, 1000), open_raw=None, close_raw=None))
+        left.update(speed=5, check=dict(min_raw=0, max_raw=3000, tolerance_raw=5, open_raw=None, close_raw=None))
         self.config['grippers']['right'] = copy.deepcopy(left)
         self.config['grippers']['right']['port'] = '/dev/serial/by-id/right'
         self.config['grippers']['right']['identity']['serial'] = 'right'
@@ -191,7 +191,7 @@ class DeviceVisualTests(unittest.TestCase):
         self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
 
     def test_position_outside_check_range_blocks_motion(self):
-        self.transport.position = 3000
+        self.transport.position = 4000
         with patch('serial.Serial', return_value=self.transport):
             with self.assertRaisesRegex(ValueError, '实际位置'):
                 m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
@@ -199,7 +199,7 @@ class DeviceVisualTests(unittest.TestCase):
 
     def test_unconfirmed_direction_and_invalid_target_do_not_open_port(self):
         with patch.object(m, 'load_operator') as loader:
-            for action, target in [('open', None), ('close', None), ('position', 500)]:
+            for action, target in [('open', None), ('close', None), ('position', 3001)]:
                 with self.assertRaises(ValueError):
                     m.move_gripper(self.config, self.rows, 'left', action, target)
             loader.assert_not_called()
@@ -286,13 +286,193 @@ class DeviceVisualTests(unittest.TestCase):
         args = [ ['--snapshot', '--gripper', 'left', '--position-raw', '0'],
                  ['--snapshot', '--update'], ['--gripper', 'left'], ['--open'],
                  ['--gripper', 'left', '--position-raw', '0', '--check-grippers'],
-                 ['--gripper', 'left', '--open', '--close'] ]
+                 ['--gripper', 'left', '--open', '--close'],
+                 ['--gripper', 'left', '--calibrate', '--json'],
+                 ['--gripper', 'left', '--calibrate', '--update'] ]
         with patch.object(m, 'scan_devices') as scan, patch('sys.stderr'):
             for argv in args:
                 with self.assertRaises(SystemExit) as result:
                     m.main(argv)
                 self.assertEqual(result.exception.code, 2)
             scan.assert_not_called()
+
+
+class GripperRangeTests(unittest.TestCase):
+    def setUp(self):
+        DeviceVisualTests.setUp(self)
+
+    def test_arbitrary_values_and_both_endpoints_follow_config(self):
+        for target in (0, 1, 1739, 2999, 3000):
+            with patch('serial.Serial', return_value=self.transport):
+                result = m.move_gripper(self.config, self.rows, 'left', 'position', target)
+            self.assertTrue(result['arrived'])
+            self.assertEqual(result['final']['position_raw'], target)
+            self.assertEqual(result['error_raw'], 0)
+
+    def test_out_of_range_and_invalid_config_never_open_serial(self):
+        with patch.object(m, 'load_operator') as loader:
+            for target in (-1, 3001, True, 100.5):
+                with self.assertRaises(ValueError):
+                    m.move_gripper(self.config, self.rows, 'left', 'position', target)
+            for changes in ({'min_raw': -1}, {'max_raw': 0}, {'max_raw': True},
+                            {'max_raw': 2**32}, {'tolerance_raw': -1},
+                            {'move_timeout_s': float('nan')}, {'move_timeout_s': 61}):
+                cfg = copy.deepcopy(self.config)
+                cfg['grippers']['left']['check'].update(changes)
+                with self.assertRaises(ValueError):
+                    m.move_gripper(cfg, self.rows, 'left', 'position', 0)
+            loader.assert_not_called()
+
+    def test_sides_have_independent_ranges(self):
+        self.config['grippers']['right']['check']['max_raw'] = 700
+        with patch.object(m, 'load_operator') as loader:
+            with self.assertRaises(ValueError):
+                m.move_gripper(self.config, self.rows, 'right', 'position', 1000)
+            loader.assert_not_called()
+        with patch('serial.Serial', return_value=self.transport):
+            self.assertTrue(m.move_gripper(self.config, self.rows, 'left', 'position', 1000)['arrived'])
+
+    def test_old_position_bit_without_actual_arrival_times_out(self):
+        self.transport.follow = False
+        self.config['grippers']['left']['check']['move_timeout_s'] = .01
+        with patch('serial.Serial', return_value=self.transport):
+            result = m.move_gripper(self.config, self.rows, 'left', 'position', 2000)
+        self.assertFalse(result['arrived'])
+        self.assertEqual(result['outcome'], 'timeout')
+        self.assertEqual(result['final']['position_raw'], 0)
+        self.assertTrue(self.transport.enabled)
+
+    def test_torque_completion_does_not_count_as_arrival(self):
+        self.transport.follow = False
+        self.transport.status = 0x001C  # torque + zero speed, no position arrival
+        with patch('serial.Serial', return_value=self.transport):
+            result = m.move_gripper(self.config, self.rows, 'left', 'position', 2000)
+        self.assertEqual(result['outcome'], 'torque_reached')
+        self.assertFalse(result['arrived'])
+        self.assertEqual(self.transport.target, 2000)  # target retained, no retreat
+
+    def test_motion_cli_returns_nonzero_for_unconfirmed_position(self):
+        from unittest.mock import MagicMock
+        failure = dict(arrived=False, outcome='torque_reached')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'devices.py'
+            path.write_text('cameras = ' + repr(self.config['cameras']) + '\ngrippers = ' + repr(self.config['grippers']))
+            with patch.object(m, 'scan_devices', return_value=[]), \
+                    patch.object(m, 'match_devices', return_value=self.rows), \
+                    patch.object(m, 'move_gripper', return_value=failure) as move, \
+                    patch.object(m, 'print_report'):
+                self.assertEqual(m.main(['--config', str(path), '--gripper', 'left', '--position-raw', '1739']), 1)
+                self.assertEqual(move.call_args.args[-1], 1739)
+
+    def run_wizard(self, commands, *, expected='saved', after_write=None):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'devices.py'
+            source = '# 中文注释保留\ncameras = ' + repr(self.config['cameras']) + '\ngrippers = ' + repr(self.config['grippers']) + '\n'
+            path.write_text(source)
+            config, nodes = m.load_config(source)
+            if after_write:
+                after_write(path)
+            with patch('serial.Serial', return_value=self.transport) as serial, \
+                    patch('builtins.input', side_effect=commands), patch('builtins.print'):
+                result = m.calibrate_gripper(config, self.rows, 'left', path, source.encode(), nodes)
+            self.assertEqual(result['status'], expected)
+            self.assertEqual(serial.call_count, 1)
+            self.assertEqual(serial.call_args.args[0], self.config['grippers']['left']['port'])
+            self.assertTrue(self.transport.closed)
+            updated, _ = m.load_config(path.read_text())
+            if expected == 'saved':
+                self.assertEqual(Path(result['backup']).read_text(), source)
+                self.assertTrue(path.read_text().startswith('# 中文注释保留\n'))
+                self.assertEqual(updated['grippers']['right'], config['grippers']['right'])
+                self.assertEqual(updated['cameras'], config['cameras'])
+                self.assertEqual(updated['grippers']['left']['identity'], config['grippers']['left']['identity'])
+            else:
+                self.assertEqual(path.read_text(), source)
+                self.assertEqual(list(Path(folder).glob('*.bak')), [])
+            return result, updated
+
+    def test_calibration_records_direction_and_saves_only_selected_check(self):
+        result, cfg = self.run_wizard(['1739', 'open', '0', 'close', 'save', 'yes'])
+        check = cfg['grippers']['left']['check']
+        self.assertEqual((check['min_raw'], check['max_raw']), (0, 1739))
+        self.assertEqual((check['open_raw'], check['close_raw']), (1739, 0))
+        self.assertEqual(check['calibration']['serial'], 'gripper')
+        self.assertEqual(check['calibration']['open_actual_raw'], 1739)
+        self.assertEqual(cfg['grippers']['left']['speed'], 5)
+        self.assertEqual(cfg['grippers']['left']['torque'], 60)
+
+    def test_calibration_supports_reverse_direction_and_explicit_range_expansion(self):
+        _, cfg = self.run_wizard(['0', 'open', 'range 0 4000', '3500', 'close', 'save', '确认'])
+        check = cfg['grippers']['left']['check']
+        self.assertEqual((check['min_raw'], check['max_raw']), (0, 3500))
+        self.assertEqual((check['open_raw'], check['close_raw']), (0, 3500))
+
+    def test_cancel_and_eof_never_save_or_automatically_move(self):
+        for commands in (['range 0 4000', 'exit'], [EOFError()], [KeyboardInterrupt()]):
+            self.transport.writes.clear()
+            self.run_wizard(commands, expected='cancelled')
+            self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+    def test_declined_save_missing_points_and_equal_points_do_not_write(self):
+        self.run_wizard(['save', 'open', '1000', 'open', 'close', 'save',
+                         '0', 'close', 'save', 'no', 'exit'], expected='cancelled')
+
+    def test_unreached_point_ends_calibration_without_saving(self):
+        self.transport.follow = False
+        self.transport.status = 0x001C
+        self.run_wizard(['1000'], expected='failed')
+
+    def test_range_command_alone_never_triggers_motion(self):
+        self.run_wizard(['range 2 1', 'range 1000 3000', 'range 0 4000', '99999', 'exit'], expected='cancelled')
+        self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+    def test_calibration_refuses_to_overwrite_concurrent_edits(self):
+        with self.assertRaisesRegex(ValueError, '其他程序修改'):
+            self.run_wizard(['1000', 'open', '0', 'close', 'save', 'yes'],
+                            after_write=lambda path: path.write_text(path.read_text() + '# other edit\n'))
+
+
+    def test_configured_tolerance_is_used_instead_of_driver_default(self):
+        original_write = self.transport.write
+        def offset_feedback(packet):
+            result = original_write(packet)
+            if packet[1:6] == bytes.fromhex('06 01 08 00 01'):
+                self.transport.position = self.transport.target + 3
+            return result
+        self.transport.write = offset_feedback
+        self.config['grippers']['left']['check'].update(tolerance_raw=2, move_timeout_s=.01)
+        with patch('serial.Serial', return_value=self.transport):
+            result = m.move_gripper(self.config, self.rows, 'left', 'position', 1000)
+        self.assertFalse(result['arrived'])
+        self.assertEqual(result['error_raw'], 3)
+        self.config['grippers']['left']['check'].update(tolerance_raw=5, move_timeout_s=1)
+        with patch('serial.Serial', return_value=self.transport):
+            self.assertTrue(m.move_gripper(self.config, self.rows, 'left', 'position', 1000)['arrived'])
+
+    def test_nonzero_minimum_is_enforced(self):
+        self.config['grippers']['left']['check']['min_raw'] = 100
+        self.transport.position = 100
+        with patch.object(m, 'load_operator') as loader:
+            with self.assertRaises(ValueError):
+                m.move_gripper(self.config, self.rows, 'left', 'position', 99)
+            loader.assert_not_called()
+        with patch('serial.Serial', return_value=self.transport):
+            self.assertTrue(m.move_gripper(self.config, self.rows, 'left', 'position', 101)['arrived'])
+
+    def test_calibrated_labels_are_bound_to_usb_serial_and_modbus_id(self):
+        check = self.config['grippers']['left']['check']
+        check.update(open_raw=1000, close_raw=0,
+                     calibration=dict(serial='different-device', device_id=1))
+        with patch.object(m, 'load_operator') as loader:
+            with self.assertRaisesRegex(ValueError, '校准记录'):
+                m.move_gripper(self.config, self.rows, 'left', 'open')
+            check['calibration'] = dict(serial='gripper', device_id=2)
+            with self.assertRaisesRegex(ValueError, '校准记录'):
+                m.move_gripper(self.config, self.rows, 'left', 'close')
+            loader.assert_not_called()
+
+    def test_indistinguishable_endpoints_are_not_saved(self):
+        self.run_wizard(['0', 'open', '5', 'close', 'save', 'exit'], expected='cancelled')
 
 
 if __name__ == '__main__':

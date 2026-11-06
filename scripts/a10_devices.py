@@ -3,18 +3,22 @@
 
 import argparse
 import ast
+import copy
 from dataclasses import asdict
 from datetime import datetime
 import errno
 import fcntl
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+import pprint
 import stat
 import struct
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SYS = Path('/sys/class')
@@ -183,19 +187,26 @@ def match_devices(config, devices):
 
 def update_paths(path, original, nodes, rows):
     """Patch only literal device/port values; preserve comments and all parameters."""
-    edits = []
-    lines = original.splitlines(keepends=True)
+    replacements = []
     for row in rows:
         if row['status'] != 'path_changed':
             continue
         node = dict_nodes(nodes[row['group']][row['name']])[row['field']]
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             raise ValueError('更新路径要求 device/port 是直接的字符串')
+        replacements.append((node, repr(row['path']).encode('utf-8')))
+    return write_config_edits(path, original, replacements)
+
+
+def write_config_edits(path, original, replacements):
+    if not replacements:
+        return None
+    lines = original.splitlines(keepends=True)
+    edits = []
+    for node, replacement in replacements:
         start = sum(map(len, lines[:node.lineno - 1])) + node.col_offset
         end = sum(map(len, lines[:node.end_lineno - 1])) + node.end_col_offset
-        edits.append((start, end, repr(row['path']).encode('utf-8')))
-    if not edits:
-        return None
+        edits.append((start, end, replacement))
     updated = original
     for start, end, replacement in sorted(edits, reverse=True):
         updated = updated[:start] + replacement + updated[end:]
@@ -291,39 +302,204 @@ def take_snapshots(config, rows, output_dir=None):
     return dict(directory=str(folder), overview=str(folder / 'overview.jpg'), **manifest)
 
 
-def move_gripper(config, rows, side, action, position_raw=None):
-    row, = require_matched(rows, 'grippers', side)
-    settings = config['grippers'][side]
+def gripper_limits(settings):
     check = settings.get('check', {})
-    positions = check.get('positions_raw')
-    if positions not in ((0, 1000), [0, 1000]):
-        raise ValueError('检查动作只支持已验证的位置0和1000，需要配置 check.positions_raw=(0, 1000)')
-    if action in ('open', 'close'):
-        opened, closed = check.get('open_raw'), check.get('close_raw')
-        if (type(opened) is not int or type(closed) is not int or
-                opened not in positions or closed not in positions or opened == closed):
-            raise ValueError('开合方向未确认；先用 --position-raw 0 / 1000 观察，再填写 check.open_raw 和 close_raw')
-        position_raw = opened if action == 'open' else closed
-    if type(position_raw) is not int or position_raw not in positions:
-        raise ValueError('检查位置仅允许0或1000，不是毫米或完整开合行程')
+    low, high = check.get('min_raw'), check.get('max_raw')
+    if type(low) is not int or type(high) is not int or not 0 <= low < high <= 0xFFFFFFFF:
+        raise ValueError('check.min_raw/max_raw 须是整数，满足 0 <= min_raw < max_raw <= 4294967295')
+    tolerance = check.get('tolerance_raw', 5)
+    if type(tolerance) is not int or not 0 <= tolerance <= high - low:
+        raise ValueError('check.tolerance_raw 须是非负整数且不超过工作范围宽度')
+    timeout = check.get('move_timeout_s', 10)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 60:
+        raise ValueError('check.move_timeout_s 须在 (0, 60] 秒内')
     speed, torque = settings.get('speed'), settings.get('torque')
     if (type(speed) is not int or not 1 <= speed <= 5 or
             type(torque) is not int or not 1 <= torque <= 60):
-        raise ValueError('设备辨认动作要求 speed 在1..5、torque在1..60，不允许提高至完整操作速度')
-    gripper_module = load_operator('gripper')
-    # Only the selected port is opened. No robot controller is constructed.
-    with gripper_module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'],
-                                  max_position_raw=1000) as gripper:
-        initial = gripper.read_state(settings['device_id'])
-        if initial.has_error:
-            raise RuntimeError(f"夹爪有报警，不发送动作：0x{initial.alarm_a:04X}/0x{initial.alarm_b:04X}")
-        if not 0 <= initial.position_raw <= 1005:
-            raise ValueError('实际位置不在本次0..1000检查范围附近，不发送可能的大行程动作')
-        final = gripper.set_position_raw(settings['device_id'], position_raw,
-                                         speed=speed, torque=torque, wait=True, move_timeout=10)
-    return dict(side=side, serial=row['serial'], port=row['configured_path'],
-                action=action, initial_raw=initial.position_raw, target_raw=position_raw,
-                speed=speed, torque=torque, final=asdict(final))
+        raise ValueError('设备检查要求 speed 在1..5、torque在1..60')
+    return low, high, tolerance, timeout
+
+
+def reached(state, target, tolerance):
+    return (not state.has_error and state.enabled and state.position_reached
+            and abs(state.position_raw - target) <= tolerance)
+
+
+def read_check_state(client, settings):
+    low, high, tolerance, _ = gripper_limits(settings)
+    state = client.read_state(settings['device_id'])
+    if state.has_error:
+        raise RuntimeError(f'夹爪有报警：0x{state.alarm_a:04X}/0x{state.alarm_b:04X}')
+    if not max(0, low - tolerance) <= state.position_raw <= high + tolerance:
+        raise ValueError(f'实际位置raw={state.position_raw}超出当前配置范围{low}..{high}附近；请先核对范围')
+    return state
+
+
+def execute_check_move(client, settings, row, target, action='position'):
+    low, high, tolerance, timeout = gripper_limits(settings)
+    if type(target) is not int or not low <= target <= high:
+        raise ValueError(f'目标raw必须是{low}..{high}范围内的整数')
+    initial = read_check_state(client, settings)
+    started = time.monotonic()
+    client.set_position_raw(settings['device_id'], target, speed=settings['speed'],
+                            torque=settings['torque'], wait=False)
+    deadline = time.monotonic() + timeout
+    consecutive = 0
+    previous = None
+    final = initial
+    outcome = 'timeout'
+    while time.monotonic() < deadline:
+        final = client.read_state(settings['device_id'])
+        if final.has_error or not final.enabled:
+            raise RuntimeError(f'运动反馈异常：raw={final.position_raw}，使能={final.enabled}，'
+                               f'报警=0x{final.alarm_a:04X}/0x{final.alarm_b:04X}')
+        if time.monotonic() >= deadline:
+            break
+        reason = ('position_reached' if reached(final, target, tolerance) else
+                  'torque_reached' if final.torque_reached and final.status & 0x0004 else None)
+        consecutive = consecutive + 1 if reason and reason == previous else 1 if reason else 0
+        previous = reason
+        if consecutive >= 2:
+            outcome = reason
+            break
+        time.sleep(min(.05, max(0., deadline - time.monotonic())))
+    return dict(side=row['name'], serial=row['serial'], port=row['configured_path'],
+                action=action, initial_raw=initial.position_raw, target_raw=target,
+                speed=settings['speed'], torque=settings['torque'], final=asdict(final),
+                error_raw=final.position_raw - target, tolerance_raw=tolerance,
+                elapsed_s=time.monotonic() - started, outcome=outcome,
+                arrived=outcome == 'position_reached')
+
+
+def move_gripper(config, rows, side, action, position_raw=None):
+    row, = require_matched(rows, 'grippers', side)
+    settings = config['grippers'][side]
+    low, high, _, _ = gripper_limits(settings)
+    if action in ('open', 'close'):
+        calibration = settings['check'].get('calibration')
+        if calibration and (calibration.get('serial') != row['serial'] or
+                            calibration.get('device_id') != settings['device_id']):
+            raise ValueError('校准记录与当前USB序列号/Modbus ID不一致，请重新运行 --calibrate')
+        opened, closed = settings['check'].get('open_raw'), settings['check'].get('close_raw')
+        if (type(opened) is not int or type(closed) is not int or
+                not low <= opened <= high or not low <= closed <= high or opened == closed):
+            raise ValueError('开合方向未确认或超出范围；请先运行 --calibrate，或核对open_raw/close_raw')
+        position_raw = opened if action == 'open' else closed
+    if type(position_raw) is not int or not low <= position_raw <= high:
+        raise ValueError(f'目标raw必须是{low}..{high}范围内的整数')
+    module = load_operator('gripper')
+    with module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'], max_position_raw=high) as client:
+        return execute_check_move(client, settings, row, position_raw, action)
+
+
+def print_motion(motion):
+    text = {'position_reached': '确认到位', 'torque_reached': '遇阻，未确认到位',
+            'timeout': '等待超时，未确认到位'}[motion['outcome']]
+    print(f"{LABELS.get(motion['side'], motion['side'])}：初始raw={motion['initial_raw']} → "
+          f"目标raw={motion['target_raw']}，实际raw={motion['final']['position_raw']}，"
+          f"误差={motion['error_raw']}，耗时{motion['elapsed_s']:.2f}s；{text}")
+
+
+def save_calibration(path, original, nodes, side, check):
+    node = dict_nodes(nodes['grippers'][side])['check']
+    value = pprint.pformat(check, sort_dicts=False, width=80)
+    value = value.replace('\n', '\n' + ' ' * node.col_offset)
+    return write_config_edits(path, original, [(node, value.encode('utf-8'))])
+
+
+def calibrate_gripper(config, rows, side, path, original, nodes):
+    """User-confirmed working endpoints; never automatically seek hard stops."""
+    row, = require_matched(rows, 'grippers', side)
+    settings = copy.deepcopy(config['grippers'][side])
+    low, high, tolerance, _ = gripper_limits(settings)
+    module = load_operator('gripper')
+    points = {}
+    last = None
+    print(f"{LABELS[side]}，USB序列号{row['serial']}，Modbus ID={settings['device_id']}。")
+    print('空载逐步验证工作范围；不会自动搜索硬限位。只有输入数字才发送一个运动目标。')
+    print('命令：数字=移动；open/张开=记录张开点；close/闭合=记录闭合点；')
+    print('      range 最小 最大=设置本轮允许范围（不运动）；save/保存=预览并确认保存；exit/退出=不保存退出。')
+    try:
+        with module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'], max_position_raw=high) as client:
+            state = read_check_state(client, settings)
+            print(f'当前raw={state.position_raw}，允许范围{low}..{high}，速度{settings["speed"]}%，力矩{settings["torque"]}%。')
+            while True:
+                command = input('校准> ').strip().lower()
+                if command in ('exit', '退出'):
+                    break
+                if command in ('save', '保存'):
+                    if set(points) != {'open', 'close'}:
+                        print('请先移动、观察并分别记录open和close两个端点。')
+                        continue
+                    opened, closed = points['open']['target'], points['close']['target']
+                    if abs(opened - closed) <= 2 * tolerance:
+                        print('两端间距须大于两倍到位容差，请重新移动并记录。')
+                        continue
+                    read_check_state(client, settings)
+                    check = dict(settings['check'], min_raw=min(opened, closed), max_raw=max(opened, closed),
+                                 open_raw=opened, close_raw=closed, tolerance_raw=tolerance,
+                                 calibration=dict(serial=row['serial'], device_id=settings['device_id'],
+                                     confirmed_at=datetime.now().astimezone().isoformat(),
+                                     open_actual_raw=points['open']['actual'], close_actual_raw=points['close']['actual'],
+                                     scope='user_confirmed_working_range'))
+                    print(f'待保存：张开raw={opened}（实际{points["open"]["actual"]}），'
+                          f'闭合raw={closed}（实际{points["close"]["actual"]}），范围{check["min_raw"]}..{check["max_raw"]}。')
+                    print('原始值增大表示' + ('张开' if opened > closed else '闭合') + '；这是人工确认的工作范围，不是自动测得的机械极限。')
+                    if input('输入“确认”或 yes 写入配置，其他输入继续校准：').strip().lower() not in ('确认', 'yes'):
+                        continue
+                    backup = save_calibration(path, original, nodes, side, check)
+                    print(f'已保存{LABELS[side]}的check，原配置备份：{backup}')
+                    return dict(status='saved', side=side, check=check, backup=str(backup))
+                if command.startswith(('range ', '范围 ')):
+                    try:
+                        _, lo, hi = command.split()
+                        new_check = dict(settings['check'], min_raw=int(lo), max_raw=int(hi))
+                        new_settings = dict(settings, check=new_check)
+                        new_low, new_high, _, _ = gripper_limits(new_settings)
+                        state = client.read_state(settings['device_id'])
+                        if state.has_error:
+                            raise RuntimeError('夹爪有报警，校准终止')
+                        if not max(0, new_low - tolerance) <= state.position_raw <= new_high + tolerance:
+                            raise ValueError('新范围必须覆盖当前实际位置')
+                    except ValueError as exc:
+                        print(f'范围未改变：{exc}；格式：range 0 4000')
+                        continue
+                    settings = new_settings
+                    low, high = new_low, new_high
+                    client.max_position_raw = high
+                    points = {key: point for key, point in points.items() if low <= point['target'] <= high}
+                    last = None
+                    print(f'本轮允许范围已设为{low}..{high}，未发送运动、未写配置。请分级输入目标，不直接跳到未知端点。')
+                    continue
+                if command in ('open', '张开', 'close', '闭合'):
+                    key = 'open' if command in ('open', '张开') else 'close'
+                    if last is None or not last['arrived']:
+                        print('先输入一个目标并确认到位，再观察并记录端点。')
+                        continue
+                    state = read_check_state(client, settings)
+                    if not reached(state, last['target_raw'], tolerance):
+                        last = None
+                        print('实时位置不再符合上次到位结果；请重新输入目标验证。')
+                        continue
+                    points[key] = dict(target=last['target_raw'], actual=state.position_raw)
+                    print(f'已记录{key}：目标raw={last["target_raw"]}，实际raw={state.position_raw}。')
+                    continue
+                try:
+                    target = int(command)
+                    if not low <= target <= high:
+                        raise ValueError(f'目标须在{low}..{high}，扩大范围请明确输入 range 最小 最大')
+                except ValueError as exc:
+                    print(f'未发送动作：{exc}')
+                    continue
+                last = execute_check_move(client, settings, row, target)
+                print_motion(last)
+                if not last['arrived']:
+                    print('本点不可记录，校准结束且不保存；请检查遇阻或超时原因。最后目标可能继续生效。')
+                    return dict(status='failed', side=side, last_move=last)
+    except (EOFError, KeyboardInterrupt):
+        print('\n校准中断，不保存；最后目标和保持力矩可能继续生效。')
+    print('校准退出，配置未更改；不自动张开或掉使能。')
+    return dict(status='cancelled', side=side)
 
 
 def check_grippers(rows, config):
@@ -367,8 +543,7 @@ def print_report(report):
         print('带名称和序列号的拼图：' + report['snapshot']['overview'])
     if report.get('gripper_motion'):
         motion = report['gripper_motion']
-        print(f"{LABELS[motion['side']]} 检查目标raw={motion['target_raw']}；"
-              f"实际raw={motion['final']['position_raw']}；完成原因={motion['final']['completion']}")
+        print_motion(motion)
         print('串口已关闭；保持最后目标和力矩，不自动张开或掉使能。')
     if report['backup']:
         print('路径已更新，原配置备份：' + report['backup'])
@@ -388,17 +563,20 @@ def main(argv=None):
     parser.add_argument('--output-dir', type=Path, help='拍照输出目录，须为新目录；默认保存到本仓库work_dirs')
     parser.add_argument('--gripper', choices=('left', 'right'), help='仅操作指定侧夹爪，用于空载设备辨认')
     actions = parser.add_mutually_exclusive_group()
-    actions.add_argument('--position-raw', type=int, choices=(0, 1000), help='小范围辨认位置，仅0或1000')
+    actions.add_argument('--position-raw', type=int, help='所选夹爪min_raw..max_raw内的任意整数位置')
     actions.add_argument('--open', dest='open_gripper', action='store_true', help='方向确认配置后，移动到检查张开位置')
     actions.add_argument('--close', dest='close_gripper', action='store_true', help='方向确认配置后，移动到检查闭合位置')
+    actions.add_argument('--calibrate', action='store_true', help='交互式确认所选夹爪的工作范围和开合方向')
     args = parser.parse_args(argv)
-    has_action = args.position_raw is not None or args.open_gripper or args.close_gripper
+    has_action = args.position_raw is not None or args.open_gripper or args.close_gripper or args.calibrate
     if bool(args.gripper) != bool(has_action):
-        parser.error('--gripper left/right 必须配合 --position-raw 0/1000 或 --open/--close')
+        parser.error('--gripper left/right 必须配合 --position-raw 整数、--open/--close 或 --calibrate')
     if args.snapshot and args.gripper:
         parser.error('拍照和夹爪动作请分开执行')
     if (args.snapshot or args.gripper) and (args.update or args.check_grippers):
         parser.error('拍照/夹爪动作不能和 --update 或 --check-grippers 混用')
+    if args.calibrate and args.json:
+        parser.error('--calibrate 是交互模式，不能与 --json 混用')
     if args.output_dir is not None and not args.snapshot:
         parser.error('--output-dir 仅用于 --snapshot')
     try:
@@ -418,6 +596,9 @@ def main(argv=None):
                       update_requested=args.update)
         if args.snapshot:
             report['snapshot'] = take_snapshots(config, rows, args.output_dir)
+        if args.calibrate:
+            result = calibrate_gripper(config, rows, args.gripper, path, original, nodes)
+            return 0 if result['status'] == 'saved' else 1
         if args.gripper:
             action = 'open' if args.open_gripper else 'close' if args.close_gripper else 'position'
             report['gripper_motion'] = move_gripper(config, rows, args.gripper, action, args.position_raw)
@@ -425,7 +606,9 @@ def main(argv=None):
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print_report(report)
-        if args.snapshot or args.gripper:
+        if args.gripper:
+            return 0 if report['gripper_motion']['arrived'] else 1
+        if args.snapshot:
             return 0
         return int(any(row['status'] != 'matched' or row.get('gripper_error') or
                        any(row.get('gripper_state', {}).get(k, 0) for k in ('alarm_a', 'alarm_b'))

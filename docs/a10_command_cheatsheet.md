@@ -29,50 +29,93 @@ python scripts/a10_devices.py --check-grippers
 - 其他参数：`--config 路径` 指定另一份设备清单；`--json` 输出所有识别到的接口、格式及匹配结果。
   返回码：0=已匹配且可选夹爪查询无报警；1=缺失/需更新/不唯一/查询失败或夹爪有报警；2=配置或扫描失败。
 
-## 用图片和小范围动作辨认设备
+## 用图片和原始位置检查设备
 
-这些命令只检查本机相机/夹爪，不连接机械臂控制器。夹爪动作请先确认空载、手指离开夹口，
-每次只执行一条并观察对应实物。拍照和夹爪动作不能混在同一条命令中。
+这些命令只检查本机相机/夹爪。夹爪动作先确认空载、手指离开夹口，每次只执行一条并观察。
+拍照和夹爪动作分开执行；默认设备扫描不会发送动作。
 
 ```bash
-# 三台相机各拍一张，并生成带中文名称、用途名、序列号的overview.jpg
+# 三台相机各拍一张，并生成带名称、用途名、序列号的overview.jpg
 python scripts/a10_devices.py --snapshot
 
-# 左夹爪：先移到检查位置1000，观察后再单独执行位置0
-python scripts/a10_devices.py --gripper left --position-raw 1000
-python scripts/a10_devices.py --gripper left --position-raw 0
-
-# 右夹爪：同样分两次执行
-python scripts/a10_devices.py --gripper right --position-raw 1000
-python scripts/a10_devices.py --gripper right --position-raw 0
+# 输入所选夹爪配置范围内的任意整数raw位置；当前初始范围为0..3000
+python scripts/a10_devices.py --gripper left --position-raw 1739
+python scripts/a10_devices.py --gripper right --position-raw 2500
 ```
 
-拍照默认保存在 `work_dirs/a10/hardware_checks/device_check_时间戳/`；终端打印完整路径。
-包含 `base_0_rgb.jpg`、`left_wrist_0_rgb.jpg`、`right_wrist_0_rgb.jpg`、`overview.jpg`、`manifest.json`。
-单张图片保留原始画面，拼图另加标签；不自动旋转或镜像。照片不是硬件曝光同步的训练数据。
-可以用 `--snapshot --output-dir 新目录` 指定位置，已有目录拒绝覆盖。
-本轮实机图片在 `work_dirs/a10/hardware_checks/20261105_164809/device_images/overview.jpg`。
+拍照默认保存在 `work_dirs/a10/hardware_checks/device_check_时间戳/`，终端打印完整路径。
+包含三张按相机用途命名的JPEG、`overview.jpg`、`manifest.json`。画面按各相机的 `rotate_180`
+配置输出，拼图另加标签；不代表硬件曝光同步。`--snapshot --output-dir 新目录` 可指定新目录，已有目录拒绝覆盖。
 
-- 拍照要求所有配置相机身份和路径匹配；夹爪动作只要求选中的夹爪匹配，另一只离线不影响辨认。
-  路径变化先单独执行 `--update`；动作不静默使用替代路径，也不自动分配新设备。
-- 夹爪固定为本次已验证的raw `0` / `1000` 两个检查位置，按配置speed=5%、torque=60%运行，
-  只允许降低速度/力矩；不是毫米，也不是完整张开/闭合。实际位置超出0..1000附近会拒绝动作。
-- 动作会按已有驱动使能选中的夹爪，等待最多10秒并显示实际位置和完成原因。
-  `position_reached`表示到位；`torque_reached`表示遇阻/力矩到达，不代表到达目标位置或已经夹稳。
-  超时不自动重发，报警不自动清除；退出不自动张开或掉使能，最后目标及保持力矩可能继续生效。
+`a10_devices.py` 中每侧的 `check` 独立生效：
 
-**开合方向确认后**，在 `a10_devices.py` 对应侧的 `check` 中填写 `open_raw` / `close_raw`，
-两个值分别为0或1000，必须不同；目前均为None，避免猜错方向。之后可使用：
+```python
+check=dict(
+    min_raw=0,
+    max_raw=3000,       # 当前允许的测试范围，不是已测得的物理极限
+    open_raw=None,      # 确认张开位置后保存
+    close_raw=None,     # 确认闭合位置后保存
+    tolerance_raw=5,    # 原始位置到位容差
+    move_timeout_s=10,
+)
+```
+
+- 命令行目标、驱动上限及实际位置检查统一读取范围；修改配置后下次启动生效。
+  范围外目标、身份/路径不匹配、报警或实际位置超出范围附近时拒绝动作。路径变化先单独执行 `--update`。
+- 每次只操作选中侧，其他设备离线不阻止该侧检查。使用配置速度/力矩，当前为5%/60%，检查入口仍限制speed<=5%、torque<=60%。
+- 终端输出初始值、目标、实际反馈、误差、耗时和结果。连续两次收到位置到达状态，且误差在容差内才算到位。
+  `torque_reached`仅表示遇阻，`timeout`表示未确认到位，两者都返回失败，不能当成量程端点。
+- 运动指令按原驱动使能夹爪；超时不自动重发，报警不自动清除，退出不自动张开或掉使能。
+  最后目标及保持力矩可能继续生效。raw不是毫米，当前3000上限也不表示完整行程。
+
+## 逐侧确认工作量程及开合方向
+
+```bash
+# 左侧做完后，再单独运行右侧
+python scripts/a10_devices.py --gripper left --calibrate
+python scripts/a10_devices.py --gripper right --calibrate
+```
+
+进入 `校准>` 后，不会自动运动。按屏幕提示输入：
+
+| 输入 | 功能 |
+| --- | --- |
+| 一个整数，如 `1000`、`2000` | 发送一个目标，等待并显示实际位置；逐级验证，不直接跳未知端点 |
+| `open` 或 `张开` | 观察当前确实是合适的张开端后，记录刚刚确认到位的目标和实际值 |
+| `close` 或 `闭合` | 观察当前确实是合适的闭合端后，同样记录 |
+| `range 0 4000` | 明确设置本轮允许范围；只改变本次校准的检查范围，不发送运动、不立即写配置 |
+| `save` 或 `保存` | 展示两个端点、工作范围和原始值方向；再输入 `确认` 或 `yes` 才保存 |
+| `exit` 或 `退出` | 放弃本轮修改并退出 |
+
+具体操作：先在当前范围内逐步输入位置，观察张开方向；到达合适的张开端后输入 `open`。
+再逐步移动到合适的闭合端并输入 `close`，最后 `save`、核对、`确认`。
+如果当前上限不够，先明确输入如 `range 0 4000`，再分级测试。新范围必须覆盖当前实际位置。
+不要依靠自动碰撞硬限位来找范围；保存的是人工确认、留有余量的工作范围。
+
+程序要求两个端点都曾确认到位，记录时再次回读，且间距大于两倍到位容差。
+遇阻/超时会结束本轮校准且不保存；无目标到位记录、端点相同/太近或未确认保存时不写配置。
+`Ctrl+C` / 输入结束也放弃保存，但不能据此认为最后运动目标已经取消。
+
+保存前自动生成 `a10_devices.py.时间戳.bak`；仅替换选中侧的 `check`，保留身份、另一侧、相机及其他参数。
+若配置在校准期间被其他程序修改，拒绝覆盖。结果包括：
+
+- `min_raw/max_raw`：两端目标中的较小值和较大值。
+- `open_raw/close_raw`：人工确认的张开、闭合目标，允许原始值增大时代表闭合。
+- `calibration`：USB序列号、Modbus ID、两端实际反馈和确认时间。更换设备身份后命名开合拒绝复用旧记录。
+
+保存后可直接检查两端：
 
 ```bash
 python scripts/a10_devices.py --gripper left --open
 python scripts/a10_devices.py --gripper left --close
-python scripts/a10_devices.py --gripper right --open
-python scripts/a10_devices.py --gripper right --close
 ```
 
-这些名称也只代表检查开/合位置，不是全行程标定。位置参数或方向未知时，在打开串口前就拒绝执行。
-输出可加 `--json` 保存为机器可读结果；操作失败返回2，无硬件操作的扫描返回码保持原有约定。
+右侧把 `left` 改成 `right`。`--open/--close` 对应保存的工作端点，并非厂商硬限位。
+以后VR的开口比例可按 `target_raw = close_raw + ratio * (open_raw - close_raw)` 映射，
+其中0闭合、1张开。此处只保存端点，尚未接入双臂VR；需要毫米数据时还需另做开口测量标定。
+
+普通动作可加 `--json` 输出结果；交互校准不能与 `--json`、更新路径、拍照、全夹爪状态查询混用。
+动作返回码：0=确认到位，1=遇阻/超时；校准0=保存成功，1=退出未保存或未到位；配置、设备或通信错误返回2。
 
 ## 当前设备绑定：双知行夹爪 + 三路相机（2026-11-05）
 
@@ -122,7 +165,7 @@ python fluxvla/engines/operators/zx_gripper.py \
 确需清除时，单独使用 `--reset-alarm --state`；清除本身不发送新的位置目标。
 
 **此配置是已核对的设备清单，尚未自动接入双臂 VR 夹爪控制。**
-两只夹爪的完整行程、开合方向及 raw→mm 标定未验收；三路相机ID与彩色读取均已确认。
+两只夹爪的工作端点和开合方向待用上述校准命令确认，raw→mm尚未标定；三路相机ID与彩色读取均已确认。
 三视角清单不代表双臂数据录制已接线；知行 raw 也不能直接填入旧数据的夹爪毫米字段。
 
 ## 之前的运行命令与配置记录

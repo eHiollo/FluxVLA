@@ -475,5 +475,30 @@ class GripperRangeTests(unittest.TestCase):
         self.run_wizard(['0', 'open', '5', 'close', 'save', 'exit'], expected='cancelled')
 
 
+    def test_calibration_can_enter_outside_old_range_without_any_motion(self):
+        self.transport.position = 9000
+        self.run_wizard(['exit'], expected='cancelled')
+        self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+    def test_outside_range_target_is_blocked_but_prompt_remains_available(self):
+        self.transport.position = 9000
+        self.run_wizard(['1000', 'range 0 8000', 'range 0 9000', 'exit'], expected='cancelled')
+        self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+    def test_calibration_saves_9000_after_explicit_range_and_verified_endpoints(self):
+        self.transport.position = 9000
+        _, cfg = self.run_wizard(['range 0 9000', '9000', 'open', '0', 'close', 'save', 'yes'])
+        self.assertEqual(cfg['grippers']['left']['check']['max_raw'], 9000)
+        self.assertEqual(cfg['grippers']['left']['check']['open_raw'], 9000)
+        self.assertEqual(cfg['grippers']['left']['check']['calibration']['open_actual_raw'], 9000)
+
+    def test_outside_initial_range_does_not_bypass_alarm_check(self):
+        self.transport.position = 9000
+        self.transport.alarms = (0, 0x1000)
+        with self.assertRaisesRegex(RuntimeError, '有报警'):
+            self.run_wizard(['exit'], expected='cancelled')
+        self.assertTrue(all(packet[1] == 3 for packet in self.transport.writes))
+
+
 if __name__ == '__main__':
     unittest.main()

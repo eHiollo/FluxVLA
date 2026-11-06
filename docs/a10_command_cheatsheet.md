@@ -76,6 +76,10 @@ python scripts/a10_devices.py --gripper left --calibrate
 python scripts/a10_devices.py --gripper right --calibrate
 ```
 
+即使实际位置已超出旧配置（例如反馈9000、旧范围0..3000），也允许进入校准并只读显示。
+此时先输入 `range 0 9000` 让本轮范围覆盖当前位置；未完成范围核对前，运动目标仍被拒绝，提示符保留。
+进入校准本身不会自动把夹爪拉回旧范围，也不会自动将9000写成量程上限。
+
 进入 `校准>` 后，不会自动运动。按屏幕提示输入：
 
 | 输入 | 功能 |

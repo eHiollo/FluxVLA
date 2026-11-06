@@ -325,12 +325,12 @@ def reached(state, target, tolerance):
             and abs(state.position_raw - target) <= tolerance)
 
 
-def read_check_state(client, settings):
+def read_check_state(client, settings, *, require_range=True):
     low, high, tolerance, _ = gripper_limits(settings)
     state = client.read_state(settings['device_id'])
     if state.has_error:
         raise RuntimeError(f'夹爪有报警：0x{state.alarm_a:04X}/0x{state.alarm_b:04X}')
-    if not max(0, low - tolerance) <= state.position_raw <= high + tolerance:
+    if require_range and not max(0, low - tolerance) <= state.position_raw <= high + tolerance:
         raise ValueError(f'实际位置raw={state.position_raw}超出当前配置范围{low}..{high}附近；请先核对范围')
     return state
 
@@ -421,7 +421,10 @@ def calibrate_gripper(config, rows, side, path, original, nodes):
     print('      range 最小 最大=设置本轮允许范围（不运动）；save/保存=预览并确认保存；exit/退出=不保存退出。')
     try:
         with module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'], max_position_raw=high) as client:
-            state = read_check_state(client, settings)
+            state = read_check_state(client, settings, require_range=False)
+            if not max(0, low - tolerance) <= state.position_raw <= high + tolerance:
+                print(f'当前位置raw={state.position_raw}超出原配置{low}..{high}；仅查询，不自动移动。')
+                print('请先输入 range 最小 最大，让本轮允许范围覆盖当前位置，再逐步验证。')
             print(f'当前raw={state.position_raw}，允许范围{low}..{high}，速度{settings["speed"]}%，力矩{settings["torque"]}%。')
             while True:
                 command = input('校准> ').strip().lower()
@@ -491,7 +494,12 @@ def calibrate_gripper(config, rows, side, path, original, nodes):
                 except ValueError as exc:
                     print(f'未发送动作：{exc}')
                     continue
-                last = execute_check_move(client, settings, row, target)
+                try:
+                    last = execute_check_move(client, settings, row, target)
+                except ValueError as exc:
+                    last = None
+                    print(f'未发送动作：{exc}；可先用range核对本轮允许范围。')
+                    continue
                 print_motion(last)
                 if not last['arrived']:
                     print('本点不可记录，校准结束且不保存；请检查遇阻或超时原因。最后目标可能继续生效。')

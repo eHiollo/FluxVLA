@@ -177,23 +177,24 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --al
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `target_rate_raw_s` | 1800 | 满摇杆时的目标变化速度，raw/秒；实际运动仍受电机速度及跟踪误差限制 |
+| `devices.left/right.speed` | 各15 | 两侧VR夹爪电机速度百分比，允许整数1～15 |
+| `target_rate_raw_s` | 3000 | 满摇杆时的目标变化速度，raw/秒；实际运动仍受电机速度及跟踪误差限制 |
 | `deadzone` | 0.1 | 摇杆回中死区 |
 | `direction.left/right` | 各1 | 设-1反转对应侧的摇杆开合方向 |
-| `max_lead_raw` | 300 | 目标最多领先实际位置的原始值，减少积压目标及回中后拖动 |
+| `max_lead_raw` | 600 | 目标最多领先实际位置的原始值，减少积压目标及回中后拖动 |
 | `io_hz` | 20 | 每侧后台串口循环频率 |
 | `input_timeout_s` | 0.25 | 手柄样本过期后不再更新目标 |
 | `feedback_timeout_s` | 0.5 | 夹爪反馈失效/串口读取过慢时中止本次遥操作 |
 
 夹爪速度分两层：
 
-- 摇杆目标变化速度在 `configs/a10/a10_dual_arm_vr_teleop.py` 的 `target_rate_raw_s`，默认1800。
-  原启动命令的 `--cfg-options` 中增加 `teleop.zx_grippers.target_rate_raw_s=3000` 可以提高该值。
-- 电机速度在 `configs/a10/a10_devices.py` 各侧的 `speed=5`，单位是百分比；力矩是 `torque=60`。
-  VR入口允许整数1～15%，默认5%；设备检查/标定入口仍限制speed<=5%。
-  VR调速使用下面的命令覆盖，避免修改共用设备清单后影响检查程序。
+- 摇杆目标变化速度在 `configs/a10/a10_dual_arm_vr_teleop.py` 的 `target_rate_raw_s`，默认3000。
+- VR配置继承 `configs/a10/a10_devices.py` 的设备身份、量程等信息，并将两侧电机速度分别覆盖为15%；
+  力矩为60%。设备清单自身的速度仍为5%，设备检查/标定入口仍限制speed<=5%。
+  VR调速可在命令中覆盖 `teleop.zx_grippers.devices.left/right.speed`，允许整数1～15%。
 
-双臂VR启用夹爪并将两侧电机速度设为10%（每行末尾的反斜杠后不要加空格）：
+2026-11-06用户实机反馈：两侧电机15%、目标速率3000raw/s、最大领先量600raw使用效果良好，
+现已设为双臂VR配置默认值。使用以下命令即可，不必再写这四项速度参数：
 
 ```bash
 python scripts/teleoperate.py \
@@ -202,10 +203,7 @@ python scripts/teleoperate.py \
     teleop.vr_only=False \
     teleop.observe_only=False \
     teleop.operator.allow_motion=True \
-    teleop.zx_grippers.enabled=True \
-    teleop.zx_grippers.devices.left.speed=10 \
-    teleop.zx_grippers.devices.right.speed=10 \
-    teleop.zx_grippers.target_rate_raw_s=3000
+    teleop.zx_grippers.enabled=True
 ```
 
 两侧speed可分别设为1～15的整数，超过15或填写小数会在连接设备前报错。

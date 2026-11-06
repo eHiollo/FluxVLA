@@ -203,6 +203,11 @@ class DualZXRuntimeTest(unittest.TestCase):
     def test_config_defaults_and_opt_in_preview_never_open_usb(self):
         cfg = configuration()
         self.assertFalse(cfg.zx_grippers.enabled)
+        self.assertEqual(cfg.zx_grippers.target_rate_raw_s, 3000.)
+        self.assertEqual(cfg.zx_grippers.max_lead_raw, 600.)
+        for side in ('left', 'right'):
+            self.assertEqual(cfg.zx_grippers.devices[side].speed, 15)
+            self.assertEqual(device(side)['speed'], 5)
         cfg.zx_grippers.enabled = True
         with patch('serial.Serial') as serial:
             rt = build_runtime(cfg)

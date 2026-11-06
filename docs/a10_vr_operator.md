@@ -693,3 +693,7 @@ VROperator保留每手摇杆X输入；DualVRTeleopRuntime内各有一个独立�
 清理先取消所有夹爪发送，再处理原机械臂停止和资源释放；夹爪串口只由所属线程关闭，不自动掉使能。
 VR-only、observe和preview不打开知行串口。gripper_command诊断按物理手柄命名。
 软件测试通过，现场联动验收待用户执行，不将软件发送成功当作真实抓取成功。
+
+2026-11-06用户已实机确认夹爪开合手感：左右电机speed=15%、target_rate_raw_s=3000、
+max_lead_raw=600，现设为a10_dual_arm_vr_teleop.py默认值。VR仍需显式开启zx_grippers；
+共用设备清单保留speed=5%供设备检查/标定使用。该反馈确认开合体验，不代表已完成数据录制或抓取任务验收。

@@ -18,9 +18,12 @@ teleop = dict(
         max_reference_lead_m=.02, max_reference_lead_rad=.12,
     ),
     zx_grippers=dict(
-        enabled=False, devices={{_base_.grippers}},
-        target_rate_raw_s=1800., deadzone=.1, direction=dict(left=1, right=1),
-        max_lead_raw=300., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5),
+        # 2026-11-06: user-confirmed live settings; device checks retain 5%.
+        enabled=False, devices=dict(
+            left=dict(_base_.grippers.left, speed=15),
+            right=dict(_base_.grippers.right, speed=15)),
+        target_rate_raw_s=3000., deadzone=.1, direction=dict(left=1, right=1),
+        max_lead_raw=600., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5),
     pose_calibration_path=None,
     # Onsite .150: physical left arm is ee 1 (operator key 'right'), right is ee 0.
     # Swap input bindings only; keep GET mappings and UDP row order unchanged.

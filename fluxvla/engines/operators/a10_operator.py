@@ -1105,7 +1105,10 @@ class A10Operator(BaseOperator):
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
             info = state.raw['ret_context'].get('robot_msg', {})
             if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
-                raise RuntimeError('Follower start requires Enabled and Stopped feedback')
+                raise RuntimeError(
+                    'Follower start requires Enabled and Stopped feedback; '
+                    f"got activate={info.get('activate')!r}, motion={info.get('motion')!r}. "
+                    'Confirm Enabled and Stopped on the pendant or A10 console before VR takeover.')
             coordinate = state.raw['ret_context']['motion_msg'].get('jog_coordinate')
             if mode == 'cartesian' and coordinate not in ('Base', 'Tool', 'Wobj'):
                 raise RuntimeError(

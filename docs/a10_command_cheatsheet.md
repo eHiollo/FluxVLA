@@ -146,6 +146,21 @@ python scripts/teleoperate.py \
 `vr_only=True` 或 `--observe` 时也不打开知行串口。默认夹爪开关为False，旧单臂/老夹爪入口沿用原逻辑。
 不要同时运行设备动作/校准脚本或其他程序占用相同夹爪串口。
 
+机械臂需先由现场明确使能；`allow_motion=True` 仅允许发送目标，不会自动使能。
+若报 `Follower start requires Enabled and Stopped`，退出VR后可先只读查询：
+
+```bash
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --read-only get
+```
+
+当反馈为Manual、Stopped、无故障且现场允许使能时，由操作者执行：
+
+```bash
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --allow-motion manual_en
+```
+
+等待终端确认Enabled，再重新启动VR。若反馈Running或故障，应先现场确认停止/故障原因，不绕过启动检查。
+
 首次验证先松开两手侧键、只推摇杆，确认各自夹爪开合；确认后再按侧键联合操作机械臂。
 启动、手柄断流恢复后，先让各自摇杆回中一下，避免仍按住摇杆时自动续动。
 
@@ -170,7 +185,17 @@ python scripts/teleoperate.py \
 | `input_timeout_s` | 0.25 | 手柄样本过期后不再更新目标 |
 | `feedback_timeout_s` | 0.5 | 夹爪反馈失效/串口读取过慢时中止本次遥操作 |
 
-电机速度和力矩仍读取设备清单的speed=5%、torque=60%，与摇杆目标变化速度不同。
+夹爪速度分两层：
+
+- 摇杆目标变化速度在 `configs/a10/a10_dual_arm_vr_teleop.py` 的 `target_rate_raw_s`，默认1800。
+  原启动命令的 `--cfg-options` 中增加 `teleop.zx_grippers.target_rate_raw_s=3000` 可以提高该值。
+- 电机速度在 `configs/a10/a10_devices.py` 各侧的 `speed=5`，单位是百分比；力矩是 `torque=60`。
+  当前设备检查和VR入口均限制speed<=5%，直接改成10会被拒绝，需要另行调整该速度保护。
+  本轮保持默认电机速度，先修复目标积分与串口调度造成的降速，再根据现场结果决定电机调参。
+
+2026-11-06修复：实际串口循环超过0.1秒时，旧积分最多只计算0.1秒，导致目标速度低于配置。
+现按真实间隔积分，最多计入输入有效期，仍限制工作范围和目标超前量；循环等待扣除I/O耗时。
+20Hz是调度频率上限，不保证串口吞吐达到20Hz；具体手感需现场复验。
 两只夹爪各有后台线程，前台只发布最新输入和读取缓存；无历史目标队列。
 串口内准备参数期间会再次检查输入截止时间及退出标记，过期或取消后不继续触发新的目标。
 已触发的目标不能通过关闭程序自动撤销；停止更新不等于物理立即停止。

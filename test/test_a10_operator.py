@@ -340,6 +340,17 @@ class FakeController:
 
 
 class NetworkTest(unittest.TestCase):
+    def test_follower_precondition_reports_actual_state_without_auto_enable(self):
+        for activation, motion in (('Disabled', 'Stopped'), ('Enabled', 'Running')):
+            with self.subTest(activation=activation, motion=motion), FakeController() as controller:
+                controller.activation, controller.motion = activation, motion
+                operator = controller.operator(feedback_position_unit='mm')
+                with self.assertRaises(RuntimeError) as error:
+                    operator.start_follower()
+                self.assertIn(f"activate={activation!r}", str(error.exception))
+                self.assertIn(f"motion={motion!r}", str(error.exception))
+                self.assertTrue(all(command == 'get' for command in controller.commands))
+
     def test_pe321_preserves_signed_angles_against_native_sdk_samples(self):
         fixture = json.loads((Path(__file__).parent / 'data/vr_control/kaanh_cartesian_wire.json').read_text())
         # Native SDK pq -> pe changes -0.01 degrees into +359.99 degrees.

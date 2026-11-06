@@ -1,6 +1,8 @@
 """Dual VR -> ZX: fake USB ownership and synthetic feedback only."""
 import copy
 import threading
+import tempfile
+import json
 import time
 import unittest
 from pathlib import Path
@@ -85,6 +87,16 @@ class ChannelTest(unittest.TestCase):
         c._choose_target(4500, 2.05, -1., 5.)
         self.assertEqual(c._choose_target(4500, 2.1, -1., 5.)[0], 4590)
 
+    def test_real_serial_interval_is_integrated_instead_of_fixed_100ms(self):
+        opts = options(); opts['max_lead_raw'] = 600.
+        c = self.channel(opts=opts)
+        c._choose_target(4500, 1., 0., 3.)
+        c._choose_target(4500, 1.05, -1., 3.)
+        target, _ = c._choose_target(4500, 1.23, -1., 3.)
+        self.assertEqual(target, 4824)  # 1800 raw/s * 0.18s, not 0.10s
+        target, _ = c._choose_target(4500, 1.5, -1., 3.)
+        self.assertEqual(target, 5100)  # bounded lead remains in force
+
     def test_center_and_stale_input_reset_target_and_require_new_center(self):
         c = self.channel()
         c._choose_target(4500, 1., 0., 2.)
@@ -145,6 +157,10 @@ class ChannelTest(unittest.TestCase):
 
 
 class DualZXRuntimeTest(unittest.TestCase):
+    def setUp(self):
+        self.logs = tempfile.TemporaryDirectory()
+        self.addCleanup(self.logs.cleanup)
+
     def test_config_defaults_and_opt_in_preview_never_open_usb(self):
         cfg = configuration()
         self.assertFalse(cfg.zx_grippers.enabled)
@@ -194,6 +210,7 @@ class DualZXRuntimeTest(unittest.TestCase):
     def live(self):
         cfg = configuration(); cfg.zx_grippers.enabled = True
         cfg.vr_only = False; cfg.operator.allow_motion = True
+        cfg.diagnostics_path = str(Path(self.logs.name) / 'teleop.jsonl')
         rt = build_runtime(cfg)
         rt.robot = DualRobot(); rt.cartesian_adapter = 'legacy_anchor'
         rt.teleoperator.input = HandInput(); rt.vr = rt.teleoperator.input
@@ -216,10 +233,13 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.assertNotIn('start', rt.robot.events)
         rt.close()
         self.assertTrue(all(not c.client.connected for c in rt._zx_channels.values()))
+        records = [json.loads(line) for line in (Path(self.logs.name) / 'teleop.jsonl').read_text().splitlines()]
+        self.assertTrue(any(set(r.get('gripper_command') or {}) == {'left', 'right'} for r in records))
 
     def test_partial_gripper_startup_failure_closes_every_open_channel(self):
         cfg = configuration(); cfg.zx_grippers.enabled = True
         cfg.vr_only = False; cfg.operator.allow_motion = True
+        cfg.diagnostics_path = str(Path(self.logs.name) / 'teleop.jsonl')
         rt = build_runtime(cfg); rt.robot = DualRobot()
         rt.teleoperator.input = HandInput(); rt.vr = rt.teleoperator.input
         for channel in rt._zx_channels.values(): channel.client = FakeZX()

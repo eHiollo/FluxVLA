@@ -101,7 +101,7 @@ class _ZXGripperChannel:
                 raise RuntimeError(f'ZX {self.side} serial worker did not finish; close unconfirmed')
 
     def _choose_target(self, actual, now, axis, deadline):
-        dt = 0. if self._last_tick is None else max(0., min(now - self._last_tick, 2. / self.options['io_hz']))
+        dt = 0. if self._last_tick is None else max(0., min(now - self._last_tick, self.options['input_timeout_s']))
         self._last_tick = now
         if now >= deadline:
             self._need_center, self._active = True, False
@@ -147,7 +147,11 @@ class _ZXGripperChannel:
                 with self._lock:
                     self._state.update(phase='neutral_required', target_raw=self._target)
                 self._ready.set()
-                while not self._stop.wait(1. / self.options['io_hz']):
+                next_tick = time.monotonic() + 1. / self.options['io_hz']
+                while not self._stop.wait(max(0., next_tick - time.monotonic())):
+                    # io_hz is a maximum rate; account for I/O instead of adding
+                    # a full extra period after every serial transaction.
+                    next_tick = time.monotonic() + 1. / self.options['io_hz']
                     state, now = self._read()
                     if self._stop.is_set():
                         break

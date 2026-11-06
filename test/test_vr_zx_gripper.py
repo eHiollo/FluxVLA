@@ -74,6 +74,45 @@ class ChannelTest(unittest.TestCase):
         self.addCleanup(channel.close)
         return channel
 
+    def test_motor_speed_accepts_1_to_15_without_opening_usb(self):
+        with patch('serial.Serial') as serial:
+            for speed in (1, 5, 10, 15):
+                with self.subTest(speed=speed):
+                    settings = device(); settings['speed'] = speed
+                    c = _ZXGripperChannel('left', settings, options())
+                    self.assertEqual(c.speed, speed)
+                    c.close()
+            serial.assert_not_called()
+
+    def test_motor_speed_rejects_out_of_range_and_non_integer_values(self):
+        with patch('serial.Serial') as serial:
+            for speed in (0, 16, 100, 1.5, True, '10'):
+                with self.subTest(speed=speed):
+                    settings = device(); settings['speed'] = speed
+                    with self.assertRaisesRegex(ValueError, 'speed within 1..15%'):
+                        _ZXGripperChannel('left', settings, options())
+            settings = device(); settings.update(speed=15, torque=61)
+            with self.assertRaises(ValueError):
+                _ZXGripperChannel('left', settings, options())
+            serial.assert_not_called()
+
+    def test_worker_forwards_configured_15_percent_speed(self):
+        settings = device(); settings['speed'] = 15
+        c = _ZXGripperChannel('left', settings, options())
+        self.addCleanup(c.close)
+        fake = FakeZX(); c.client = fake
+        with patch.object(fake, 'set_position_raw', wraps=fake.set_position_raw) as send:
+            c.connect()
+            c.submit(0., time.monotonic() + .5)
+            wait_for(lambda: c.snapshot()['phase'] == 'centered')
+            c.submit(-1., time.monotonic() + .5)
+            wait_for(lambda: len(fake.targets) > 0)
+            c.close()
+            self.assertTrue(send.call_args_list)
+            for call in send.call_args_list:
+                self.assertEqual(call.kwargs['speed'], 15)
+                self.assertEqual(call.kwargs['torque'], 60)
+
     def test_neutral_gate_open_close_direction_and_lead_limit(self):
         c = self.channel()
         self.assertEqual(c._choose_target(4500, 1., 1., 5.)[1], 'neutral_required')

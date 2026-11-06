@@ -1193,3 +1193,21 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
   没有连接实机或下发动作。未扩展为对全部console/推理功能的完整回归或实机验收。
 - 命令速查5处旧工作树入口已更新为主目录。迁回时主目录已有控制台进程，未替用户关闭或重启；
   该进程继续使用原已加载对象，后续使用新配置需由用户退出后重新启动。
+
+
+### 2026-11-06：清理冗余FluxVLA工作树
+
+- 用户要求检查其余工作树，冗余的直接移除。核对FluxVLA_follower/89c2563及
+  FluxVLA_vr/kaanh_follower_vr/d54727f均为当前kaanh_follower的祖先，无独有未合并提交。
+  follower未提交CLI与主目录逐字节一致；VR没有跟踪文件修改，但存在独有未跟踪附件、文档及历史日志。
+- 主目录代码/配置和fluxvla环境未发现指向两旧目录的硬编码运行依赖或资源软链接。
+  旧目录仅有两个空闲终端停留，无机器人程序运行；未关闭用户终端或任何控制程序。
+- 清理前备份至/home/robot/VLA/FluxVLA_migration_backups/retire_worktrees_20261106_150938：
+  每个工作树保存HEAD、状态、补丁和逐文件清单；与主目录相同的文件逐个SHA256核对，
+  独有资料按相对路径写入tar.gz并重新读取校验。VR归档32项约123MB，含协议附件、知行资料包、
+  控制器检查文档、标定及历史诊断资料；follower归档1份重名空日志。可重建Python字节码缓存不归档。
+- 二次确认未提交状态/文件清单未变化后，通过git worktree remove移除FluxVLA_follower及FluxVLA_vr。
+  当前只保留/home/robot/VLA/FluxVLA工作树及kaanh_follower分支；旧分支和备份分支均未删除。
+  主目录CLI哈希清理前后相同，保持未提交；现有模型、数据、运行日志和本地配置未删除。
+- 本次为工作树及文档清理，无业务代码改动。移除后主目录实机配置preview通过，
+  从仓库外验证fluxvla仍从主目录导入。未连接设备或下发动作；命令速查更新统一入口及旧终端切换提示。

@@ -88,10 +88,13 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
     if not robot._init_motion_lock.acquire(blocking=False):
         raise RuntimeError('Initialization is already running')
     claimed = attempted = False
+    speed_restore = None
+    motion_percent = 5
     previous_mode = robot.command_mode
     result = dict(arms_arrived=False, grippers_initialized=False,
                   follower_stopped=False, completed=False, phase='preflight',
-                  joint_packets_sent=0, error=None, stop_error=None)
+                  joint_packets_sent=0, error=None, stop_error=None,
+                  original_speed=None, speed_restored=False, speed_restore_error=None)
     robot.last_init_motion = result
     failure = None
     try:
@@ -99,6 +102,17 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
         claimed = True
         check_cancelled()
         robot._prepare_init_motion()
+        check_cancelled()
+        result['phase'] = 'setting_speed'
+        original_speed = robot.get_speed_override()
+        result['original_speed'] = dict(original_speed)
+        # Retain the snapshot even if setting succeeds but its reply is lost.
+        speed_restore = dict(original_speed)
+        if original_speed['percent'] != motion_percent:
+            robot.set_speed_override(motion_percent, expected_mode=original_speed['mode'],
+                                     expected_percent=original_speed['percent'])
+        if progress:
+            progress(f"回位速度倍率设为 {motion_percent}%，结束后恢复为 {original_speed['percent']:g}%。")
         check_cancelled()
         joint_map(robot._read_init_joints(), robot.joint_dofs, 'actual joints')
         robot._traj_stop_event.clear()
@@ -175,11 +189,36 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
                     raise InitMotionError(failure, stop_error, result['phase'],
                                           result['joint_packets_sent']) from failure
         finally:
-            robot.command_mode = previous_mode
-            if claimed:
-                robot._release_init_motion()
-            robot._init_motion_lock.release()
-    result['completed'] = result['arms_arrived'] and result['follower_stopped']
+            try:
+                if speed_restore is not None:
+                    try:
+                        current = robot.get_speed_override()
+                        if (current['mode'] != speed_restore['mode']
+                                or current['percent'] not in (motion_percent, speed_restore['percent'])):
+                            raise RuntimeError('Controller mode or speed changed; preserving site settings')
+                        if current['percent'] != speed_restore['percent']:
+                            # The existing setter confirms inactive + Stopped before restoring.
+                            # Allow cleanup after stop without re-enabling target sending.
+                            robot.set_speed_override(
+                                speed_restore['percent'], expected_mode=speed_restore['mode'],
+                                expected_percent=current['percent'], allow_cancelled=True)
+                        result['speed_restored'] = True
+                        if progress:
+                            progress(f"速度倍率已恢复为 {speed_restore['percent']:g}%。")
+                    except Exception as restore_error:
+                        result['speed_restored'] = False
+                        result['speed_restore_error'] = f'{type(restore_error).__name__}: {restore_error}'
+                        if progress:
+                            progress(f'速度倍率恢复未确认：{restore_error}')
+                        if failure is None and result['stop_error'] is None:
+                            raise RuntimeError(f'初始化运动已结束，但速度倍率恢复未确认：{restore_error}') from restore_error
+            finally:
+                robot.command_mode = previous_mode
+                if claimed:
+                    robot._release_init_motion()
+                robot._init_motion_lock.release()
+    result['completed'] = (result['arms_arrived'] and result['follower_stopped']
+                           and result['speed_restored'])
     if not result['completed']:
         raise RuntimeError('Initialization follower stop was not confirmed')
     result['phase'] = 'complete'

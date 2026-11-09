@@ -421,7 +421,8 @@ class _FollowerConnection:
 
     def send_command(self, command):
         if (self.command_cancelled is not None and self.command_cancelled.is_set()
-                and command.split(maxsplit=1)[0] not in ('get', 'stop_follower', 'manual_stop')):
+                and command.split(maxsplit=1)[0] not in (
+                    'get', 'stop_follower', 'manual_stop', 'set_jog_vel', 'set_pgm_vel')):
             raise InterruptedError('当前命令已取消，未发送控制器命令')
         if self.ws is None:
             raise ConnectionError('A10 operator is not connected')
@@ -1145,11 +1146,12 @@ class A10Operator(BaseOperator):
         """Read the current Manual/Auto controller speed percentage."""
         return _speed_override(self.get_state())
 
-    def set_speed_override(self, percent, *, expected_mode, expected_percent=None):
-        """Set and confirm controller speed only while stopped; never change mode."""
+    def set_speed_override(self, percent, *, expected_mode, expected_percent=None,
+                           allow_cancelled=False):
+        """Set speed while stopped; cleanup may restore it without clearing cancellation."""
         _validate_speed_override(percent, expected_mode)
         with self._io_lock:
-            self._require_motion()
+            self._require_motion(allow_cancelled=allow_cancelled)
             from ..communication.a10_shared_connection import SharedFollowerConnection
             if isinstance(self._connection, SharedFollowerConnection):
                 return self._connection.call('speed_override', percent=percent,
@@ -1236,6 +1238,10 @@ class A10Operator(BaseOperator):
             self.command_mode = mode
             self._reset_cartesian_encoding()
             try:
+                if mode == 'joint' and not self.shared_control:
+                    # Enable the follower module before entering the joint plan.
+                    # Shared mode performs both steps under its service control lock.
+                    self._connection.request('start_follower')
                 self._connection.send_command(command)
                 return self._wait_mode(True)
             except A10ControllerError:

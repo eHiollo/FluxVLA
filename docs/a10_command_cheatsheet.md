@@ -318,7 +318,8 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --ho
 该命令更新最新目标，并通过现有 `send_joints` 按默认 30 Hz 持续发送同一个完整关节组。
 即使角度没有变化也重复发送；再次输入 `joints --deg ...` 会替换目标，不排队积累旧目标。
 启动参数 `--joint-hz 30` 可调整频率，须放在 `shell` 前。
-`follower_aj` 只启动 follower，在首次输入目标之前不发 UDP。
+控制台 `follower_aj` 会先发送原生 `start_follower`，收到成功回复后发送 `follower_aj`
+（双臂配置附带 `--vel_percent=100`），再确认 Axis 状态。首次输入目标之前不发 UDP。
 `stop`、`stop_follower`、退出、重连或执行其他控制命令会结束本地持续发送并清除目标；
 `get` / `joints` 查询和 `help` 不结束持续发送。状态查询或发送失败会中止发送并请求停止，
 不会自动恢复旧目标。发送期间定期查询状态，慢 I/O 不追赶补发，因此不是硬实时 30 Hz。
@@ -364,7 +365,10 @@ m_init
 
 回位先停止本次已有跟随；共享 console 会先撤销推理控制权。读取实际关节后启动关节 follower，
 重复发送 `init_position`，同时按反馈间隔查询实际位置。所有关节连续三次误差不超过
-`0.01 rad` 后请求并确认停止 follower。不会自动使能、调速、恢复推理或重试运动命令。
+`0.01 rad` 后请求并确认停止 follower。回位前保存当前模式的速度倍率，临时设为 **5%**；
+手动模式发送 `set_jog_vel --vel_percent=5`，自动模式发送 `set_pgm_vel --vel_percent=5`。
+运动结束并确认停止后恢复原倍率；取消或异常退出也会尝试恢复。停止未确认、连接中断或
+现场已切换模式／修改倍率时不强行覆盖，并明确报告恢复未确认。不会自动使能、恢复推理或重试运动命令。
 `stop` 可以取消等待并请求停止。中断、故障、反馈缺失及超时也会尝试停止。
 
 `init_motion` 配置发送频率和到位检测：`publish_hz=30`、`tolerance_rad=0.01`、

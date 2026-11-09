@@ -53,6 +53,8 @@ class SharedControl:
     def mode_command(self, command, active, *, stop_motion=False):
         if self.control.ws is None:
             self.control.connect()
+        if active and command.split(maxsplit=1)[0] in ('follower_aj', 'follower_aj_tg'):
+            self.control.request('start_follower')
         self.control.send_command(command)
         if stop_motion:
             self.control.send_command('manual_stop')
@@ -179,6 +181,9 @@ class SharedControl:
                     if role != 'console':
                         raise PermissionError('Only the console may preempt for a control command')
                     self.stop_owner('console_command_preflight')
+                    # A newly requested console command may set its temporary speed
+                    # after the old follower was stopped; target ownership stays empty.
+                    self.revoked.discard(session_id)
                 return dict(owns=self.owner == session_id, stopped_by_service=session_id in self.stopped)
             if op not in ('command', 'request'):
                 raise ValueError(f'Unknown shared operation: {op}')

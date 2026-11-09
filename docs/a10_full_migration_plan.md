@@ -1280,3 +1280,17 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 新库18项CTest全部通过（无跳过），含核心采样/心跳/溢出/分卷/恢复/错误处理、真实SDK临时端口WebSocket指令、断线保存/重连、原初始化转调及可选登录。测试只使用合成控制对象和临时端口，未访问真实总线或下发运动指令。
 - 待部署库`startup_login/libkaanh_startup_login.so.sdk-2.5.10.4.next`及同名入口脚本`kaanhbin.sdk-2.5.10.4.launcher.next`已准备，脚本语法检查通过。库SHA256：`26d425ba1aaa4dd00d444a7ae212629fac7205206c5b9eaca8978809ef2f61f5`。远端状态记录`runtime_recorder/sdk_2_5_10_4_deployment.json`，使用说明同步。
 - 截至准备完成，原控制进程PID2657819仍运行（15:31启动），当前入口和部署库尚未替换；XML及历史日志保持原样。已请求现场正常退出旧进程，收到确认后再核对进程、原子替换入口/库。后续由现场使用原命令启动，静止记录约10秒，验证record_start/status/heartbeat及250Hz左右的实际周期、12轴/valid位、正常结束和丢样计数，再恢复FluxVLA的--record-controller。尚未宣称正式5999与真实PDO验收完成。
+
+### 2026-11-09：0.150入口切换、现场日志验收与断开事件修正（已完成）
+
+- 用户确认旧进程退出后，于16:19原子切换同名kaanhbin启动脚本和SDK2.5.10.4记录库；新版ELF内容保持原SHA256，默认只加载记录模块，不执行扩展库自动登录。XML在准备至切换期间由外部/控制器更新，本次保留退出后的最新配置，切换前后XML校验一致。
+- 用户通过原命令启动新进程PID4178286，确认实际执行kaanhbin.sdk-2.5.10.4、映射新版SDK及记录库。5999无其他已建立控制连接时，仅发送get、record_status、record_start、record_heartbeat，无UDP/使能/跟随/运动命令。
+- 首轮约10秒采样加5秒心跳收尾，共3756周期、250.000Hz，中位间隔3.999553ms、最大4.113827ms；12轴配置、0丢样、无周期缺口、SDK元数据2.5.10.4、CRC与结束记录完整。日志`log/robot_state/2026-11-09_16-22-17.878+0800-p4178286-n8177902577150-0000.rlog`。重连record_status确认不会自动开始记录。本机验收详情`work_dirs/a10/vr/controller_recorder_sdk_2_5_10_4_validation.json`，控制器摘要`runtime_recorder/sdk_2_5_10_4_live_validation.json`。
+- 开始记录前控制器已有Disabled/Stopped、错误-8456（12轴检查模式失败），整段保留该状态。实际位置有效位未置位（各轴掩码752），无效位置保持NaN，不能将“12轴结构存在”解释为实际反馈全部有效；本次没有清错或执行运动验收。
+- 现场发现WebSocket正常关闭及明确TCP关闭均由heartbeat_timeout兜底收尾。加强回环测试：模拟应用在初始化后清空Interface断开回调，并要求结束原因为disconnected；在修正前可复现失败，原测试仅检查文件完整，未识别这项延迟。
+- 在现有sdk_adapter.cpp补Socket::setOnLoseConnection事件桥接，保留原SDK回调，仅对选定5999 Socket原子更新连接状态并请求后台停止；不在Socket回调等待命令锁，不增加轮询线程、网络端口或运动行为。加强后的全部18项CTest通过（无跳过），原SDK临时端口回环约0.20秒完成。
+- 修正库已暂存，SHA256为522062f0fb78a795ad0e61f5b5cfdfc575ef0b8d3fd263579a5c27eb6cabd6aa；源码及首版新版库备份在原备份目录before_socket_bridge/。远端部署报告disconnect_bridge状态为tested_waiting_for_controller_exit；等待用户再次退出当前进程后原子替换最终库、启动并确认现场disconnected结束原因。
+
+- 用户再次退出控制进程后，已原子替换最终库；入口、原SDK2.5.10.4二进制及切换前后XML均保持原样。用户使用原命令重新启动PID384753。现场最终约1秒记录250周期、0丢样，周期中位4.000407ms/最大4.134166ms，实际约249.974Hz；文件CRC及结束记录完整，结束原因已确认disconnected，不再依赖5秒心跳兜底。日志为log/robot_state/2026-11-09_16-33-42.973+0800-p384753-n8862998378568-0000.rlog。
+- 远端部署状态已更新为installed_live_recording_and_disconnect_validated；最终验收摘要runtime_recorder/sdk_2_5_10_4_final_validation.json。本机验收JSON同步final_inspection。最终启动后首次get在record_start前即显示Disabled/Stopped、-506“电机1位置跟随误差过大”，实际0.366514、目标-3.141569；这是当前需另查的实机状态，不能宣称正常运动验收通过。本轮未清错、使能、启动跟随或发送UDP目标。
+- 日志功能恢复完成，仍用sudo ./kaanhbin启动；FluxVLA可在原命令重新加--record-controller。默认不自动开始记录，记录协议和文件格式保持原样。原始备份、首版新版库及最终源码/测试均留在控制器；本地只提交本次开发记录，保留其他会话的operator、m_init、VR和CLI修改。

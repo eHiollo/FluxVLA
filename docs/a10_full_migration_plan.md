@@ -1270,3 +1270,13 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 正在录制或后台正在开始一集时遇到输入暂停，本集失效、停止采样，禁止正常保存；允许用既有二次确认丢弃，暂停期间禁止新集和m_init。恢复后仍需处理异常集再开始新集，避免拼接时间空洞。
 - 127项Python离线回归通过，包含真实mapper位置突跳、旧输入/追踪丢失、持续握持不恢复、冻结帧/触发器/摇杆门槛、再次异常、停止失败、控制器故障、实际反馈重建锚点、只读语义、夹爪取消及异步开始录制的异常；原HUD与新增暂停/恢复Node渲染检查及JS语法检查通过。用户当前完整参数加--preview验证通过，未连接设备或发送运动指令。使用说明更新docs/a10_vr_recording.md第9节；实机手感与头显提示待现场验证。
 - 本次只提交上述VR配置、运行/录制/HUD、测试和说明；保留工作区中既有CLI、operator/共享通信、m_init及其他文档的未提交修改。
+
+### 2026-11-09：0.150控制器记录模块适配SDK 2.5.10.4（已构建，待退出旧进程后切换）
+
+- 按用户审核的最小修改方案，在0.150的`/home/kaanh/Desktop/kaanh-project`复用现有`startup_login`与`runtime_recorder`，保留`sudo ./kaanhbin`入口；不新建另一套记录协议或启动命令。当前直接运行的新版ELF没有加载旧记录库，导致`record_start`返回-40。
+- 先备份当前二进制、旧库、构建/初始化/适配源码、相关测试和说明及XML，目录为`runtime_recorder/backup/sdk_2_5_10_4_20261109_161200`，附逐文件SHA256。新版实际ELF保留为`kaanhbin.sdk-2.5.10.4`，SHA256为`b9a7eb58549a5d259ece9c3db503336efb2da14b8ec79efbe6aa459b51c31ba3`；旧`kaanhbin.original`仍为旧SDK版本，不作为本次启动程序。
+- `startup_login/CMakeLists.txt`增加SDK版本参数，当前为2.5.10.4；新构建目录`build/auto-login-sdk-2.5.10.4`。核对编译头文件和运行依赖全部指向新版SDK，`ldd -r`未报告缺失依赖/未定义符号。适配器日志元数据中的SDK版本改由编译配置提供，不再写死2.5.10.3。
+- 初始化钩子的旧自动登录改为显式`KAANH_STARTUP_AUTO_LOGIN=1`才执行；本次待部署入口设置为0，仅恢复周期记录。保留旧能力的独立测试，并新增默认关闭登录的测试。
+- 新库18项CTest全部通过（无跳过），含核心采样/心跳/溢出/分卷/恢复/错误处理、真实SDK临时端口WebSocket指令、断线保存/重连、原初始化转调及可选登录。测试只使用合成控制对象和临时端口，未访问真实总线或下发运动指令。
+- 待部署库`startup_login/libkaanh_startup_login.so.sdk-2.5.10.4.next`及同名入口脚本`kaanhbin.sdk-2.5.10.4.launcher.next`已准备，脚本语法检查通过。库SHA256：`26d425ba1aaa4dd00d444a7ae212629fac7205206c5b9eaca8978809ef2f61f5`。远端状态记录`runtime_recorder/sdk_2_5_10_4_deployment.json`，使用说明同步。
+- 截至准备完成，原控制进程PID2657819仍运行（15:31启动），当前入口和部署库尚未替换；XML及历史日志保持原样。已请求现场正常退出旧进程，收到确认后再核对进程、原子替换入口/库。后续由现场使用原命令启动，静止记录约10秒，验证record_start/status/heartbeat及250Hz左右的实际周期、12轴/valid位、正常结束和丢样计数，再恢复FluxVLA的--record-controller。尚未宣称正式5999与真实PDO验收完成。

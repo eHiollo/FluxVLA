@@ -45,6 +45,8 @@ class VRInput:
         self._connected = False
         self._vr_event_handler: VREventHandler | None = None
         self.calibration_view = None
+        self.measure_latency = False
+        self.latency = None
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -97,6 +99,10 @@ class VRInput:
         while time.time() < deadline:
             if self._vr_monitor.initialize():
                 self._vr_monitor.https_server.calibration_view = self.calibration_view
+                if self.measure_latency:
+                    from .latency import VRLatencyRecorder
+                    self.latency = VRLatencyRecorder(context=getattr(self, 'latency_context', {}))
+                    self._vr_monitor.vr_server.latency = self.latency
                 init_ok = True
                 break
             time.sleep(0.1)
@@ -262,6 +268,7 @@ class VRInput:
             "xlevr.sample_age_s": sample_age_s,
             "xlevr.sample_sequence": sample_sequence,
             "xlevr.source_timestamp": source_timestamp,
+            "xlevr.latency": metadata.get("latency_trace"),
             "xlevr.reset_arm": reset_arm,
             "xlevr.ray_direction_local": metadata.get("ray_direction_local"),
             "xlevr.verification_tracking": metadata.get("verification_tracking"),
@@ -314,4 +321,9 @@ class VRInput:
             monitor._loop.call_soon_threadsafe(setattr, monitor, 'is_running', False)
         if self._vr_thread is not None:
             self._vr_thread.join(timeout=3)
+        if self.latency is not None:
+            try:
+                self.latency.close()
+            except Exception:
+                logger.warning("VR延迟报告写入失败", exc_info=True)
         logger.info("FluxVLA VR disconnected")

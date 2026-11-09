@@ -18,6 +18,7 @@ def main(argv=None):
     parser.add_argument('--check-record-buttons', action='store_true', help='配合--record-config，只检查VR按钮，不连接机器人/夹爪/相机')
     parser.add_argument('--record-controller', action='store_true',
                         help='同一5999连接开启控制器高频记录；需实机模式或 --observe')
+    parser.add_argument('--measure-vr-latency', action='store_true', help='诊断VR发包/收包间隔、WebSocket往返与输入读取延迟，单独保存日志')
     parser.add_argument('--preview', action='store_true', help='只检查配置，不启动服务或连接设备')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--observe', action='store_true',
@@ -43,6 +44,8 @@ def main(argv=None):
         parser.error('数据录制不能与观察/标定/控制器检查模式混用；检查按钮使用--check-record-buttons')
     if args.check_record_buttons and args.record_controller:
         parser.error('按键检查不能开启控制器记录')
+    if args.measure_vr_latency and any((args.inspect_controller, args.calibrate_pose, args.verify_calibration)):
+        parser.error('--measure-vr-latency 用于遥操作、观察或录制按键检查模式')
     cfg = Config.fromfile(args.config)
     if args.cfg_options:
         cfg.merge_from_dict(args.cfg_options)
@@ -105,6 +108,11 @@ def main(argv=None):
         cfg.teleop.update(vr_only=True, observe_only=False)
         cfg.teleop.zx_grippers.enabled = False
     runtime = build_runtime(cfg.teleop)
+    runtime.vr.measure_latency = args.measure_vr_latency
+    runtime.vr.latency_context = dict(recording=bool(args.record_config),
+        button_check=args.check_record_buttons, execute=runtime.execute,
+        observe_only=runtime.observe_only, fps=cfg.teleop.get('fps', 30),
+        record_controller=runtime.record_controller)
     if args.record_config:
         if cfg.teleop.get('fps', 30) != 30:
             parser.error('双臂数据录制要求teleop.fps=30')
@@ -120,7 +128,7 @@ def main(argv=None):
     if args.preview:
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
-              f'record_controller={runtime.record_controller}，'
+              f'record_controller={runtime.record_controller}，measure_vr_latency={args.measure_vr_latency}，'
               f'zx_grippers={getattr(runtime, "zx_grippers_enabled", False)}，'
               '未启动服务或连接设备。')
         return 0

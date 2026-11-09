@@ -120,6 +120,7 @@ AFRAME.registerComponent('controller-updater', {
     };
 
     // --- WebSocket Setup ---
+    this.latencyClient = null;
     this.websocket = null;
     this.leftGripDown = false;
     this.rightGripDown = false;
@@ -178,6 +179,8 @@ AFRAME.registerComponent('controller-updater', {
           if (!event.wasClean) {
             console.error('WebSocket closed unexpectedly.');
           }
+          if (this.latencyClient) this.latencyClient.close();
+          this.latencyClient = null;
           this.websocket = null; // Clear the reference
           this.reportVRStatus(false);
           this.applyHud({phase:'stop',hint:'VR DISCONNECTED / release controls before reconnecting'});
@@ -191,6 +194,11 @@ AFRAME.registerComponent('controller-updater', {
           } catch (error) {
             return;
           }
+          if (data && data.type === 'latency_config') {
+            if (this.latencyClient) this.latencyClient.close();
+            this.latencyClient = new VRLatencyClient(this.websocket, this.el.sceneEl);
+          }
+          if (this.latencyClient) this.latencyClient.receive(data);
           if (data && data.type === 'hud') {
             this.applyHud(data);
           }
@@ -413,6 +421,7 @@ AFRAME.registerComponent('controller-updater', {
 
   remove: function () {
     this.websocketDisposed = true;
+    if (this.latencyClient) this.latencyClient.close();
     if (this.websocketRetry !== null) clearTimeout(this.websocketRetry);
     this.websocketRetry = null;
     if (this.websocket) this.websocket.close();
@@ -797,6 +806,7 @@ AFRAME.registerComponent('controller-updater', {
                 rightController: rightController,
                 headset: headset
             };
+            if (this.latencyClient) this.latencyClient.stamp(dualControllerData);
             this.websocket.send(JSON.stringify(dualControllerData));
 
             // 添加调试信息

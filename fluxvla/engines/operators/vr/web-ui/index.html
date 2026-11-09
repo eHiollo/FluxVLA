@@ -3,7 +3,7 @@
 <html lang="zh-CN"><head><meta charset="utf-8">
 <title>FluxVLA · A10 VR</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://aframe.io/releases/1.7.1/aframe.min.js"></script>
-<script src="vr-config.js"></script><script src="vr_app.js" defer></script>
+<script src="vr-config.js"></script><script src="latency.js" defer></script><script src="vr_app.js" defer></script>
 <link rel="stylesheet" href="styles.css"></head><body>
 <div id="modeNotice" style="position:fixed;z-index:10;padding:12px;background:#ffffffdd;border-radius:8px">
 <strong>FluxVLA · A10 VR</strong><br>进入 VR 后使用右手侧键控制机械臂、摇杆控制夹爪。<br>
@@ -29,6 +29,7 @@
             <a-text id="recordHudDown" position="0 -0.85 0" align="center" width="7" wrap-count="50"></a-text>
           </a-entity>
         </a-entity>
+        <a-text id="vrLatencyHud" value="" position="0 -0.045 -0.72" scale="0.035 0.035 0.035" color="#FFFFFF" align="center" width="14" wrap-count="85"></a-text>
         <a-text id="headsetInfo" value="" position="0 -0.16 -0.72" rotation="0 0 0" scale="0.035 0.035 0.035" color="#777777" align="center"></a-text>
       </a-entity>
 

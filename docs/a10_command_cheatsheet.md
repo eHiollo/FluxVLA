@@ -888,3 +888,16 @@ python scripts/teleoperate.py \
 按住右A，左摇杆回中后：右=开始/保存；左=丢弃确认；下=停止采样待处理；上=复位确认。模式内屏蔽左夹爪新输入，松A后回中恢复。复位需先处理本集、释放两手侧键/扳机。备用终端：start/save/discard/reset/stop/status/quit。
 
 首次使用空输出目录；续录在命令末尾追加 `--record-options record.resume=True`，任务和输出目录也可通过 `capture.task` / `record.root` 覆盖。中断恢复、HUD及日志见[采集指南](a10_vr_recording.md)。
+
+### 测VR输入延迟（2026-11-09）
+
+VR＋现有录制头显，无设备控制：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --check-record-buttons --measure-vr-latency
+```
+
+真实采集负载测试：在原完整采集命令的`--cfg-options`前加`--measure-vr-latency`，其他参数保留。刷新头显网页，采样约2分钟后Ctrl+C退出；报告在`work_dirs/a10/vr/latency/<本次目录>/summary.json`，逐包数据在同目录`events.jsonl`。测的是应用层RTT及发包/收包/读取间隔，不是机械臂响应时间。具体对照流程见[录制指南第8节](a10_vr_recording.md#8-vr-网络延迟诊断2026-11-09)。

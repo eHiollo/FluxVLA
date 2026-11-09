@@ -77,6 +77,7 @@ class VRWebSocketServer(BaseInputProvider):
         self.server = None
         self.print_only = print_only  # New flag for print-only mode
         self._last_hud: Optional[Dict[str, Any]] = None
+        self.latency = None
 
         # Controller states
         self.left_controller = VRControllerState("left")
@@ -174,11 +175,22 @@ class VRWebSocketServer(BaseInputProvider):
             except Exception:
                 logger.debug("Failed to send cached HUD to new VR client", exc_info=True)
 
+        connection = self.latency.connect(client_address) if self.latency else None
         try:
+            if self.latency:
+                await websocket.send(json.dumps(dict(type='latency_config', connection=connection)))
             async for message in websocket:
+                received = time.monotonic()
                 try:
                     data = json.loads(message)
-                    await self.process_controller_data(data)
+                    if isinstance(data, dict) and data.get('type', '').startswith('latency_'):
+                        if self.latency:
+                            reply = self.latency.probe(connection, data, received)
+                            if reply is not None:
+                                await websocket.send(json.dumps(reply))
+                        continue  # Probes never refresh hand poses or sample freshness.
+                    trace = self.latency.packet(connection, data, received) if self.latency else None
+                    await self.process_controller_data(data, latency_trace=trace)
                 except json.JSONDecodeError:
                     logger.warning(f"Received non-JSON message: {message}")
                 except Exception as e:
@@ -198,12 +210,14 @@ class VRWebSocketServer(BaseInputProvider):
             logger.error(f"Unexpected error with VR client {client_address}: {e}")
         finally:
             self.clients.discard(websocket)
+            if self.latency:
+                self.latency.disconnect(connection)
             # Handle grip releases when client disconnects
             await self.handle_grip_release('left')
             await self.handle_grip_release('right')
             logger.debug("VR client %s cleanup complete", client_address)
 
-    async def process_controller_data(self, data: Dict):
+    async def process_controller_data(self, data: Dict, latency_trace=None):
         """Process incoming VR controller data."""
         # Process headset data if available
         if 'headset' in data:
@@ -234,9 +248,9 @@ class VRWebSocketServer(BaseInputProvider):
         # Process controller data
         try:
             if 'leftController' in data:
-                await self.process_single_controller('left', data['leftController'])
+                await self.process_single_controller('left', dict(data['leftController'], _latency_trace=latency_trace))
             if 'rightController' in data:
-                await self.process_single_controller('right', data['rightController'])
+                await self.process_single_controller('right', dict(data['rightController'], _latency_trace=latency_trace))
         except Exception as exc:
             logger.exception("Error in process_single_controller")
 
@@ -361,6 +375,7 @@ class VRWebSocketServer(BaseInputProvider):
                         "scaled_position": absolute_position.tolist(),
                         "ray_direction_local": data.get("rayDirectionLocal"),
                         "verification_tracking": data.get("verificationTracking"),
+                        "latency_trace": data.get("_latency_trace"),
                     },
                 ),
             )

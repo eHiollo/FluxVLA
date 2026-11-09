@@ -533,6 +533,9 @@ class VRTeleopRuntime:
                 raw = self.vr.get_action()
                 action = self.mapper(raw)
             self._input_read_time = time.monotonic()
+            latency = getattr(self.vr, 'latency', None)
+            if latency is not None:
+                latency.consume(raw, self._input_read_time)
             blocked = recording.before_step(raw, action) if recording is not None else False
             result = action if blocked else self._step(raw, action)
             if recording is not None: recording.after_step()

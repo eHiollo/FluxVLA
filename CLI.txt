@@ -106,3 +106,114 @@ python scripts/teleoperate.py \
     teleop.reference_options.max_reference_lead_m=0.03 \
     teleop.reference_options.max_reference_lead_rad=0.30 \
     teleop.max_rotation_step_rad=0.025 
+
+
+====数据录制====
+cd /home/robot/VLA/FluxVLA
+conda activate fluxvla
+
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --record-options \
+    record.root=/home/robot/VLA/FluxVLA/datasets/a10_dual_record \
+    record.resume=True \
+  --measure-vr-latency \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True \
+    teleop.zx_grippers.enabled=True \
+    teleop.controller_speed_percent=50 \
+    teleop.reference_options.max_linear_speed_m_s=0.08 \
+    teleop.reference_options.max_angular_speed_rad_s=0.6 \
+    teleop.reference_options.max_linear_accel_m_s2=0.4 \
+    teleop.reference_options.max_angular_accel_rad_s2=1.5 \
+    teleop.reference_options.max_reference_lead_m=0.03 \
+    teleop.reference_options.max_reference_lead_rad=0.30 \
+    teleop.max_rotation_step_rad=0.030
+ --record-controller \
+  
+# 夹爪参数
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-controller \
+  --cfg-options \
+    teleop.zx_grippers.devices.left.speed=15 \
+    teleop.zx_grippers.devices.right.speed=15 \
+    teleop.zx_grippers.target_rate_raw_s=3000 \
+    teleop.zx_grippers.max_lead_raw=600 \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True \
+    teleop.zx_grippers.enabled=True
+
+
+teleop.zx_grippers.target_rate_raw_s=3000 \
+
+====设备检查====
+换 USB 插口时，identity.serial 序列号保持不动，只需更新连接路径：
+- 相机：更新 device。
+- 夹爪：更新 port。
+
+# 查看设备ID、当前节点和匹配状态
+python scripts/a10_devices.py
+
+#显示照片
+python scripts/a10_devices.py --snapshot
+
+# 换USB口后提示“路径需更新”时执行，自动备份配置
+python scripts/a10_devices.py --update
+
+# 额外查询夹爪状态，只读、不发送动作
+python scripts/a10_devices.py --check-grippers
+
+
+
+python - <<'PY'
+import socket
+import struct
+import time
+
+target = [21, 38, -131, 28, 100, 10,
+          -18, -36, 128, -20, -100, 5]
+
+payload = ('jp --motor_pos=[' +
+           ','.join(map(str, target)) + ']').encode('utf-8')
+
+packet = struct.pack('<IIQqqq', len(payload), 0, 0, 0, 0, 0) + payload
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    print('向 192.168.0.150:9999 持续发送目标，Ctrl+C 停止发送')
+    try:
+        while True:
+            sock.sendto(packet, ('192.168.0.150', 9999))
+            time.sleep(1 / 30)
+    except KeyboardInterrupt:
+        print('\nUDP 发送已结束')
+PY
+
+
+
+python - <<'PY'
+import socket
+import struct
+import time
+
+target = [21, 38, -131, 28, 110, 20,
+          -18, -36, 128, -20, -110, 20]
+
+payload = ('jp --motor_pos=[' +
+           ','.join(map(str, target)) + ']').encode('utf-8')
+
+packet = struct.pack('<IIQqqq', len(payload), 0, 0, 0, 0, 0) + payload
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    print('向 192.168.0.150:9999 持续发送目标，Ctrl+C 停止发送')
+    try:
+        while True:
+            sock.sendto(packet, ('192.168.0.150', 9999))
+            time.sleep(1 / 30)
+    except KeyboardInterrupt:
+        print('\nUDP 发送已结束')
+PY

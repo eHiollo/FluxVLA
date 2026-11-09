@@ -65,6 +65,7 @@ AFRAME.registerComponent('controller-updater', {
       if (!el) return;
       const phase = String(data.phase || 'idle').toLowerCase();
       const colors = {
+        input_paused: '#EF5350', input_ready: '#FFD54F',
         resetting: '#FFD54F', failed: '#EF5350', reset_failed: '#EF5350', review: '#FFB300',
         reset: '#FFD54F',
         initial_reset: '#FFD54F',
@@ -77,6 +78,7 @@ AFRAME.registerComponent('controller-updater', {
         idle: '#FFFFFF', button_check: '#FFFFFF', starting: '#FFD54F', discarding: '#FFD54F'
       };
       const titles = {
+        input_paused: 'INPUT PAUSED / MOTION STOPPED', input_ready: 'INPUT STABLE / PRESS GRIP',
         resetting: 'RESETTING / DOWN TO CANCEL', reset_failed: 'RESET FAILED',
         failed: 'INVALID EPISODE', review: 'CAPTURE STOPPED', starting: 'STARTING',
         discarding: 'DISCARDING', button_check: 'BUTTON CHECK / NO MOTION',

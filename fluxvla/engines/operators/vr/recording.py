@@ -100,6 +100,7 @@ class RecordingSession:
         self.reset_result = queue.Queue(maxsize=1)
         self.reset_failed = False; self._closed = False
         self.input_fresh = False
+        self._input_pause_invalid = None
 
     @property
     def blocks_motion(self):
@@ -165,6 +166,8 @@ class RecordingSession:
         return self.blocks_motion or self.button_check
 
     def _assemble(self, now):
+        if getattr(self.runtime, 'input_pause_status', None) is not None:
+            raise ValueError('VR input paused; release controls and re-engage first')
         if not self.input_fresh: raise ValueError('Waiting for fresh paired VR input')
         frame = self.runtime.last_frame
         if not frame or frame.get('has_error') is not False:
@@ -242,6 +245,13 @@ class RecordingSession:
                 self.fail(str(exc))
         self._hud(now)
 
+    def input_paused(self, message):
+        self.pending = None
+        self.ready_sample = None
+        if self.state == 'recording' or (self.future is not None and self.future_operation == 'starting'):
+            self._input_pause_invalid = message
+            self.fail(message)
+
     def fail(self, message):
         self.error = message
         if self.state == 'recording': self.state = 'failed'
@@ -261,13 +271,16 @@ class RecordingSession:
                 self.state = 'recording'; self.frames = 0; self.elapsed = 0.
                 self._first_sample = self._last_sample = None
                 self._camera_sequences = {}; self.repeated_images = 0
+                if self._input_pause_invalid:
+                    self.state = 'failed'
             else:
                 self.state = 'idle'; self.stopping = False
                 self.notice = f'Episode {value+1} saved' if operation == 'saving' else 'Episode discarded; ready'
             if operation == 'saving':
                 self._saved_until = time.monotonic() + 1.5
                 self._saved_episode = value + 1
-            self.error = ''
+            self.error = self._input_pause_invalid if operation == 'starting' and self._input_pause_invalid else ''
+            if operation != 'starting': self._input_pause_invalid = None
             LOG.info('录制：%s %s', self.state, self.notice)
         except Exception as exc:
             self.state = 'failed'; self.error = str(exc)
@@ -304,9 +317,12 @@ class RecordingSession:
         command = {'right':'save' if self.state in ('recording','review','failed') else 'start',
                    'left':'discard', 'up':'reset', 'down':'stop'}.get(command,command)
         if self.pending and command != self.pending: self.pending = None
+        if command in ('start', 'reset') and getattr(self.runtime, 'input_pause_status', None) is not None:
+            self.notice = 'VR input paused: release controls, wait, then press a side grip'; return
         if command == 'start':
             if self.state != 'idle': self.notice = 'Save or discard current episode first'; return
             if self.ready_sample is None: self.notice = 'Not ready: '+self.health; return
+            self._input_pause_invalid = None
             self.notice = 'Starting episode'
             self._work('starting', self.writer.start, self.task)
         elif command == 'save':
@@ -379,6 +395,7 @@ class RecordingSession:
                     episode=(self.writer.info['total_episodes']+1 if self.writer else 0),
                     pending=self.pending, health=self.health, error=self.error, hint=self.notice,
                     task=self.task, repeated_images=self.repeated_images,
+                    input_pause=getattr(self.runtime, 'input_pause_status', None),
                     effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
 
     def _hud_controls(self):
@@ -395,8 +412,11 @@ class RecordingSession:
             if self.reset_thread is not None: show('down', 'CANCEL RESET')
         elif self.future is None:
             if self.state == 'idle':
-                show('right', 'START' if self.ready_sample is not None else 'WAIT FOR DEVICES', self.ready_sample is not None)
-                show('up', 'RESET' if self._released() else 'RELEASE BOTH GRIPS', self._released())
+                paused = getattr(self.runtime, 'input_pause_status', None) is not None
+                show('right', 'REARM VR FIRST' if paused else ('START' if self.ready_sample is not None else 'WAIT FOR DEVICES'),
+                     self.ready_sample is not None and not paused)
+                can_reset = self._released() and getattr(self.runtime, 'input_pause_status', None) is None
+                show('up', 'RESET' if can_reset else 'RELEASE BOTH GRIPS', can_reset)
             elif self.state in ('recording', 'review', 'failed'):
                 show('left', 'DISCARD / REDO')
                 show('up', 'SAVE / DISCARD FIRST', False)
@@ -432,6 +452,12 @@ class RecordingSession:
             status['hint'] = 'Ready for next episode'
         if self.button_check:
             status['hint'] = self.notice or 'Button check only - no device motion'
+        if getattr(self.runtime, 'input_pause_status', None) is not None:
+            pause = self.runtime.input_pause_hud()
+            status.update({key: value for key, value in pause.items() if key != 'controls'})
+            if self.state == 'failed': status['hint'] += ' / INVALID EPISODE: LEFT TO DISCARD'
+            controls['prompt'] = pause['controls']['prompt']
+            phase = status['phase']
         # Clock/frame counts stay rate limited; input gates and state transitions do not.
         signature = (phase, self.pending, self.error, status['hint'],
                      json.dumps(controls, sort_keys=True))

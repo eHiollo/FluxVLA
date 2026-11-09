@@ -172,6 +172,23 @@ class ChannelTest(unittest.TestCase):
         c.close()
         self.assertFalse(fake.connected)
 
+    def test_pause_cancels_old_targets_and_requires_fresh_neutral_before_usb_can_resume(self):
+        c = self.channel()
+        c.submit(0., time.monotonic()+1.)
+        c.pause()
+        self.assertTrue(c._motion_cancel.is_set())
+        self.assertEqual(c._input, (0., 0.))
+        self.assertTrue(c._need_center)
+        c.submit(-1., time.monotonic()+1.)
+        self.assertTrue(c._motion_cancel.is_set())
+        c.submit(0., 0.)  # Synthetic zero while paused is not a neutral observation.
+        self.assertTrue(c._motion_cancel.is_set())
+        c.submit(0., time.monotonic()+1.)
+        self.assertFalse(c._motion_cancel.is_set())
+        c.request_stop()
+        c.submit(0., time.monotonic()+1.)
+        self.assertTrue(c._motion_cancel.is_set())
+
     def test_slow_serial_does_not_block_submit_or_snapshot(self):
         c = self.channel(); fake = FakeZX(); c.client = fake
         fake.block.clear()

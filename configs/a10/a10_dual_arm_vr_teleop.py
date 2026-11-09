@@ -9,6 +9,7 @@ _base_ = ['./a10_vr_teleop.py', './a10_dual_arm_operator.py', './a10_devices.py'
 teleop = dict(
     vr_only=True, observe_only=False,
     control_mode='reference', pose_mapping='anchor_relative',
+    input_recovery_stable_s=.5,  # 松手回中、追踪稳定后，重新按侧键才恢复。
     cartesian_adapter='sdk_tool_cumulative', fps=30,
     # Initial low-speed trial values, independent of single-arm tuning.
     # These bound frontend targets, not physical joint speed or collision distance.

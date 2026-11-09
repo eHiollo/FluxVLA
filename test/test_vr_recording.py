@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -264,6 +264,48 @@ class SessionTests(unittest.TestCase):
         self.session.command('start'); self.assertEqual(self.session.state,'review')
         self.session.command('right'); self.settle(); self.assertEqual(self.session.state,'idle')
         self.robot.stop_follower.assert_not_called()
+
+    def test_input_pause_invalidates_recording_blocks_start_reset_and_keeps_discard_available(self):
+        self.start()
+        count = self.session.frames
+        self.runtime.input_pause_status = dict(state='release_required', reason='spike_pending')
+        self.runtime.input_pause_hud = lambda: dict(type='hud', phase='input_paused', error='',
+            hint='LEFT HAND: spike_pending', pending=None,
+            controls=dict(prompt='RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS'))
+        self.session.input_paused('Dual VR right: spike_pending')
+        self.update()
+        self.assertEqual(self.session.state, 'failed')
+        self.assertEqual(self.session.frames, count)
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+        payload = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual(payload['phase'], 'input_paused')
+        self.assertIn('INVALID EPISODE', payload['hint'])
+        self.assertIn('RELEASE BOTH', payload['controls']['prompt'])
+        self.session.command('discard'); self.session.command('discard'); self.settle()
+        self.assertEqual(self.session.state, 'idle')
+        self.session.command('start'); self.assertIsNone(self.session.future)
+        self.session.command('reset'); self.assertIsNone(self.session.pending)
+        self.assertFalse(self.session._hud_controls()['directions']['up']['enabled'])
+        self.runtime.input_pause_status = None
+        self.update(); self.start()
+        self.assertEqual(self.session.state, 'recording')
+
+    def test_input_pause_during_async_start_cannot_publish_a_continuous_episode(self):
+        self.writer.start(self.session.task)
+        future = Future()
+        self.session.future, self.session.future_operation = future, 'starting'
+        self.session.state = 'starting'
+        self.session.input_paused('VR input fault while starting')
+        future.set_result(None)
+        self.session._poll_future()
+        self.assertEqual(self.session.state, 'failed')
+        self.assertEqual(self.session.frames, 0)
+        self.assertIn('input fault', self.session.error)
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
 
     def test_camera_stale_fault_prevents_publication(self):
         self.start()

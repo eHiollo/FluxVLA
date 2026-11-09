@@ -38,3 +38,14 @@ assert.equal(attrs('recordHudDirections').visible, false);
 assert.equal(attrs('recordHudPrompt').value, '');
 assert.equal(attrs('recordHudDetails').value, '');
 console.log('HUD rendering checks passed (check/record/confirm/fault/disconnect).');
+
+context.applyHud({phase:'input_paused', hint:'LEFT HAND: spike_pending', controls:{prompt:'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS'}});
+assert.equal(attrs('recordHud').value,'INPUT PAUSED / MOTION STOPPED');
+assert.equal(attrs('recordHud').color,'#EF5350');
+assert.match(attrs('recordHudPrompt').value,/RELEASE BOTH/);
+context.applyHud({phase:'input_ready', controls:{prompt:'PRESS A SIDE GRIP TO RESUME'}});
+assert.equal(attrs('recordHud').color,'#FFD54F');
+assert.match(attrs('recordHudPrompt').value,/PRESS A SIDE/);
+context.applyHud({phase:'idle', controls:{}});
+assert.equal(attrs('recordHudPrompt').value,'');
+console.log('Input pause / ready / resumed HUD checks passed.');

@@ -49,6 +49,7 @@ class _ZXGripperChannel:
                                 expected_usb_interface=identity['usb_interface'])
         self._lock = threading.Lock()
         self._stop, self._ready = threading.Event(), threading.Event()
+        self._motion_cancel = threading.Event()
         self._thread = None
         self._input = (0., 0.)
         self._target = None
@@ -75,6 +76,14 @@ class _ZXGripperChannel:
         with self._lock:
             if not self._stop.is_set():
                 self._input = (float(axis), float(deadline))
+                if abs(axis) <= self.options['deadzone'] and deadline > time.monotonic():
+                    self._motion_cancel.clear()  # A fresh neutral sample rearms USB commands.
+
+    def pause(self):
+        self._motion_cancel.set()  # Also cancels a target waiting inside the serial driver.
+        with self._lock:
+            self._input = (0., 0.)
+            self._need_center, self._active = True, False
 
     def snapshot(self):
         with self._lock:
@@ -90,6 +99,7 @@ class _ZXGripperChannel:
 
     def request_stop(self):
         self._stop.set()
+        self._motion_cancel.set()
         with self._lock:
             self._input = (0., 0.)
 
@@ -161,7 +171,7 @@ class _ZXGripperChannel:
                     if target is not None and target != self._last_sent:
                         try:
                             self.client.set_position_raw(self.device_id, target, speed=self.speed, torque=self.torque,
-                                                         motion_deadline_s=deadline, motion_cancel_event=self._stop)
+                                                         motion_deadline_s=deadline, motion_cancel_event=self._motion_cancel)
                             self._last_sent = target
                         except ZXGripperInputExpired:
                             self._need_center, self._active = True, False
@@ -175,6 +185,13 @@ class _ZXGripperChannel:
             self._stop.set()
         finally:
             self._ready.set()
+
+
+class _VRInputPause(RuntimeError):
+    """Only expected input guards may enter recoverable pause."""
+    def __init__(self, arm, reason):
+        self.arm, self.reason = arm, reason
+        super().__init__(f'Dual VR {arm}: {reason}')
 
 
 class VRTeleopRuntime:
@@ -581,6 +598,7 @@ class VRTeleopRuntime:
                               reference_control=self.last_reference_result,
                               controller_speed_override=self.speed_status,
                               controller_recording=self.controller_recording,
+                              input_pause=getattr(self, "input_pause_status", None),
                               dataset_recording=recording.status() if recording is not None else None,
                               client_monotonic_ns=time.monotonic_ns(), client_wall_ns=time.time_ns(),
                               stop_status=self.last_stop_status)
@@ -903,7 +921,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     release shapes a bounded command stop; faults stop the entire group.
     """
 
-    def __init__(self, vr, robot=None, *, gripper=None, zx_grippers=None, **settings):
+    def __init__(self, vr, robot=None, *, gripper=None, zx_grippers=None,
+                 input_recovery_stable_s=.5, **settings):
         from .control import VRPoseController
         if (not getattr(vr, 'is_dual', False) or settings.get('control_mode') != 'reference'
                 or settings.get('pose_mapping', 'anchor_relative') != 'anchor_relative'
@@ -923,6 +942,14 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._dual_time = None
         self._dual_require_release = False
         self._dual_stop_failed = False
+        if (isinstance(input_recovery_stable_s, bool) or not isinstance(input_recovery_stable_s, (int, float))
+                or not math.isfinite(input_recovery_stable_s) or not .5 <= input_recovery_stable_s <= 5):
+            raise ValueError('input_recovery_stable_s must be within .5..5 seconds')
+        self.input_recovery_stable_s = input_recovery_stable_s
+        self._input_pause = None
+        self._pause_samples = {}
+        self._pause_stable_since = None
+        self._pause_hud_signature = None
         self._zx_channels = {}
         config = dict(zx_grippers or {})
         enabled = config.pop('enabled', False)
@@ -987,16 +1014,163 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             self.last_gripper_command = {side: channel.snapshot() for side, channel in self._zx_channels.items()}
             for channel in self._zx_channels.values():
                 channel.check_health()
-        result = self._step_arms(raw, action)
+        try:
+            result = self._step_arms(raw, action)
+        except _VRInputPause as exc:
+            if not self.execute:
+                raise  # Read-only observation cannot promise a confirmed physical stop.
+            self._enter_input_pause(exc)
+            result = action
         for side, channel in self._zx_channels.items():
             sample = raw[side]
             age = sample.get('xlevr.sample_age_s', -1.)
             elapsed = max(0., time.monotonic() - self._input_read_time)
             budget = channel.options['input_timeout_s']
-            valid = isinstance(age, (int, float)) and math.isfinite(age) and 0 <= age and age + elapsed <= budget
+            valid = (self._input_pause is None and isinstance(age, (int, float))
+                     and math.isfinite(age) and 0 <= age and age + elapsed <= budget)
             value = action[self.teleoperator.hand_to_arm[side]].get('gripper.pos', 0.)
             channel.submit(float(value) if valid else 0., time.monotonic() + budget - age - elapsed if valid else 0.)
         return result
+
+
+    @property
+    def input_pause_status(self):
+        return dict(self._input_pause) if self._input_pause is not None else None
+
+    def input_pause_hud(self):
+        status = self.input_pause_status
+        if status is None:
+            return None
+        ready = status['state'] == 'ready'
+        prompt = ('PRESS A SIDE GRIP TO RESUME' if ready else
+                  'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING')
+        return dict(type='hud', phase='input_ready' if ready else 'input_paused',
+                    hint=f"{status['hand'].upper()} HAND: {status['reason']}", error='',
+                    pending=None, input_pause=status,
+                    controls=dict(visible=False, ready=ready, prompt=prompt, directions={}))
+
+    def _pause_result(self):
+        self.last_reference_result = dict(state='input_paused', arms={}, transmitted=False,
+                                         input_pause=self.input_pause_status)
+        if getattr(self, 'recording', None) is None:
+            payload = self.input_pause_hud()
+            signature = (payload['phase'], payload['hint'])
+            if signature != self._pause_hud_signature:
+                try:
+                    self.teleoperator.send_feedback(payload)
+                    self._pause_hud_signature = signature
+                except Exception:
+                    logging.getLogger(__name__).warning('暂停提示发送失败', exc_info=True)
+
+    def _enter_input_pause(self, error):
+        diagnostics = self._arms[error.arm]['mapper'].get_last_diagnostics() or {}
+        for channel in self._zx_channels.values():
+            channel.pause()
+        self._input_pause = dict(state='release_required', arm=error.arm,
+                                 hand=self._arms[error.arm]['hand'], reason=error.reason,
+                                 stopped=False, stable_s=0.)
+        self._pause_samples.clear()
+        self._pause_stable_since = None
+        self._pause_hud_signature = None
+        recording = getattr(self, 'recording', None)
+        if recording is not None:
+            recording.input_paused(str(error))
+        if self.execute:
+            try:
+                self._stop_reference()
+                # Also confirm an idle/pre-start fault; no session-owned follower may exist yet.
+                if not self.last_stop_status or self.last_stop_status.get('reported_stopped') is not True:
+                    self.robot.wait_stopped()
+                self._checked_frame(require_active=False)
+                if self.last_frame.get('follower_active') is not False:
+                    raise RuntimeError('Follower is still active during input pause')
+            except BaseException:
+                self._dual_stop_failed = True
+                raise
+        self._input_pause.update({key: diagnostics.get(key) for key in ('vr_input_speed_m_s', 'sample_dt_s')})
+        self._input_pause['stopped'] = True
+        self._dual_time = None
+        self._dual_require_release = True
+        self.teleoperator.reset_reference()
+        self._pause_result()
+        logging.getLogger(__name__).warning('VR输入异常已暂停：%s；双手松开并回中，输入稳定后重新按侧键接管。', error)
+
+    def _pause_input_stable(self, raw, now):
+        """New paired poses, fresh tracking and the existing position-speed guard."""
+        valid, updated = True, True
+        for arm, context in self._arms.items():
+            side = context['hand']
+            sample = raw[side]
+            age, stamp = sample.get('xlevr.sample_age_s'), sample.get('xlevr.sample_receive_time_s')
+            sequence = sample.get('xlevr.sample_sequence')
+            limit = min(context['mapper'].stale_timeout_s, context['control'].config.max_input_age_s)
+            try:
+                position = np.asarray(sample.get('xlevr.target_position'), dtype=float)
+                quat = np.asarray(sample.get('xlevr.orientation_quat'), dtype=float)
+                good = (sample.get('xlevr.verification_tracking') is True and type(sequence) is int
+                        and sequence >= 0 and isinstance(age, (int, float)) and math.isfinite(age)
+                        and 0 <= age + max(0., now-self._input_read_time) <= limit
+                        and isinstance(stamp, (int, float)) and math.isfinite(stamp) and 0 <= now-stamp <= limit
+                        and position.shape == (3,) and np.isfinite(position).all()
+                        and quat.shape == (4,) and np.isfinite(quat).all() and np.linalg.norm(quat) > 1e-8)
+            except (TypeError, ValueError):
+                good = False
+            if not good:
+                valid = False
+                self._pause_samples.pop(side, None)
+                continue
+            previous = self._pause_samples.get(side)
+            if previous is None:
+                valid = False  # Establish a baseline before starting the stability timer.
+            elif sequence == previous[0]:
+                updated = False  # Re-reading one pose never completes the stability gate.
+            else:
+                dt = stamp-previous[1]
+                if sequence < previous[0] or not 0 < dt <= limit or (
+                        np.linalg.norm(position-previous[2])/dt > context['mapper'].max_vr_speed_m_s):
+                    valid = False
+            if previous is None or sequence != previous[0]:
+                self._pause_samples[side] = (sequence, stamp, position.copy())
+        return valid, updated
+
+    def _step_input_pause(self, raw):
+        now = time.monotonic()
+        self._checked_frame(require_active=False)  # Controller/transport failures remain fatal.
+        if self.execute and self.last_frame.get('follower_active') is not False:
+            raise RuntimeError('Follower restarted while VR input is paused')
+        valid, updated = self._pause_input_stable(raw, now)
+        grips, neutral = [], True
+        for sample in raw.values():
+            grip = bool(sample.get('xlevr.grip_active') or sample.get('xlevr.buttons', {}).get('squeeze'))
+            grips.append(grip)
+            trigger = sample.get('xlevr.trigger')
+            stick = sample.get('xlevr.thumbstick', {})
+            values = [trigger, stick.get('x', 0.), stick.get('y', 0.)]
+            neutral = neutral and all(isinstance(v, (int, float)) and math.isfinite(v) and abs(v) <= .1 for v in values)
+        if self._input_pause['state'] == 'ready' and valid and updated and neutral and any(grips):
+            self._input_pause = None
+            self._pause_stable_since = None
+            self._pause_samples.clear()
+            self._dual_require_release = False
+            self.teleoperator.reset_reference()  # Next sample uses current hand + actual robot anchors.
+            self.last_reference_result = dict(state='input_resumed', arms={}, transmitted=False)
+            if getattr(self, 'recording', None) is None:
+                try:
+                    self.teleoperator.send_feedback(dict(type='hud', phase='idle', hint='INPUT RESUMED', controls={}))
+                except Exception:
+                    logging.getLogger(__name__).warning('恢复提示发送失败', exc_info=True)
+            logging.getLogger(__name__).info('VR输入恢复：已重新按侧键，下一帧重新建立锚点。')
+            return
+        if not valid or not neutral or any(grips):
+            self._pause_stable_since = None
+            self._input_pause.update(state='release_required', stable_s=0.)
+        elif updated:
+            if self._pause_stable_since is None:
+                self._pause_stable_since = now
+            elapsed = now-self._pause_stable_since
+            self._input_pause.update(state='ready' if elapsed >= self.input_recovery_stable_s else 'stabilizing',
+                                     stable_s=round(elapsed, 3))
+        self._pause_result()
 
 
     def _checked_frame(self, *, require_active):
@@ -1065,10 +1239,16 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 raise RuntimeError('Dual VR live reset is unsupported; release the side keys')
             if requested[arm] or (self._dual_time is not None and context['state'] == 'tracking'):
                 if not fresh[arm]:
-                    raise RuntimeError(f'Dual VR {arm}: input_stale')
+                    raise _VRInputPause(arm, 'input_stale')
+                if hand_raw.get('xlevr.verification_tracking') is False:
+                    raise _VRInputPause(arm, 'tracking_lost')
                 command = action[arm].get('_xlevr.anchor_command', {})
                 if requested[arm] and command.get('active') is not True:
-                    raise RuntimeError(f'Dual VR {arm}: mapper_input_rejected')
+                    reason = (context['mapper'].get_last_diagnostics() or {}).get('guard_reason')
+                    if reason in ('spike_pending', 'spike_reanchor', 'stale_age', 'sample_gap',
+                                  'invalid_sample', 'sequence_rollback'):
+                        raise _VRInputPause(arm, reason)
+                    raise RuntimeError(f'Dual VR {arm}: mapper_input_rejected ({reason})')
         return requested, fresh
 
     def _step_arms(self, raw, action):
@@ -1078,6 +1258,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             raise RuntimeError('Dual follower stop is unconfirmed; do not restart this session')
         if set(raw) != {'left', 'right'} or set(action) != set(self.arm_names):
             raise ValueError('Dual VR requires complete hand input and arm actions')
+        if self._input_pause is not None:
+            self._step_input_pause(raw)
+            return action
         if self._dual_require_release:
             # Latched after a shared stop/fault: no automatic restart with held keys.
             released = all(not raw[c['hand']].get('xlevr.enabled') and

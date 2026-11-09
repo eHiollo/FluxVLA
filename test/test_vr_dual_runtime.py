@@ -41,6 +41,7 @@ def hand(seq, pressed=False, x=0., angle=0., age=0., trigger=0.):
             'xlevr.target_position': [0., x, 0.],
             'xlevr.orientation_quat': Rotation.from_euler('z', angle).as_quat(),
             'xlevr.sample_sequence': seq, 'xlevr.sample_receive_time_s': time.monotonic(),
+            'xlevr.verification_tracking': True,
             'xlevr.sample_age_s': age, 'xlevr.thumbstick': {}, 'xlevr.reset_arm': False}
 
 
@@ -48,6 +49,10 @@ class HandInput:
     def __init__(self):
         self.is_connected = False
         self.rows = None
+        self.hud = []
+
+    def send_hud(self, payload):
+        self.hud.append(copy.deepcopy(payload))
 
     def connect(self):
         self.is_connected = True
@@ -391,14 +396,100 @@ class DualRuntimeTest(unittest.TestCase):
     def test_stale_active_hand_stops_group_no_partial_send_and_no_auto_restart(self):
         self.move()
         count = len(self.robot.targets)
-        with self.assertRaisesRegex(RuntimeError, 'input_stale'):
-            self.tick(age=.3)
+        self.tick(age=.3)
+        self.assertEqual(self.runtime.input_pause_status['reason'], 'input_stale')
         self.assertEqual(len(self.robot.targets), count)
         self.assertEqual(self.robot.events.count('stop'), 1)
         for _ in range(4):
             self.tick()
         self.assertEqual(self.robot.events.count('start'), 1)
-        self.assertEqual(self.runtime.last_reference_result['state'], 'release_required')
+        self.assertEqual(self.runtime.last_reference_result['state'], 'input_paused')
+
+    def wait_input_ready(self):
+        for _ in range(20): self.tick(False, False)
+        self.assertEqual(self.runtime.input_pause_status['state'], 'ready')
+
+    def test_position_spike_pauses_held_grips_never_restart_and_reclutch_anchors_actual_pose(self):
+        self.move()
+        sent = len(self.robot.targets)
+        self.tick(xleft=.4)
+        pause = self.runtime.input_pause_status
+        self.assertEqual(pause['reason'], 'spike_pending')
+        self.assertTrue(pause['stopped'])
+        self.assertGreater(pause['vr_input_speed_m_s'], 2.)
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertEqual(self.robot.events.count('wait_stopped'), 1)
+        for _ in range(25): self.tick(xleft=.4)
+        self.assertEqual(self.robot.events.count('start'), 1)
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        self.wait_input_ready()
+        self.assertEqual(self.vr.input.hud[-1]['phase'], 'input_ready')
+        for _ in range(5): self.tick(False, False)
+        self.assertEqual(self.robot.events.count('start'), 1)
+        actual = copy.deepcopy(self.robot.poses)
+        self.tick(left=True, right=False)  # New edge clears latch, sends no robot target.
+        self.assertIsNone(self.runtime.input_pause_status)
+        self.assertEqual(len(self.robot.targets), sent)
+        self.tick(left=True, right=False)  # Mapper arming sample.
+        self.tick(left=True, right=False)  # Fresh active input may now start.
+        self.assertEqual(self.robot.events.count('start'), 2)
+        for name in actual:
+            np.testing.assert_allclose(self.robot.anchors[name], actual[name])
+        self.assertEqual(self.runtime.last_reference_result['state'], 'await_fresh_sample')
+
+    def test_tracking_loss_requires_new_tracked_samples_and_lost_tracking_resets_ready(self):
+        self.move()
+        self.vr.input.rows['left']['xlevr.verification_tracking'] = False
+        self.runtime.step()
+        self.assertEqual(self.runtime.input_pause_status['reason'], 'tracking_lost')
+        for _ in range(20):
+            self.clock.advance(); self.seq += 1
+            self.vr.input.rows = {side: hand(self.seq) for side in ('left', 'right')}
+            self.vr.input.rows['left']['xlevr.verification_tracking'] = False
+            self.runtime.step()
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        self.wait_input_ready()
+        self.vr.input.rows['left']['xlevr.verification_tracking'] = False
+        self.runtime.step()
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        self.assertEqual(self.robot.events.count('start'), 1)
+
+    def test_trigger_stick_or_frozen_input_cannot_pass_recovery_gate(self):
+        self.move(); self.tick(age=.3)
+        for _ in range(20): self.tick(False, False, trigger=.5)
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        self.tick(False, False)
+        for _ in range(20):
+            self.clock.advance(); self.seq += 1
+            self.vr.input.rows = {side: hand(self.seq) for side in ('left', 'right')}
+            self.vr.input.rows['right']['xlevr.thumbstick'] = {'x': .5}
+            self.runtime.step()
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        self.tick(False, False)
+        for _ in range(20):
+            self.clock.advance()
+            self.runtime.step()  # No new sequence or receive timestamp.
+        self.assertNotEqual(self.runtime.input_pause_status['state'], 'ready')
+        self.wait_input_ready()
+
+    def test_read_only_observation_never_claims_it_stopped_the_robot(self):
+        self.runtime.execute = False
+        self.runtime.observe_only = True
+        with self.assertRaisesRegex(RuntimeError, 'input_stale'):
+            self.tick(age=.3)
+        self.assertIsNone(self.runtime.input_pause_status)
+        self.assertNotIn('start', self.robot.events)
+        self.assertNotIn('stop', self.robot.events)
+
+    def test_second_position_jump_resets_stability_and_controller_fault_while_paused_is_fatal(self):
+        self.move(); self.tick(age=.3)
+        for _ in range(10): self.tick(False, False)
+        self.tick(False, False, xleft=.4)
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        self.robot.frame_fault = True
+        with self.assertRaisesRegex(RuntimeError, 'fault'):
+            self.tick(False, False)
+        self.assertEqual(self.robot.events.count('start'), 1)
 
     def test_missing_feedback_stops_group_no_partial_packet(self):
         self.move()
@@ -421,7 +512,7 @@ class DualRuntimeTest(unittest.TestCase):
     def test_stop_unconfirmed_is_latched_even_after_fresh_release(self):
         self.move()
         self.robot.stop_timeout = True
-        with self.assertRaisesRegex(RuntimeError, 'stop unconfirmed'):
+        with self.assertRaisesRegex(TimeoutError, 'stop unconfirmed'):
             self.tick(age=.3)
         self.robot.stop_timeout = False
         with self.assertRaisesRegex(RuntimeError, 'stop is unconfirmed'):

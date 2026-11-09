@@ -39,7 +39,7 @@ python scripts/teleoperate.py \
 
 这使用双臂配置当前默认运动参数；如需原来CLI中验证过的速度参数，可继续加在 `--cfg-options` 后面。本轮没有替换你的CLI或改变运动速度默认值。
 
-- 任务文字默认 `Pick up the water bottle`，输出目录默认 `work_dirs/a10/datasets/a10_dual_record`。
+- 任务文字默认 `Pick up the water bottle`，输出目录默认 `datasets/a10_dual_record`。
 - 首次目录必须为空。再次向同一数据集录制，在上述命令最后添加：
 
 ```bash
@@ -50,7 +50,7 @@ python scripts/teleoperate.py \
 
 ```bash
   --record-options \
-    record.root=work_dirs/a10/datasets/bottle_dual_01 \
+    record.root=datasets/bottle_dual_01 \
     'capture.task=Pick up the water bottle'
 ```
 
@@ -151,3 +151,7 @@ python scripts/teleoperate.py \
 ## 8. 2026-11-06 头显显示改进记录
 
 沿用现有 `applyHud` 和 `RecordingSession`，没有新建录制状态机或改动机器人控制逻辑。修正按钮检查默认蓝色、整块文字同色以及调试字段堆积的问题；补齐动态方向提示、回中/确认提示、状态变化即时推送和非阻塞保存成功提示。新增5项Python行为测试及Node真实HUD渲染测试，相关111项Python回归通过，JS语法检查通过。未连接设备；新版头显清晰度待佩戴实测。
+
+### 2026-11-09：统一数据集保存位置
+
+双臂实采默认目录调整为仓库根目录下的 `datasets/a10_dual_record`；导出示例使用 `datasets/a10_dual_record_openpi`。`work_dirs` 保留运行日志、诊断及设备检查结果。数据目录已有Git忽略规则，续录仍需显式 `record.resume=True`。

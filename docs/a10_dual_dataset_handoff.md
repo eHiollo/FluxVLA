@@ -88,11 +88,11 @@ with EpisodeWriter(**cfg.record) as writer:
 真实数据目录产生且录制器关闭后，在 `/home/robot/VLA/FluxVLA` 的 fluxvla 环境运行：
 
 ```bash
-python scripts/validate_a10_dataset.py work_dirs/a10/datasets/a10_dual_record
+python scripts/validate_a10_dataset.py datasets/a10_dual_record
 python scripts/export_a10_openpi_dataset.py \
-  --source work_dirs/a10/datasets/a10_dual_record \
-  --output work_dirs/a10/datasets/a10_dual_record_openpi
-python scripts/validate_a10_dataset.py work_dirs/a10/datasets/a10_dual_record_openpi
+  --source datasets/a10_dual_record \
+  --output datasets/a10_dual_record_openpi
+python scripts/validate_a10_dataset.py datasets/a10_dual_record_openpi
 ```
 
 这些命令不会采集设备或创建实机样本。`--record-controller` 依然只用于控制器诊断，不生成此数据集。保存失败/队列满使本集失效；录制器本身没有机械臂停止权限。

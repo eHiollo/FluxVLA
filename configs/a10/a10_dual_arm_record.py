@@ -7,7 +7,7 @@ _base_ = ['./a10_devices.py']
 
 record = dict(
     schema='a10_dual_v1',
-    root='work_dirs/a10/datasets/a10_dual_record',
+    root='datasets/a10_dual_record',
     fps=30,
     cameras={name: dict(width=cfg.width, height=cfg.height,
                         identity=dict(cfg.identity), rotate_180=cfg.rotate_180)

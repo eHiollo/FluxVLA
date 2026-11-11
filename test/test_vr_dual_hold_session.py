@@ -150,6 +150,66 @@ class HoldSessionTest(unittest.TestCase):
                      * Rotation.from_quat(current['left'][3:])).magnitude()
             self.assertLessEqual(angle, 1.4 / 30 + 1e-10)
 
+    def test_stream_loss_in_holding_stops_repeating_old_sdk_targets(self):
+        # Reproduce the incident even if a legacy profile leaves HOLD enabled.
+        self.runtime.stop_on_both_release = False
+        self.move()
+        for _ in range(20): self.tick(False, False)
+        self.assertEqual(self.runtime.last_reference_result['state'], 'holding')
+        count = len(self.robot.targets)
+        for sample in self.vr.input.rows.values():
+            sample.update({'xlevr.enabled': False, 'xlevr.grip_active': False,
+                           'xlevr.verification_tracking': False, 'xlevr.sample_age_s': 46.7})
+        self.clock.advance()
+        self.runtime.step()
+        self.assertEqual(len(self.robot.targets), count)
+        self.assertEqual(self.runtime.input_pause_status['reason'], 'vr_stream_stale')
+        self.assertTrue(self.runtime.input_pause_status['stopped'])
+        self.assertEqual(self.robot.events.count('stop'), 1)
+        self.assertEqual(self.robot.events.count('wait_stopped'), 1)
+        self.assertFalse(self.robot.follower_stop_pending)
+        for _ in range(10):
+            self.clock.advance()
+            self.runtime.step()  # Re-reading the old snapshot must never replay it.
+        self.assertEqual(len(self.robot.targets), count)
+        self.assertEqual(self.robot.events.count('start'), 1)
+
+    def test_normal_both_release_confirms_stop_then_new_press_reclutches_directly(self):
+        self.runtime.stop_on_both_release = True
+        self.move()
+        sent = len(self.robot.targets)
+        self.tick(False, False)
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertEqual(self.runtime.last_reference_result['state'], 'stopped')
+        self.assertFalse(self.robot.follower_stop_pending)
+        self.assertFalse(self.runtime._dual_require_release)
+        # No extra released sample between confirmed stop and the next press.
+        for _ in range(5): self.tick(True, False)
+        self.assertEqual(self.robot.events.count('start'), 2)
+        self.assertEqual(self.runtime._arms['left']['state'], 'tracking')
+        self.assertFalse(self.runtime.last_reference_result['arms']['left']['reengage_requires_release'])
+
+    def test_missing_stream_before_first_clutch_never_starts_robot(self):
+        self.tick(False, False, age=1.)
+        for sample in self.vr.input.rows.values():
+            sample['xlevr.sample_age_s'] = 1.
+        self.clock.advance()
+        self.runtime.step()
+        self.assertEqual(self.runtime.last_reference_result['state'], 'idle')
+        self.assertEqual(self.robot.targets, [])
+        self.assertNotIn('start', self.robot.events)
+        self.assertNotIn('stop', self.robot.events)
+
+    def test_release_still_stops_if_unused_controller_has_no_fresh_sample(self):
+        self.runtime.stop_on_both_release = True
+        self.move(left=False, right=True)
+        sent = len(self.robot.targets)
+        self.tick(False, False, age=2.)  # Only the unused left controller is stale.
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertEqual(self.runtime.last_reference_result['state'], 'stopped')
+        self.assertEqual(self.robot.events.count('stop'), 1)
+        self.assertFalse(self.robot.follower_stop_pending)
+
 
 if __name__ == '__main__':
     unittest.main()

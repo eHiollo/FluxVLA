@@ -639,7 +639,7 @@ class DualSDKRuntimeTest(DualRuntimeTest):
         self.assertEqual(runtime.reference_control.config.max_angular_speed_rad_s, 1.4)
         self.assertEqual(runtime.reference_control.config.max_angular_brake_rad_s2, 10.)
         self.assertEqual(runtime.reference_control.config.rotation_follow_mode, 'incremental_velocity')
-        self.assertFalse(runtime.stop_on_both_release)
+        self.assertTrue(runtime.stop_on_both_release)
         self.assertTrue(runtime.keep_session_on_query_error)
 
     def test_site_binding_routes_hands_to_expected_ids_and_releases_independently(self):

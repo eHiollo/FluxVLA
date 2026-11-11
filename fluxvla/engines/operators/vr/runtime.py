@@ -1116,7 +1116,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         prompt = ('PRESS A SIDE GRIP TO RESUME' if ready else
                   'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING')
         return dict(type='hud', phase='input_ready' if ready else 'input_paused',
-                    hint=f"{status['hand'].upper()} HAND: {status['reason']}", error='',
+                    hint=('VR INPUT STREAM LOST' if status['reason'] == 'vr_stream_stale' else
+                          f"{status['hand'].upper()} HAND: {status['reason']}"), error='',
                     pending=None, input_pause=status,
                     controls=dict(visible=False, ready=ready, prompt=prompt, directions={}))
 
@@ -1305,6 +1306,13 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                           and 0 <= age + max(0., time.monotonic() - self._input_read_time)
                           <= min(context['mapper'].stale_timeout_s,
                                  context['control'].config.max_input_age_s))
+        # A lost browser stream must stop HOLD packets too. Previously only a
+        # pressed/tracking arm checked age, so old nonzero targets were repeated
+        # indefinitely after both hands had already released.
+        if self._dual_time is not None and not any(fresh.values()):
+            raise _VRInputPause(self.arm_names[0], 'vr_stream_stale')
+        for arm, context in self._arms.items():
+            hand_raw = raw[context['hand']]
             if hand_raw.get('xlevr.reset_arm') or action[arm].get('_xlevr.reset_arm'):
                 raise RuntimeError('Dual VR live reset is unsupported; release the side keys')
             if requested[arm] or (self._dual_time is not None and context['state'] == 'tracking'):
@@ -1373,13 +1381,17 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     self.robot.begin_sdk_tool_trajectory(poses)
                 self._send_dual_targets(targets)
             return action
-        # Optional legacy lifecycle: native stop + confirmation on both releases.
-        # The dual site profile instead keeps one follower and brakes each arm below.
-        if self.stop_on_both_release and not any(requested.values()) and all(fresh.values()):
+        # End the native follower when both grips release. A repeating HOLD is
+        # not a verified controller stop; per-arm release below keeps the other arm active.
+        if self.stop_on_both_release and not any(requested.values()) and any(fresh.values()):
             self.last_reference_result = dict(state='stopping', arms={}, transmitted=False,
                                              reason='both_hands_released')
             if self.execute:
                 self._stop_reference()
+                # Both grips were freshly released before this normal stop.
+                # New fresh presses may re-clutch after confirmation; faults
+                # retain their separate release/recovery path.
+                self._dual_require_release = False
             else:
                 self._dual_time = None
                 self._dual_require_release = True

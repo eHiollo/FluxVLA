@@ -10,8 +10,9 @@ teleop = dict(
     vr_only=True, observe_only=False,
     control_mode='reference', pose_mapping='anchor_relative',
     input_recovery_stable_s=.5,  # 松手回中、追踪稳定后，重新按侧键才恢复。
-    # 松开双手只减速保持；退出/故障才请求原生停止，避免每次松手进入停止查询。
-    stop_on_both_release=False,
+    # 现场出现无输入晚运动：双手松开时结束原生跟随并确认停止，不持续重发旧保持包。
+    # 正常停止确认后，新的侧键按下可直接重新接管，不要求再松一次。
+    stop_on_both_release=True,
     # 查询失败保留VR界面，但冻结新目标；不使用过期反馈继续运动或自动重连。
     keep_session_on_query_error=True,
     cartesian_adapter='sdk_tool_cumulative', fps=30,

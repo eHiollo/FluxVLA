@@ -11,12 +11,15 @@ teleop = dict(
     control_mode='reference', pose_mapping='anchor_relative',
     input_recovery_stable_s=.5,  # 松手回中、追踪稳定后，重新按侧键才恢复。
     cartesian_adapter='sdk_tool_cumulative', fps=30,
-    # Initial low-speed trial values, independent of single-arm tuning.
-    # These bound frontend targets, not physical joint speed or collision distance.
+    # 2026-11-11：固化用户本轮现场调参；启动实机仍需显式开放运动权限。
+    # 以下约束前端末端目标；不是电机限速或碰撞距离。
+    controller_speed_percent=70,
     reference_options=dict(
-        max_linear_speed_m_s=.04, max_angular_speed_rad_s=.20,
-        max_linear_accel_m_s2=.4, max_angular_accel_rad_s2=.96,
-        max_reference_lead_m=.02, max_reference_lead_rad=.12,
+        max_linear_speed_m_s=.17, max_angular_speed_rad_s=1.1,
+        max_linear_accel_m_s2=1., max_angular_accel_rad_s2=3.,
+        position_gain=10., rotation_gain=12.,
+        # 旋转软领先预算为0.1rad（约5.7度）；本组配置尚待现场复测。
+        max_reference_lead_m=.03, max_reference_lead_rad=.1,
     ),
     zx_grippers=dict(
         # 2026-11-06: user-confirmed live settings; device checks retain 5%.

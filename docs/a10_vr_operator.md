@@ -710,3 +710,26 @@ max_lead_raw=600，现设为a10_dual_arm_vr_teleop.py默认值。VR仍需显式�
 - 当前换向诊断：16:33:22会话中，以期望速度与上一帧发送速度夹角至少45度、两者速度超过0.02m/s定义明显换向，28个采样段均接近前端0.4m/s²加速度上限（按反馈时间计算，容差±0.02）。包含参考进度未被软预算限制的样本，能确认前端限加速度本身造成部分迟缓；这些计数不是28次独立操作。
 - 0.150 XML只读核对：笛卡尔FollowerCartParam仅关联tg_id=2及UDP9998，未显式配置单独的末端加速度；MotorConfig的关节加速度上限为17.45329252rad/s²，不能与前端0.4m/s²直接比较。SDK内部笛卡尔规划未据此得到完全确认，不声称后端没有延迟。
 - 当前14cm/s平移上限与0.4m/s²加速度对应全速反向至少约0.7秒；0.7rad/s与1.5rad/s²对应全速反向至少约0.93秒。可在现场停止/通信确认后单独对照平移加速度0.6或0.8，最大速度保持一致；本轮未改动加速度、控制器XML或启动任何实机运动。
+
+
+### 2026-11-11：双臂VR现场调参设为默认值
+
+`configs/a10/a10_dual_arm_vr_teleop.py` 已按用户指定固化本轮参数：控制器倍率70%，
+最大线/角速度0.17m/s、1.1rad/s，最大线/角加速度1.0m/s²、3.0rad/s²，
+平移/旋转跟随增益10、12，reference软领先预算0.03m、0.1rad（约5.7°）。
+本次仅保存参数，不代表新增的0.1rad预算已完成实机验收；停止查询超时另行处理。
+
+实机遥操作并记录控制器状态可缩短为（需现场正常使能）：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-controller \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True
+```
+
+配置仍默认VR-only、禁止运动，知行夹爪仍需单独开启；上述命令只省略已固化的运动参数。
+命令行 `--cfg-options` 可覆盖这些默认值，单臂配置不继承本轮双臂调参。

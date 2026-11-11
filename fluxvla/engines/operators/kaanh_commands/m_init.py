@@ -73,7 +73,7 @@ def initialize_grippers(robot, targets_mm):
 
 
 def move_to_init(robot, progress=None, *, cancel_event=None):
-    """Block until arm arrival and confirmed follower stop; never raw fallback."""
+    """Return to init, then restore the prior follower mode and activation."""
     configure_init_motion(
         robot, joint_dofs=robot.joint_dofs,
         init_position=getattr(robot, 'init_position', None),
@@ -89,19 +89,23 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
         raise RuntimeError('Initialization is already running')
     claimed = attempted = False
     speed_restore = None
+    control_restore = None
     motion_percent = 5
     previous_mode = robot.command_mode
     result = dict(arms_arrived=False, grippers_initialized=False,
                   follower_stopped=False, completed=False, phase='preflight',
                   joint_packets_sent=0, error=None, stop_error=None,
-                  original_speed=None, speed_restored=False, speed_restore_error=None)
+                  original_speed=None, speed_restored=False, speed_restore_error=None,
+                  original_control_state=None, control_state_restored=False,
+                  control_restore_error=None)
     robot.last_init_motion = result
     failure = None
     try:
         robot._claim_init_motion()
         claimed = True
         check_cancelled()
-        robot._prepare_init_motion()
+        control_restore = robot._prepare_init_motion()
+        result['original_control_state'] = control_restore
         check_cancelled()
         result['phase'] = 'setting_speed'
         original_speed = robot.get_speed_override()
@@ -212,13 +216,34 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
                             progress(f'速度倍率恢复未确认：{restore_error}')
                         if failure is None and result['stop_error'] is None:
                             raise RuntimeError(f'初始化运动已结束，但速度倍率恢复未确认：{restore_error}') from restore_error
+                if (failure is None and result['stop_error'] is None
+                        and result['arms_arrived'] and result['speed_restored']):
+                    result['phase'] = 'restoring_control'
+                    try:
+                        check_cancelled()
+                        state = robot._restore_init_control_state(control_restore)
+                        check_cancelled()
+                        result['control_state_restored'] = True
+                        result['follower_active'] = state.follower_active
+                        result['follower_mode'] = state.follower_mode
+                    except BaseException as restore_error:
+                        result['control_restore_error'] = f'{type(restore_error).__name__}: {restore_error}'
+                        result['error'] = result['control_restore_error']
+                        if robot.follower_stop_pending:
+                            try:
+                                robot.stop_follower()
+                            except BaseException as stop_error:
+                                result['stop_error'] = f'{type(stop_error).__name__}: {stop_error}'
+                                raise InitMotionError(restore_error, stop_error, 'restoring_control',
+                                                      result['joint_packets_sent']) from restore_error
+                        raise
             finally:
                 robot.command_mode = previous_mode
                 if claimed:
                     robot._release_init_motion()
                 robot._init_motion_lock.release()
     result['completed'] = (result['arms_arrived'] and result['follower_stopped']
-                           and result['speed_restored'])
+                           and result['speed_restored'] and result['control_state_restored'])
     if not result['completed']:
         raise RuntimeError('Initialization follower stop was not confirmed')
     result['phase'] = 'complete'
@@ -232,7 +257,7 @@ def configure_parser(parser):
 def execute(robot, args, output):
     output('执行 FluxVLA 本地 m_init，返回机器人定义的初始位置。')
     result = move_to_init(robot, progress=output)
-    output('机械臂初始化到位（实际关节反馈已确认），本次 follower 已停止。')
+    output('机械臂初始化到位（实际关节反馈已确认），原 follower 状态、控制模式及速度倍率已恢复。')
     output('夹爪初始化已完成。' if result['grippers_initialized'] else
            '夹爪初始化尚未执行（预留接口，初始开度默认 0 mm）。')
     return result

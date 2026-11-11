@@ -1362,10 +1362,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 self._arms[name]['control'].validate_command(
                     action[name]['_xlevr.anchor_command'], poses[name])
             if self.execute:
-                self.robot.set_tool_coordinate()
                 self._reference_stop_attempted = False
                 self.last_stop_status = None
-                self.robot.start_follower('cartesian')
+                if not self._started_follower:
+                    self.robot.set_tool_coordinate()
+                    self.robot.start_follower('cartesian')
                 self._started_follower = True
                 poses = self._checked_frame(require_active=True)
             targets = {}

@@ -23,8 +23,6 @@
     双臂（192.168.0.150）：
     python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
 
-    默认进入 shell 并允许控制，不自动使能；只读启动加 --read-only。
-
     修改机器人 IP：在 shell 前加 --host 新IP，覆盖配置中的 operator.host。
     不带 --config 时默认单臂配置 configs/a10/a10_operator.py。
     切换单臂/双臂使用 --config；每个配置的 init_position 对应这台机器人。
@@ -97,16 +95,24 @@ python scripts/teleoperate.py \
   --cfg-options \
     teleop.vr_only=False \
     teleop.observe_only=False \
-    teleop.operator.allow_motion=True \
-    teleop.controller_speed_percent=50 \
-    teleop.reference_options.max_linear_speed_m_s=0.08 \
-    teleop.reference_options.max_angular_speed_rad_s=0.6 \
-    teleop.reference_options.max_linear_accel_m_s2=0.4 \
-    teleop.reference_options.max_angular_accel_rad_s2=1.5 \
-    teleop.reference_options.max_reference_lead_m=0.03 \
-    teleop.reference_options.max_reference_lead_rad=0.30 \
-    teleop.max_rotation_step_rad=0.025 
+    teleop.operator.allow_motion=True
 
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-controller \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True \
+    teleop.controller_speed_percent=70 \
+    teleop.reference_options.max_linear_speed_m_s=0.17 \
+    teleop.reference_options.max_angular_speed_rad_s=1.1 \
+    teleop.reference_options.max_linear_accel_m_s2=1.0 \
+    teleop.reference_options.max_angular_accel_rad_s2=3.0 \
+    teleop.reference_options.position_gain=10.0 \
+    teleop.reference_options.rotation_gain=16.0 \
+    teleop.reference_options.max_reference_lead_m=0.03 \
+    teleop.reference_options.max_reference_lead_rad=0.3
 
 ====数据录制====
 cd /home/robot/VLA/FluxVLA
@@ -118,7 +124,8 @@ python scripts/teleoperate.py \
   --record-options \
     record.root=/home/robot/VLA/FluxVLA/datasets/a10_dual_record \
     record.resume=True \
-  --measure-vr-latency \
+    record.recover=True \
+  --record-controller \
   --cfg-options \
     teleop.vr_only=False \
     teleop.observe_only=False \
@@ -132,7 +139,10 @@ python scripts/teleoperate.py \
     teleop.reference_options.max_reference_lead_m=0.03 \
     teleop.reference_options.max_reference_lead_rad=0.30 \
     teleop.max_rotation_step_rad=0.030
- --record-controller \
+
+
+ --measure-vr-latency \
+
   
 # 夹爪参数
 python scripts/teleoperate.py \

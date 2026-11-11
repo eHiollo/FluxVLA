@@ -361,11 +361,10 @@ class RecordingSession:
         error = None
         try:
             from ..kaanh_commands.m_init import move_to_init
-            if robot.follower_stop_pending: robot.stop_follower()
-            robot.wait_stopped()
             if self.reset_cancel.is_set(): raise InterruptedError('Reset cancelled before motion')
             move_to_init(robot, cancel_event=self.reset_cancel)
-            robot.wait_stopped()
+            if not robot.follower_stop_pending:
+                robot.wait_stopped()
         except Exception as exc:
             error = str(exc)
             try: robot.stop_all_actions()
@@ -379,7 +378,8 @@ class RecordingSession:
         error = self.reset_result.get_nowait()
         # All mapper/reference state changes happen back on the control thread.
         r = self.runtime
-        r._started_follower = False; r._dual_time = None; r._dual_require_release = True
+        r._started_follower = not error and r.robot.follower_stop_pending
+        r._dual_time = None; r._dual_require_release = True
         r._reference_stop_attempted = False
         r.teleoperator.reset_reference()
         self.buttons.reset(); self.pending = None

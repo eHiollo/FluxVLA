@@ -1203,9 +1203,9 @@ class A10Operator(BaseOperator):
             self._follower_mode = None
 
     def set_jog_coordinate(self, coordinate):
-        """Explicitly select Axis or Tool jog coordinates and verify feedback."""
-        if coordinate not in ('Axis', 'Tool'):
-            raise ValueError('coordinate must be Axis or Tool')
+        """Select controller jog coordinates and verify feedback while stopped."""
+        if coordinate not in ('Axis', 'Tool', 'Base', 'Wobj'):
+            raise ValueError('coordinate must be Axis, Tool, Base or Wobj')
         with self._io_lock:
             self._require_motion()
             self._prepare_shared_console_command()
@@ -1238,6 +1238,11 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             self._require_motion()
             if self._started_here:
+                state = self.get_state()
+                owns = not self.shared_control or self._connection.lease('status')['owns']
+                if owns and self._confirmed_active and state.follower_mode == feedback_mode:
+                    self.command_mode = mode
+                    return state  # Already in this session's confirmed mode; no duplicate start.
                 raise RuntimeError('This session has a pending follower; stop_follower before switching modes')
             if self.shared_control:
                 self._connection.lease('acquire')
@@ -1882,10 +1887,62 @@ class A10Operator(BaseOperator):
     def _prepare_init_motion(self):
         with self._io_lock:
             self._require_motion()
+            state = self.get_state()
+            if state.follower_active not in (True, False):
+                raise RuntimeError('Initialization requires known follower state')
+            snapshot = dict(follower_active=state.follower_active,
+                            follower_mode=state.follower_mode,
+                            jog_coordinate=state.raw['ret_context']['motion_msg'].get('jog_coordinate'))
+            if state.follower_active and state.follower_mode not in ('Axis', 'Cart'):
+                raise RuntimeError('Cannot restore an unknown follower mode')
             self._prepare_shared_console_command()
+            if state.follower_active and not self.shared_control and not self._started_here:
+                # Explicit m_init temporarily borrows the controller's existing follower.
+                # Stop it before setting speed or entering a different plan.
+                self._started_here = True
+                self._follower_mode = state.follower_mode
             if self.follower_stop_pending:
                 self.stop_follower()
             self._check_init_speed(self.get_state())
+            return snapshot
+
+    def _restore_init_control_state(self, snapshot):
+        """Restore mode/activation after arrival, without replaying any old target."""
+        with self._io_lock:
+            self._require_motion()
+            state = self.get_state()
+            coordinate = snapshot['jog_coordinate']
+            mode = snapshot['follower_mode']
+            select_plan = mode in ('Axis', 'Cart') and (
+                snapshot['follower_active'] or state.follower_mode != mode)
+            plan_coordinate = coordinate
+            if select_plan and mode == 'Cart' and coordinate == 'Axis' and not snapshot['follower_active']:
+                plan_coordinate = 'Tool'  # Temporarily select Cart, then restore inactive Axis coordinates.
+            if (plan_coordinate is not None and
+                    state.raw['ret_context']['motion_msg'].get('jog_coordinate') != plan_coordinate):
+                self.set_jog_coordinate(plan_coordinate)
+            if select_plan:
+                # Even an inactive controller retains its last Axis/Cart selection.
+                # Select the original plan without sending a UDP target, then
+                # stop it again if the follower was originally inactive.
+                self._traj_stop_event.clear()
+                self.start_follower('joint' if mode == 'Axis' else 'cartesian')
+                if not snapshot['follower_active']:
+                    self.stop_follower()
+            self._require_motion()
+            state = self.get_state()
+            if (not snapshot['follower_active'] and coordinate is not None and
+                    state.raw['ret_context']['motion_msg'].get('jog_coordinate') != coordinate):
+                self.set_jog_coordinate(coordinate)
+                state = self.get_state()
+            if (state.follower_active != snapshot['follower_active']
+                    or (mode in ('Axis', 'Cart') and state.follower_mode != mode)
+                    or (coordinate is not None and
+                        state.raw['ret_context']['motion_msg'].get('jog_coordinate') != coordinate)):
+                raise RuntimeError('Original follower state or coordinate was not restored')
+            # Cartesian encoding must be anchored anew at the post-init actual pose.
+            self._reset_cartesian_encoding()
+            return state
 
     @staticmethod
     def _check_init_speed(state):

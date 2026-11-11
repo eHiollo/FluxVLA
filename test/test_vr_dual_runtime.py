@@ -380,18 +380,19 @@ class DualRuntimeTest(unittest.TestCase):
         for name, actual in restart_actual.items():
             np.testing.assert_allclose(self.runtime._arms[name]['control'].startup_anchor, actual)
 
-    def test_press_during_deceleration_requires_new_release(self):
+    def test_press_during_deceleration_resumes_without_an_extra_release(self):
         self.move()
         self.tick(False, True, .005, .005)
         for i in range(20):
             self.tick(True, True, .1, .005 + .0001 * i)
-        self.assertTrue(self.runtime._arms['left']['blocked'])
-        self.assertEqual(self.runtime._arms['left']['state'], 'holding')
-        self.tick(False, True, .1, .008)
-        for _ in range(4):
-            self.tick(True, True, .1, .008)
         self.assertEqual(self.runtime._arms['left']['state'], 'tracking')
+        self.assertEqual(self.runtime._arms['right']['state'], 'tracking')
+        self.assertFalse(self.runtime.last_reference_result['arms']['left']['reengage_requires_release'])
         self.assertEqual(self.robot.events.count('start'), 1)
+        self.assertNotIn('stop', self.robot.events)
+        for previous, current in zip(self.robot.targets, self.robot.targets[1:]):
+            for name in ('left', 'right'):
+                self.assertLessEqual(np.linalg.norm(current[name][:3] - previous[name][:3]), .12 / 30 + 1e-10)
 
     def test_stale_active_hand_stops_group_no_partial_send_and_no_auto_restart(self):
         self.move()

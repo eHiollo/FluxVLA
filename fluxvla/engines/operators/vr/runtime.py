@@ -500,8 +500,8 @@ class VRTeleopRuntime:
                 self.last_tracking_warning = dict(position_error_m=float(position_error),
                                                   rotation_error_rad=float(rotation_error))
                 if not self._tracking_warning_logged:
-                    logging.getLogger(__name__).warning(
-                        '末端跟踪误差超出参考值，仅记录不退出：位置%.4fm，姿态%.4frad',
+                    logging.getLogger(__name__).info(
+                        '跟踪误差参考（不限制、不锁定）：位置%.4fm，姿态%.4frad',
                         position_error, rotation_error)
                     self._tracking_warning_logged = True
                 return
@@ -998,7 +998,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             raise ValueError('Dual release requires acceleration limiting')
         self._arms = {arm: dict(hand=hand, mapper=vr.mappers[hand],
                                control=VRPoseController(self.reference_control.config),
-                               state='holding', blocked=False, key=None, target=None)
+                               state='holding', key=None, target=None)
                       for hand, arm in vr.hand_to_arm.items()}
         self._dual_time = None
         self._dual_require_release = False
@@ -1362,7 +1362,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 poses = self._checked_frame(require_active=True)
             targets = {}
             for name, context in self._arms.items():
-                context.update(state='holding', blocked=False, key=None, target=poses[name].copy())
+                context.update(state='holding', key=None, target=poses[name].copy())
                 context['control'].start(poses[name])
                 targets[name] = poses[name].copy()
             self.teleoperator.reset_reference()  # Discard input predating blocking WS setup.
@@ -1400,11 +1400,10 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     raise RuntimeError(f'Dual VR {name}: anchor_changed_while_engaged')
             if context['state'] == 'tracking' and not requested[name]:
                 context['state'] = 'releasing'
-            if context['state'] == 'releasing' and requested[name]:
-                context['blocked'] = True  # Must release again after stopping, never auto-resume.
-            if context['state'] == 'holding' and fresh[name] and not requested[name]:
-                context['blocked'] = False
-            if active and context['state'] != 'releasing' and not context['blocked']:
+            # A fresh clutch press can resume even during frontend braking.
+            # continuous_reanchor preserves the command pose and velocity;
+            # input/transport fault recovery is handled separately above.
+            if active:
                 age = raw[context['hand']]['xlevr.sample_age_s'] + max(0., now - self._input_read_time)
                 result = control.step(command, poses[name], dt, sample_age_s=age,
                                       feedback_age_s=feedback_age, continuous_reanchor=True)
@@ -1416,7 +1415,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 if context['state'] == 'releasing':
                     context['state'] = result['state']
             results[name] = result
-            result.update(hand=context['hand'], reengage_requires_release=context['blocked'])
+            result.update(hand=context['hand'], reengage_requires_release=False)
             self.last_reference_result = dict(state='running', arms=results, transmitted=False)
             if result['stop_requested']:
                 raise RuntimeError(f"Dual VR {name}: {result['fault_reason']}")

@@ -1331,3 +1331,10 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 随后用户明确要求放宽前端运动阈值：增加enforce_tracking_error_limits开关（类/单臂默认True），双臂默认False，超差仅记录告警；双臂两种softlead设None，继续使用最大速度、加速度和制动约束。不因reference/command/release跟踪差停止，释放以command归零稳定为holding，实际quiet仍展示，非物理停止证明。runtime重复误差检查同步采用同一策略，避免内层放宽后外层仍退出。
 - 输入/反馈有效性和时效、控制间隔、控制器故障、通信失败暂停及SDK驱动保护保持原流程；没有修改远端控制器。旧CLI若显式传lead数值仍会重新启用软限制。新回归验证远大于原阈值时仍以限定速度/加速度发送完整双臂SDK数据，以及恢复True后原故障与无效数据检查有效。
 - 最终验证：145项相关离线/本地回环回归通过（15.085秒），包含新增放宽策略与完整双臂SDK发包检查；最终默认参数的实机标志+record-controller预览通过。未执行真实机器人控制；仅整理本轮自有修改，保留其他会话未提交内容。
+
+### 2026-11-11：移除正常松手再握的二次释放锁
+
+- 用户反馈误差WARNING后不便接管。读取18:34会话发现18:36:32.563释放、32.630重新握住，旧逻辑在releasing期间设blocked/reengage_requires_release=True，保持后仍需再释放；没有input_pause或communication_pause，该WARNING并未停止控制。
+- 删除正常每臂blocked锁，已验证的新鲜侧键输入在减速过程中也可直接接管；continuous_reanchor保留命令位姿与速度，不回跳反馈、不重启SDK、不重置另一臂。历史reengage_requires_release字段保留False以兼容诊断。
+- 跟踪误差只记录策略的终端提示改为INFO，一次提示且明确“不限制、不锁定”。没有移除失联或控制器故障的暂停。同步更新VR说明和命令速查中原“等保持后再次释放”旧说明，命令不变。
+- 验证：既有双臂/SDK生命周期与保持会话共65项通过（4.414秒），新增连续快速松握、旋转连续和完整双臂目标速度上限验证；真实故障不自动恢复的既有回归仍通过。本轮未连接控制接口或执行实机运动；保留用户未提交修改。

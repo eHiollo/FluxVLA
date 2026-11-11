@@ -124,6 +124,32 @@ class HoldSessionTest(unittest.TestCase):
                          * Rotation.from_quat(current[name][3:])).magnitude()
                 self.assertLessEqual(angle, 1.4 / 30 + 1e-10)
 
+    def test_short_release_then_press_keeps_incremental_rotation_continuous(self):
+        cfg = ReferenceConfig(enforce_tracking_error_limits=False,
+                              rotation_follow_mode='incremental_velocity',
+                              max_angular_speed_rad_s=1.4, max_angular_accel_rad_s2=6.,
+                              max_angular_brake_rad_s2=10.)
+        self.runtime.reference_control = VRPoseController(cfg)
+        for context in self.runtime._arms.values():
+            context['control'] = VRPoseController(cfg)
+        self.runtime.stop_on_both_release = False
+        for i in range(24):
+            self.tick(True, False, angle=.035 * i)
+        self.assertGreater(np.linalg.norm(self.runtime._arms['left']['control'].angular_velocity), .8)
+        for cycle in range(4):
+            self.tick(False, False, angle=.035 * 23)
+            for i in range(6):
+                self.tick(True, False, angle=.035 * 23 + .02 * i)
+            self.assertEqual(self.runtime._arms['left']['state'], 'tracking')
+            self.assertFalse(self.runtime.last_reference_result['arms']['left']['reengage_requires_release'])
+        self.assertEqual(self.robot.events.count('start'), 1)
+        self.assertEqual(self.robot.events.count('begin_sdk'), 1)
+        self.assertNotIn('stop', self.robot.events)
+        for previous, current in zip(self.robot.targets, self.robot.targets[1:]):
+            angle = (Rotation.from_quat(previous['left'][3:]).inv()
+                     * Rotation.from_quat(current['left'][3:])).magnitude()
+            self.assertLessEqual(angle, 1.4 / 30 + 1e-10)
+
 
 if __name__ == '__main__':
     unittest.main()

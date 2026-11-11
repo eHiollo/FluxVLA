@@ -105,6 +105,8 @@ class ReferenceConfig:
     max_angular_speed_rad_s: float = .32
     max_tracking_error_m: float = .05
     max_tracking_error_rad: float = .35
+    # False keeps measured errors as diagnostics; motion/time limits still apply.
+    enforce_tracking_error_limits: bool = True
     # C++ default 50 * 2 ms. Use elapsed time when frontend rate changes.
     tracking_fault_after_s: float = .1
     max_input_age_s: float = .25
@@ -115,6 +117,10 @@ class ReferenceConfig:
     max_angular_accel_rad_s2: float = .96
     position_gain: float = 6.
     rotation_gain: float = 4.8
+    # Incremental mode follows current hand motion and drops angular catch-up.
+    rotation_follow_mode: str = 'anchor'
+    rotation_velocity_deadzone_rad_s: float = .03
+    max_angular_brake_rad_s2: float | None = None
     # None preserves the original C++ parity path. Config opts into soft lead limits.
     max_reference_lead_m: float | None = None
     max_reference_lead_rad: float | None = None
@@ -126,17 +132,29 @@ class ReferenceConfig:
     release_timeout_s: float = 2.
 
     def __post_init__(self):
+        if self.rotation_follow_mode not in ('anchor', 'incremental_velocity'):
+            raise ValueError('rotation_follow_mode must be anchor or incremental_velocity')
+        if self.rotation_follow_mode == 'incremental_velocity' and not self.limit_acceleration:
+            raise ValueError('incremental_velocity requires limit_acceleration=True')
         for name, value in vars(self).items():
+            if name == 'rotation_follow_mode':
+                continue
+            if name == 'max_angular_brake_rad_s2' and value is None:
+                continue
+            if name == 'rotation_velocity_deadzone_rad_s':
+                if isinstance(value, bool) or not math.isfinite(value) or value < 0:
+                    raise ValueError(f'{name} must be finite and nonnegative')
+                continue
             if name in ('max_reference_lead_m', 'max_reference_lead_rad') and value is None:
                 continue
-            if name == 'limit_acceleration':
+            if name in ('limit_acceleration', 'enforce_tracking_error_limits'):
                 if type(value) is not bool:
-                    raise ValueError('limit_acceleration must be bool')
+                    raise ValueError(f'{name} must be bool')
             elif isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be positive and finite')
         for lead, hard in ((self.max_reference_lead_m, self.max_tracking_error_m),
                            (self.max_reference_lead_rad, self.max_tracking_error_rad)):
-            if lead is not None and lead >= hard:
+            if self.enforce_tracking_error_limits and lead is not None and lead >= hard:
                 raise ValueError('Reference lead limit must be smaller than the tracking fault limit')
 
 
@@ -293,7 +311,9 @@ class ReferenceGovernor:
         rotation = Rotation.from_quat(ref[3:])
         self.tracking_error_m = float(np.linalg.norm(ref[:3] - actual[:3]))
         self.tracking_error_rad = float((rotation.inv() * Rotation.from_quat(actual[3:])).magnitude())
-        if self.tracking_error_m > cfg.max_tracking_error_m or self.tracking_error_rad > cfg.max_tracking_error_rad:
+        if cfg.enforce_tracking_error_limits and (
+                self.tracking_error_m > cfg.max_tracking_error_m
+                or self.tracking_error_rad > cfg.max_tracking_error_rad):
             self.frozen_s += dt_s
             self.state = 'fault' if self.frozen_s + 1e-12 >= cfg.tracking_fault_after_s else 'frozen'
             if self.state == 'fault':
@@ -339,6 +359,8 @@ class VRPoseController:
             raise ValueError('pose_calibration must be a dictionary')
         if pose_mapping == 'calibrated_absolute' and pose_calibration is None:
             raise ValueError('calibrated_absolute requires explicit pose_calibration')
+        if self.config.rotation_follow_mode == 'incremental_velocity' and pose_mapping != 'anchor_relative':
+            raise ValueError('incremental_velocity requires anchor_relative pose mapping')
         self.pose_mapping = pose_mapping
         # Own calibration data so caller edits cannot change a running mapping.
         self.pose_calibration = (None if pose_calibration is None else
@@ -355,6 +377,11 @@ class VRPoseController:
         self._release_previous_actual = None
         self._reanchor_translation = np.zeros(3)
         self._reanchor_rotation = Rotation.identity()
+        self._rotation_previous_target = None
+        self._rotation_sample_elapsed_s = 0.
+        self.rotation_input_base_rad_s = np.zeros(3)
+        self.rotation_backlog_discarded_rad = 0.
+        self._command_tracking_limit_exceeded = False
 
     def _new_anchor(self):
         return (CalibratedAnchorState(self.pose_calibration)
@@ -382,11 +409,56 @@ class VRPoseController:
                     relative_target=follower_relative(self.startup_anchor, self.command_pose).tolist() if active else None,
                     tracking_error_m=self.governor.tracking_error_m,
                     tracking_error_rad=self.governor.tracking_error_rad,
+                    enforce_tracking_error_limits=self.config.enforce_tracking_error_limits,
+                    tracking_limit_exceeded=bool(
+                        self._command_tracking_limit_exceeded
+                        or self.governor.tracking_error_m > self.config.max_tracking_error_m
+                        or self.governor.tracking_error_rad > self.config.max_tracking_error_rad),
                     frozen_s=self.governor.frozen_s,
                     reference_progress_scale=dict(position=self.governor.position_progress_scale,
                                                   rotation=self.governor.rotation_progress_scale),
                     linear_velocity_m_s=self.linear_velocity.tolist(),
-                    angular_velocity_rad_s=self.angular_velocity.tolist())
+                    angular_velocity_rad_s=self.angular_velocity.tolist(),
+                    rotation_follow_mode=self.config.rotation_follow_mode,
+                    rotation_input_base_rad_s=self.rotation_input_base_rad_s.tolist(),
+                    rotation_input_stationary=(None if self.config.rotation_follow_mode == 'anchor' else
+                                               bool(np.linalg.norm(self.rotation_input_base_rad_s) == 0.)),
+                    rotation_backlog_discarded_rad=self.rotation_backlog_discarded_rad)
+
+    def _incremental_rotation(self, packet, tracking_target, dt_s):
+        """Consume each accepted orientation once, in base axes, without a queue.
+
+        Speed limiting intentionally discards unexecuted angular travel. This is
+        motion following, not eventual arrival at the absolute anchor attitude.
+        """
+        self._rotation_sample_elapsed_s += dt_s
+        self.rotation_input_base_rad_s.fill(0.)
+        current = Rotation.from_quat(tracking_target[3:])
+        if packet in ('anchored', 'updated'):
+            if packet == 'updated' and self._rotation_previous_target is not None:
+                self.rotation_input_base_rad_s = ((current * self._rotation_previous_target.inv()).as_rotvec()
+                                                  / self._rotation_sample_elapsed_s)
+                if np.linalg.norm(self.rotation_input_base_rad_s) < self.config.rotation_velocity_deadzone_rad_s:
+                    self.rotation_input_base_rad_s.fill(0.)
+            self._rotation_previous_target = current
+            self._rotation_sample_elapsed_s = 0.
+        rotation = Rotation.from_quat(self.command_pose[3:])
+        angular = clamp_vector(rotation.inv().apply(self.rotation_input_base_rad_s),
+                               self.config.max_angular_speed_rad_s)
+        self.rotation_backlog_discarded_rad = float((rotation.inv() * current).magnitude())
+        # Keep the position governor unchanged. Angular reference starts at the
+        # continuous command, never jumps to feedback or the old hand target.
+        self.governor.reference[3:] = self.command_pose[3:]
+        target = tracking_target.copy()
+        target[3:] = (rotation * Rotation.from_rotvec(angular * dt_s)).as_quat()
+        return angular, target
+
+    def _angular_acceleration_limit(self, desired):
+        if (self.config.max_angular_brake_rad_s2 is not None
+                and np.linalg.norm(desired) < np.linalg.norm(self.angular_velocity)
+                and np.dot(desired - self.angular_velocity, self.angular_velocity) < 0.):
+            return self.config.max_angular_brake_rad_s2
+        return self.config.max_angular_accel_rad_s2
 
     def step(self, command, actual, dt_s, *, sample_age_s=0., feedback_age_s=0., has_error=False,
              continuous_reanchor=False):
@@ -450,7 +522,11 @@ class VRPoseController:
             return self._result('inactive', packet=packet)
         tracking_target = np.r_[self.anchor.target[:3] + self._reanchor_translation,
                                 (self._reanchor_rotation * Rotation.from_quat(self.anchor.target[3:])).as_quat()]
-        state = self.governor.step(tracking_target, actual, dt_s)
+        angular_input = None
+        governor_target = tracking_target
+        if self.config.rotation_follow_mode == 'incremental_velocity':
+            angular_input, governor_target = self._incremental_rotation(packet, tracking_target, dt_s)
+        state = self.governor.step(governor_target, actual, dt_s)
         if state == 'fault':
             self.fault_reason = 'tracking_error'
             return self._result('fault', stop=True, packet=packet)
@@ -463,6 +539,8 @@ class VRPoseController:
                                   self.config.max_linear_speed_m_s)
             angular = clamp_vector((rotation.inv() * Rotation.from_quat(reference[3:])).as_rotvec() * self.config.rotation_gain,
                                    self.config.max_angular_speed_rad_s)
+            if angular_input is not None:
+                angular = angular_input * self.governor.rotation_progress_scale
             if state == 'frozen':
                 linear.fill(0.)
                 angular.fill(0.)
@@ -472,7 +550,7 @@ class VRPoseController:
             self.linear_velocity += clamp_vector(linear - self.linear_velocity,
                                                  self.config.max_linear_accel_m_s2 * dt_s)
             self.angular_velocity += clamp_vector(angular - self.angular_velocity,
-                                                  self.config.max_angular_accel_rad_s2 * dt_s)
+                                                  self._angular_acceleration_limit(angular) * dt_s)
             self.command_pose = np.r_[self.command_pose[:3] + self.linear_velocity * dt_s,
                                       (rotation * Rotation.from_rotvec(self.angular_velocity * dt_s)).as_quat()]
         else:
@@ -481,7 +559,9 @@ class VRPoseController:
         # It must never turn that into an unbounded command/feedback separation.
         error_m = np.linalg.norm(self.command_pose[:3] - actual[:3])
         error_rad = (Rotation.from_quat(actual[3:]).inv() * Rotation.from_quat(self.command_pose[3:])).magnitude()
-        if error_m > self.config.max_tracking_error_m or error_rad > self.config.max_tracking_error_rad:
+        self._command_tracking_limit_exceeded = bool(
+            error_m > self.config.max_tracking_error_m or error_rad > self.config.max_tracking_error_rad)
+        if self.config.enforce_tracking_error_limits and self._command_tracking_limit_exceeded:
             self.fault_reason = 'command_tracking_error'
             self.governor.force_fault(actual)
             result = self._result('fault', stop=True, packet=packet)
@@ -513,12 +593,15 @@ class VRPoseController:
             return self._result('fault', stop=True)
         self.anchor.active = False
         self.anchor.target = None
+        self._rotation_previous_target = None
+        self._rotation_sample_elapsed_s = 0.
+        self.rotation_input_base_rad_s.fill(0.)
         self.governor.reference = None
         self._release_elapsed_s += dt_s
         self.linear_velocity -= clamp_vector(self.linear_velocity,
                                              self.config.max_linear_accel_m_s2 * dt_s)
         self.angular_velocity -= clamp_vector(self.angular_velocity,
-                                              self.config.max_angular_accel_rad_s2 * dt_s)
+                                              self._angular_acceleration_limit(np.zeros(3)) * dt_s)
         rotation = Rotation.from_quat(self.command_pose[3:])
         self.command_pose = np.r_[self.command_pose[:3] + self.linear_velocity * dt_s,
                                   (rotation * Rotation.from_rotvec(self.angular_velocity * dt_s)).as_quat()]
@@ -526,8 +609,9 @@ class VRPoseController:
         error_rad = float((Rotation.from_quat(actual[3:]).inv()
                            * Rotation.from_quat(self.command_pose[3:])).magnitude())
         self.governor.tracking_error_m, self.governor.tracking_error_rad = error_m, error_rad
-        if (error_m > self.config.max_tracking_error_m
-                or error_rad > self.config.max_tracking_error_rad):
+        self._command_tracking_limit_exceeded = bool(
+            error_m > self.config.max_tracking_error_m or error_rad > self.config.max_tracking_error_rad)
+        if self.config.enforce_tracking_error_limits and self._command_tracking_limit_exceeded:
             self.fault_reason = 'release_tracking_error'
         stopped_command = (np.linalg.norm(self.linear_velocity) < 1e-10
                            and np.linalg.norm(self.angular_velocity) < 1e-10)
@@ -538,12 +622,14 @@ class VRPoseController:
                      and (Rotation.from_quat(previous[3:]).inv()
                           * Rotation.from_quat(actual[3:])).magnitude() <= .05 * dt_s)
         self._release_previous_actual = actual.copy()
-        # Holding is not precision arrival. Residual error stays visible and
-        # bounded by max_tracking_error_* above; it is never silently zeroed.
-        settled = stopped_command and quiet and self.fault_reason is None
+        # With tracking enforcement disabled, holding confirms only frontend
+        # setpoint deceleration; measured motion/errors remain visible in logs.
+        settled = (stopped_command and (quiet or not self.config.enforce_tracking_error_limits)
+                   and self.fault_reason is None)
         self._release_settled_s = self._release_settled_s + dt_s if settled else 0.
         held = self._release_settled_s >= self.config.release_settle_s
-        if not held and self._release_elapsed_s > self.config.release_timeout_s:
+        if (self.config.enforce_tracking_error_limits and not held
+                and self._release_elapsed_s > self.config.release_timeout_s):
             self.fault_reason = self.fault_reason or 'release_settle_timeout'
         if self.fault_reason:
             return self._result('fault', stop=True)

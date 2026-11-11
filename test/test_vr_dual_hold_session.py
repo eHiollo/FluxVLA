@@ -1,0 +1,129 @@
+"""Dual hold/re-clutch and query failure handling; synthetic devices only."""
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+import test_vr_dual_runtime as dual
+from fluxvla.engines.operators.vr.control import ReferenceConfig, VRPoseController
+
+
+class HoldSessionTest(unittest.TestCase):
+    robot_type = dual.DualSDKRobot
+    cartesian_adapter = 'sdk_tool_cumulative'
+    setUp = dual.DualRuntimeTest.setUp
+    tick = dual.DualRuntimeTest.tick
+    move = dual.DualRuntimeTest.move
+
+    def test_both_release_holds_without_stop_queries_and_reclutches_same_follower(self):
+        self.runtime.stop_on_both_release = False
+        self.move()
+        for _ in range(30):
+            self.tick(False, False)
+        self.assertEqual(self.runtime.last_reference_result['state'], 'holding')
+        self.assertTrue(all(c['state'] == 'holding' for c in self.runtime._arms.values()))
+        self.assertNotIn('stop', self.robot.events)
+        self.assertNotIn('wait_stopped', self.robot.events)
+        for i in range(10):
+            self.tick(True, False, .007 + i * .0003, .004)
+        self.assertEqual(self.robot.events.count('start'), 1)
+        self.assertEqual(self.robot.events.count('begin_sdk'), 1)
+        self.assertEqual(self.runtime._arms['left']['state'], 'tracking')
+        self.assertEqual(self.runtime._arms['right']['state'], 'holding')
+        self.runtime.close()
+        self.assertEqual(self.robot.events.count('stop'), 1)
+        self.assertEqual(self.robot.events.count('wait_stopped'), 1)
+
+    def fail_query(self, command='get'):
+        self.robot.last_communication_failure = dict(command=command, failed_wall_ns=time.time_ns(),
+                                                      events=[], error='synthetic timeout')
+        raise TimeoutError(f"A10 command '{command}' reply timed out after 2.000s")
+
+    def test_query_failure_keeps_vr_and_jsonl_without_more_queries_targets_or_restart(self):
+        self.runtime.stop_on_both_release = False
+        self.runtime.keep_session_on_query_error = True
+        self.move()
+        sent = len(self.robot.targets)
+        from fluxvla.engines.operators.vr.diagnostics import XLeVRDiagnosticsWriter
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'diagnostics.jsonl'
+            self.runtime._diagnostics = XLeVRDiagnosticsWriter(path)
+            with patch.object(self.robot, 'get_frame', side_effect=self.fail_query) as query, \
+                    patch.object(self.robot, 'stop_follower', side_effect=ConnectionError('closed')) as stop:
+                self.tick()
+                for _ in range(10):
+                    self.tick()  # Still-held keys cannot resume an uncertain session.
+                self.assertEqual(query.call_count, 1)
+                self.assertEqual(stop.call_count, 1)
+                self.assertTrue(self.runtime._connected)
+                self.assertTrue(self.vr.is_connected)
+                self.assertEqual(len(self.robot.targets), sent)
+                self.assertFalse(self.runtime.communication_pause['stop_confirmed'])
+                self.assertEqual(self.runtime.last_reference_result['state'], 'communication_paused')
+                self.assertEqual(self.robot.events.count('start'), 1)
+            self.runtime._diagnostics.close()
+            self.runtime._diagnostics = None
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(rows[-1]['communication_pause']['restart_required'])
+            self.assertFalse(rows[-1]['reference_control']['transmitted'])
+            self.assertEqual(rows[-1]['communication_failure']['command'], 'get')
+
+    def test_recorder_heartbeat_query_failure_also_retains_session(self):
+        self.runtime.keep_session_on_query_error = True
+        self.move()
+        self.runtime.record_controller = True
+        self.runtime._recording_next_heartbeat = 0.
+        with patch.object(self.robot, 'heartbeat_runtime_recording', create=True,
+                          side_effect=lambda: self.fail_query('record_heartbeat')) as heartbeat:
+            self.tick()
+            for _ in range(4): self.tick()
+        self.assertEqual(heartbeat.call_count, 1)
+        self.assertIsNotNone(self.runtime.communication_pause)
+        self.assertIsNone(self.runtime._recording_next_heartbeat)
+        self.assertTrue(self.vr.is_connected)
+
+    def test_controller_fault_still_requests_stop_and_is_not_treated_as_query_timeout(self):
+        self.runtime.keep_session_on_query_error = True
+        self.move()
+        self.robot.last_communication_failure = dict(command='get', failed_wall_ns=1)
+        self.robot.frame_fault = True
+        with self.assertRaisesRegex(RuntimeError, 'fault'):
+            self.tick()
+        self.assertIsNone(self.runtime.communication_pause)
+        self.assertEqual(self.robot.events.count('stop'), 1)
+
+    def test_diagnostic_tracking_policy_covers_runtime_guard_and_complete_sdk_packets(self):
+        cfg = ReferenceConfig(enforce_tracking_error_limits=False,
+                              rotation_follow_mode='incremental_velocity',
+                              max_linear_speed_m_s=.17, max_linear_accel_m_s2=1.,
+                              max_angular_speed_rad_s=1.4, max_angular_accel_rad_s2=6.,
+                              max_angular_brake_rad_s2=10.)
+        self.runtime.reference_control = VRPoseController(cfg)
+        for context in self.runtime._arms.values():
+            context['control'] = VRPoseController(cfg)
+        self.runtime.stop_on_both_release = False
+        self.robot.follow = False  # Fresh feedback stays far behind the command.
+        for i in range(200):
+            self.tick(True, False, .001 * i, 0., angle=.006 * i)
+        result = self.runtime.last_reference_result['arms']['left']
+        self.assertTrue(result['tracking_limit_exceeded'])
+        self.assertGreater(result['command_tracking_error_m'], .05)
+        self.assertGreater(result['command_tracking_error_rad'], .35)
+        self.assertIsNotNone(self.runtime.last_tracking_warning)
+        self.assertNotIn('stop', self.robot.events)
+        for previous, current in zip(self.robot.targets, self.robot.targets[1:]):
+            self.assertEqual(set(current), {'left', 'right'})
+            for name in current:
+                self.assertLessEqual(np.linalg.norm(current[name][:3] - previous[name][:3]), .17 / 30 + 1e-10)
+                angle = (Rotation.from_quat(previous[name][3:]).inv()
+                         * Rotation.from_quat(current[name][3:])).magnitude()
+                self.assertLessEqual(angle, 1.4 / 30 + 1e-10)
+
+
+if __name__ == '__main__':
+    unittest.main()

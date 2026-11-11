@@ -10,16 +10,25 @@ teleop = dict(
     vr_only=True, observe_only=False,
     control_mode='reference', pose_mapping='anchor_relative',
     input_recovery_stable_s=.5,  # 松手回中、追踪稳定后，重新按侧键才恢复。
+    # 松开双手只减速保持；退出/故障才请求原生停止，避免每次松手进入停止查询。
+    stop_on_both_release=False,
+    # 查询失败保留VR界面，但冻结新目标；不使用过期反馈继续运动或自动重连。
+    keep_session_on_query_error=True,
     cartesian_adapter='sdk_tool_cumulative', fps=30,
-    # 2026-11-11：固化用户本轮现场调参；启动实机仍需显式开放运动权限。
+    # 2026-11-11：旋转响应调整，待现场验证；启动实机仍需显式开放运动权限。
     # 以下约束前端末端目标；不是电机限速或碰撞距离。
     controller_speed_percent=70,
     reference_options=dict(
-        max_linear_speed_m_s=.17, max_angular_speed_rad_s=1.1,
-        max_linear_accel_m_s2=1., max_angular_accel_rad_s2=3.,
+        max_linear_speed_m_s=.17, max_angular_speed_rad_s=1.4,
+        max_linear_accel_m_s2=1., max_angular_accel_rad_s2=6.,
         position_gain=10., rotation_gain=12.,
-        # 旋转软领先预算为0.1rad（约5.7度）；本组配置尚待现场复测。
-        max_reference_lead_m=.03, max_reference_lead_rad=.1,
+        # 增量速度模式不补追旧旋转；单臂/绝对姿态模式保持原算法。
+        rotation_follow_mode='incremental_velocity',
+        rotation_velocity_deadzone_rad_s=.03, max_angular_brake_rad_s2=10.,
+        # 现场开发：误差只记录，关闭软领先减速；运动仍受速度/加速度/制动约束。
+        # 需要恢复超差停止时设True；设置具体lead数值可重新启用软领先限制。
+        enforce_tracking_error_limits=False,
+        max_reference_lead_m=None, max_reference_lead_rad=None,
     ),
     zx_grippers=dict(
         # 2026-11-06: user-confirmed live settings; device checks retain 5%.

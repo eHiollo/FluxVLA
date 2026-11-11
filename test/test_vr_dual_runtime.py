@@ -631,8 +631,15 @@ class DualSDKRuntimeTest(DualRuntimeTest):
         self.assertIsNone(runtime.robot)
         self.assertFalse(runtime.execute)
         self.assertEqual(cfg.operator.ws_port, 5999)
-        self.assertEqual(runtime.reference_control.config.max_angular_accel_rad_s2, 3.)
-        self.assertEqual(runtime.reference_control.config.max_reference_lead_rad, .1)
+        self.assertEqual(runtime.reference_control.config.max_angular_accel_rad_s2, 6.)
+        self.assertIsNone(runtime.reference_control.config.max_reference_lead_m)
+        self.assertIsNone(runtime.reference_control.config.max_reference_lead_rad)
+        self.assertFalse(runtime.reference_control.config.enforce_tracking_error_limits)
+        self.assertEqual(runtime.reference_control.config.max_angular_speed_rad_s, 1.4)
+        self.assertEqual(runtime.reference_control.config.max_angular_brake_rad_s2, 10.)
+        self.assertEqual(runtime.reference_control.config.rotation_follow_mode, 'incremental_velocity')
+        self.assertFalse(runtime.stop_on_both_release)
+        self.assertTrue(runtime.keep_session_on_query_error)
 
     def test_site_binding_routes_hands_to_expected_ids_and_releases_independently(self):
         self.runtime.close()

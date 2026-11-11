@@ -211,7 +211,7 @@ class VRTeleopRuntime:
                  control_mode='delta', reference_options=None, observe_only=False,
                  pose_mapping='anchor_relative', pose_calibration=None,
                  controller_speed_percent=None, cartesian_adapter='legacy_anchor',
-                 record_controller=False):
+                 record_controller=False, keep_session_on_query_error=False):
         if cartesian_adapter not in ('legacy_anchor', 'sdk_tool_cumulative'):
             raise ValueError('Unknown cartesian_adapter')
         if cartesian_adapter == 'sdk_tool_cumulative':
@@ -224,6 +224,12 @@ class VRTeleopRuntime:
         if record_controller and (robot is None or not (execute or observe_only) or not diagnostics_path):
             raise ValueError('record_controller requires live/observe feedback and a diagnostics_path')
         self.record_controller = record_controller
+        if type(keep_session_on_query_error) is not bool:
+            raise ValueError('keep_session_on_query_error must be bool')
+        self.keep_session_on_query_error = keep_session_on_query_error
+        self.communication_pause = None
+        self.last_tracking_warning = None
+        self._tracking_warning_logged = False
         self.controller_recording = dict(state='disabled' if not record_controller else 'pending')
         self._recording_next_heartbeat = None
         self._recording_last_dropped = 0
@@ -490,6 +496,15 @@ class VRTeleopRuntime:
                           * Rotation.from_quat(target[3:])).magnitude()
         if (position_error > self.max_position_tracking_error_m
                 or rotation_error > self.max_rotation_tracking_error_rad):
+            if self.reference_control is not None and not self.reference_control.config.enforce_tracking_error_limits:
+                self.last_tracking_warning = dict(position_error_m=float(position_error),
+                                                  rotation_error_rad=float(rotation_error))
+                if not self._tracking_warning_logged:
+                    logging.getLogger(__name__).warning(
+                        '末端跟踪误差超出参考值，仅记录不退出：位置%.4fm，姿态%.4frad',
+                        position_error, rotation_error)
+                    self._tracking_warning_logged = True
+                return
             raise RuntimeError('VR target exceeds the configured tracking error limit')
 
     def _hold(self):
@@ -533,7 +548,9 @@ class VRTeleopRuntime:
         self.last_sdk_command = None
         self.last_relative_target = None
         self.last_reference_result = None
+        self.last_tracking_warning = None
         started = time.monotonic()
+        started_wall_ns = time.time_ns()
         self.last_gripper_command = None
         recording = getattr(self, 'recording', None)
         raw, action = {}, {}
@@ -541,7 +558,7 @@ class VRTeleopRuntime:
         try:
             if not self._connected or not self.vr.is_connected:
                 raise ConnectionError('VR input is not connected')
-            if recording is None or not recording.blocks_motion:
+            if self.communication_pause is None and (recording is None or not recording.blocks_motion):
                 self._poll_controller_recording()
             if self.teleoperator is not None:
                 action = self.teleoperator.get_action()
@@ -550,6 +567,12 @@ class VRTeleopRuntime:
                 raw = self.vr.get_action()
                 action = self.mapper(raw)
             self._input_read_time = time.monotonic()
+            if self.communication_pause is not None:
+                # Keep VR/HUD and diagnostics alive, but never replay commands,
+                # poll the closed socket, or restart with keys still held.
+                self.last_reference_result = dict(state='communication_paused', arms={},
+                                                 transmitted=False)
+                return action
             latency = getattr(self.vr, 'latency', None)
             if latency is not None:
                 latency.consume(raw, self._input_read_time)
@@ -562,6 +585,37 @@ class VRTeleopRuntime:
                 recording.fail(f'Control interrupted: {exc}')
             self._cancel_accessories()
             error = f'{type(exc).__name__}: {exc}'
+            failure = getattr(self.robot, 'last_communication_failure', None)
+            if (self.keep_session_on_query_error and isinstance(exc, Exception)
+                    and failure is not None and failure.get('failed_wall_ns', 0) >= started_wall_ns
+                    and failure.get('command') in ('get', 'record_heartbeat')):
+                if recording is not None:
+                    recording.reset_cancel.set()
+                self.communication_pause = dict(reason=error, restart_required=True,
+                                                stop_confirmed=False)
+                try:
+                    if self.execute:
+                        self._stop_reference()
+                    self.communication_pause['stop_confirmed'] = bool(
+                        self.last_stop_status and self.last_stop_status.get('reported_stopped'))
+                except Exception as stop_error:
+                    self.communication_pause['stop_error'] = str(stop_error)
+                self._recording_next_heartbeat = None
+                self.last_reference_result = dict(state='communication_paused', arms={},
+                                                 transmitted=False)
+                logging.getLogger(__name__).error(
+                    '控制器查询失败，VR界面保留，已暂停新目标；停止确认=%s。'
+                    '请在现场确认停止，Ctrl+C退出后重新连接。',
+                    self.communication_pause['stop_confirmed'])
+                if self.teleoperator is not None:
+                    try:
+                        self.teleoperator.send_feedback(dict(
+                            type='hud', phase='communication_paused',
+                            hint='CONTROLLER QUERY FAILED - MOTION PAUSED',
+                            error='Confirm robot stopped onsite. Ctrl+C to exit and reconnect.'))
+                    except Exception:
+                        logging.getLogger(__name__).warning('通信暂停提示发送失败', exc_info=True)
+                return action
             if recording is not None and recording.blocks_motion:
                 recording.reset_cancel.set()
                 if recording.reset_thread is not None:
@@ -602,6 +656,10 @@ class VRTeleopRuntime:
                               dataset_recording=recording.status() if recording is not None else None,
                               client_monotonic_ns=time.monotonic_ns(), client_wall_ns=time.time_ns(),
                               stop_status=self.last_stop_status)
+                if self.last_tracking_warning is not None:
+                    record['tracking_limit_warning'] = dict(self.last_tracking_warning)
+                if self.communication_pause is not None:
+                    record['communication_pause'] = dict(self.communication_pause)
                 failure = getattr(self.robot, 'last_communication_failure', None)
                 if failure is not None:
                     record['communication_failure'] = failure
@@ -922,7 +980,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     """
 
     def __init__(self, vr, robot=None, *, gripper=None, zx_grippers=None,
-                 input_recovery_stable_s=.5, **settings):
+                 input_recovery_stable_s=.5, stop_on_both_release=True, **settings):
         from .control import VRPoseController
         if (not getattr(vr, 'is_dual', False) or settings.get('control_mode') != 'reference'
                 or settings.get('pose_mapping', 'anchor_relative') != 'anchor_relative'
@@ -933,6 +991,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                                   or set(robot.arm_names) != set(self.arm_names)):
             raise ValueError('VR bindings must match the complete dual A10 arm group')
         super().__init__(vr, robot=robot, gripper=None, **settings)
+        if type(stop_on_both_release) is not bool:
+            raise ValueError('stop_on_both_release must be bool')
+        self.stop_on_both_release = stop_on_both_release
         if not self.reference_control.config.limit_acceleration:
             raise ValueError('Dual release requires acceleration limiting')
         self._arms = {arm: dict(hand=hand, mapper=vr.mappers[hand],
@@ -981,6 +1042,16 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     def connect(self):
         try:
             super().connect()
+            config = self.reference_control.config
+            logging.getLogger(__name__).info(
+                '双臂旋转模式=%s，角速度=%srad/s，加速度=%srad/s²，制动=%srad/s²；'
+                '双手松开=%s，查询失败=%s，跟踪误差阈值=%s',
+                config.rotation_follow_mode, config.max_angular_speed_rad_s,
+                config.max_angular_accel_rad_s2,
+                config.max_angular_brake_rad_s2 or config.max_angular_accel_rad_s2,
+                '停止并确认' if self.stop_on_both_release else '减速保持',
+                '保留界面/暂停新目标' if self.keep_session_on_query_error else '退出',
+                '超差停止' if config.enforce_tracking_error_limits else '仅记录')
             for channel in self._zx_channels.values():
                 channel.connect()
             if self._zx_channels:
@@ -1302,9 +1373,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     self.robot.begin_sdk_tool_trajectory(poses)
                 self._send_dual_targets(targets)
             return action
-        # A fresh release of BOTH hands follows the single-arm lifecycle:
-        # native stop + confirmation, with no more UDP endpoint chasing.
-        if not any(requested.values()) and all(fresh.values()):
+        # Optional legacy lifecycle: native stop + confirmation on both releases.
+        # The dual site profile instead keeps one follower and brakes each arm below.
+        if self.stop_on_both_release and not any(requested.values()) and all(fresh.values()):
             self.last_reference_result = dict(state='stopping', arms={}, transmitted=False,
                                              reason='both_hands_released')
             if self.execute:
@@ -1358,6 +1429,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         # Validate BOTH arms first: never transmit a partially valid group.
         if self.execute:
             self._send_dual_targets(targets)
+        if not any(requested.values()):
+            self.last_reference_result['state'] = (
+                'holding' if all(r['state'] == 'holding' for r in results.values()) else 'releasing')
         self._dual_time = now
         return action
 

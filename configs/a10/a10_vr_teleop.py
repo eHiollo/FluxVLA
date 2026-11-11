@@ -74,9 +74,8 @@ teleop = dict(
                   # Single .125 arm + old USB gripper: use the child config
                   # a10_vr_teleop_legacy_gripper.py. Defaults here stay arm-only.
                   gripper_transport='controller'),
-    # ReferenceConfig already defaults to the original vr_vel 0.12 m/s and
-    # 0.32 rad/s. Remove the old CLI overrides 0.01/0.05 for the speed trial.
-    # At 30 Hz this is 4 mm / 0.01067 rad per frame; retain finite step guards.
+    # Fixed per-frame bounds apply only to legacy delta mode. Reference mode
+    # ignores these and uses reference_options speed/acceleration with actual dt.
     max_position_step_m=.005, max_rotation_step_rad=.015,
     max_feedback_age_s=.25, gripper_speed_mm_s=30.,
     gripper_direction=1,  # +X opens; -1 reverses the thumbstick direction.

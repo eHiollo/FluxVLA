@@ -255,10 +255,11 @@ class VRTeleopRuntime:
                 raise ValueError('Live VR requires the Cartesian follower')
             if getattr(robot, 'feedback_position_unit', None) not in ('mm', 'm'):
                 raise ValueError('Confirm A10 feedback_position_unit as mm or m')
-            for name, value in [('max_position_step_m', max_position_step_m),
-                                ('max_rotation_step_rad', max_rotation_step_rad)]:
-                if value is None or not math.isfinite(value) or value <= 0:
-                    raise ValueError(f'Configure a positive finite {name} for live VR')
+            if control_mode == 'delta':
+                for name, value in [('max_position_step_m', max_position_step_m),
+                                    ('max_rotation_step_rad', max_rotation_step_rad)]:
+                    if value is None or not math.isfinite(value) or value <= 0:
+                        raise ValueError(f'Configure a positive finite {name} for live delta VR')
         if not math.isfinite(max_feedback_age_s) or max_feedback_age_s <= 0:
             raise ValueError('max_feedback_age_s must be positive and finite')
         if not math.isfinite(gripper_speed_mm_s) or gripper_speed_mm_s <= 0:
@@ -477,8 +478,7 @@ class VRTeleopRuntime:
                                    (inverse_anchor * Rotation.from_quat(target[3:])).as_quat()))
         if self.cartesian_adapter == 'sdk_tool_cumulative':
             self.last_sdk_command = self.robot.send_sdk_tool_pose(
-                target, max_position_step_m=self.max_position_step_m,
-                max_rotation_step_rad=self.max_rotation_step_rad)
+                target, max_position_step_m=None, max_rotation_step_rad=None)
             self.last_relative_target = None  # Cumulative 321 is not a relative pose.
         else:
             self.robot.send_eepose({self.robot.arm_name: relative})
@@ -791,12 +791,9 @@ class VRTeleopRuntime:
             return action
         target = np.asarray(result['command_pose'])
         self._check_tracking(pose, target)
-        previous_target = self._target_pose
         if self.execute:
-            distance = np.linalg.norm(target[:3] - previous_target[:3])
-            angle = (Rotation.from_quat(previous_target[3:]).inv() * Rotation.from_quat(target[3:])).magnitude()
-            if distance > self.max_position_step_m or angle > self.max_rotation_step_rad:
-                raise ValueError('Reference command exceeds the configured step limit')
+            # ReferenceConfig constrains speed and acceleration using actual dt.
+            # A longer valid tick must not trip an unrelated fixed-step bound.
             self._send_absolute_target(target)
             if self.cartesian_adapter == 'sdk_tool_cumulative':
                 result['relative_target'] = None
@@ -1214,8 +1211,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         """Send both planned poses together; SDK state survives per-hand re-clutch."""
         if self.cartesian_adapter == 'sdk_tool_cumulative':
             self.last_sdk_command = self.robot.send_sdk_tool_pose(
-                targets, max_position_step_m=self.max_position_step_m,
-                max_rotation_step_rad=self.max_rotation_step_rad)
+                targets, max_position_step_m=None, max_rotation_step_rad=None)
             self.last_relative_target = None
         else:
             from .control import follower_relative
@@ -1352,11 +1348,6 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 raise RuntimeError(f"Dual VR {name}: {result['fault_reason']}")
             target = np.asarray(result['command_pose'])
             self._check_tracking(poses[name], target)
-            previous = context['target']
-            if (np.linalg.norm(target[:3] - previous[:3]) > self.max_position_step_m
-                    or (Rotation.from_quat(previous[3:]).inv()
-                        * Rotation.from_quat(target[3:])).magnitude() > self.max_rotation_step_rad):
-                raise ValueError(f'Dual VR {name}: reference step limit exceeded')
             targets[name] = target
             if self.cartesian_adapter == 'sdk_tool_cumulative':
                 result['relative_target'] = None  # Wire rows are cumulative 321, not relative poses.

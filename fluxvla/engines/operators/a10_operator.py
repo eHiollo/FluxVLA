@@ -54,13 +54,15 @@ class SDKToolCumulativeAdapter:
     def propose(self, target, *, max_position_step_m, max_rotation_step_rad):
         target = _pose(target)
         for limit in (max_position_step_m, max_rotation_step_rad):
-            if not math.isfinite(limit) or limit <= 0:
-                raise ValueError('SDK adapter step limits must be positive and finite')
+            if limit is not None and (not math.isfinite(limit) or limit <= 0):
+                raise ValueError('SDK adapter step limits must be None or positive and finite')
         previous_rotation = Rotation.from_quat(self.previous_pose[3:])
         translation = previous_rotation.inv().apply(target[:3] - self.previous_pose[:3])
         rotation = previous_rotation.inv() * Rotation.from_quat(target[3:])
-        if (np.linalg.norm(translation) > max_position_step_m
-                or rotation.magnitude() > max_rotation_step_rad):
+        # Reference teleoperation limits speed/acceleration before this codec.
+        # Explicit console callers can still request independent step bounds.
+        if ((max_position_step_m is not None and np.linalg.norm(translation) > max_position_step_m)
+                or (max_rotation_step_rad is not None and rotation.magnitude() > max_rotation_step_rad)):
             raise ValueError('SDK adapter target exceeds step limit')
         # This interface is for small continuous steps, never large Euler jumps.
         if rotation.magnitude() >= np.pi / 2:

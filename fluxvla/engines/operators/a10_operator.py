@@ -20,6 +20,7 @@ import struct
 import threading
 import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
@@ -400,6 +401,9 @@ class _FollowerConnection:
         self.ws = self.udp = self.joint_udp = None
         self._request_pending = threading.Event()
         self.command_cancelled = None
+        self._ws_trace = deque(maxlen=32)
+        self._ws_addresses = None
+        self.last_request_failure = None
 
     def connect(self):
         from websockets.sync.client import connect
@@ -411,6 +415,12 @@ class _FollowerConnection:
                               ping_interval=None,
                               open_timeout=self.timeout_s, close_timeout=self.timeout_s,
                               max_size=_MAX_PAYLOAD + _HEADER.size)
+            self._ws_trace.clear()
+            self.last_request_failure = None
+            self._ws_addresses = dict(local=list(self.ws.local_address),
+                                      remote=list(self.ws.remote_address))
+            self._ws_trace.append(dict(event='connected', wall_ns=time.time_ns(),
+                                       addresses=self._ws_addresses))
             self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp.settimeout(self.timeout_s)
             self.udp.connect((self.host, self.udp_port))
@@ -430,6 +440,9 @@ class _FollowerConnection:
             raise ConnectionError('A10 operator is not connected')
         try:
             self.ws.send(_pack(command.encode('utf-8'), command=True))
+            # Local send completion is not a controller execution acknowledgement.
+            self._ws_trace.append(dict(event='sent', wall_ns=time.time_ns(),
+                                       command=command.split(maxsplit=1)[0]))
         except Exception:
             self.close()
             raise
@@ -445,9 +458,14 @@ class _FollowerConnection:
                 if remaining <= 0:
                     raise TimeoutError('A10 reply deadline exceeded')
                 reply = _decode_reply(self.ws.recv(timeout=remaining), raw=raw)
+                context = reply.get('ret_context')
+                kind = ('status' if isinstance(context, dict) and 'motion_msg' in context
+                        else 'empty_ack' if context in ('', None, {}) and not reply.get('ret_msg')
+                        else 'other')
+                self._ws_trace.append(dict(event='received', wall_ns=time.time_ns(),
+                                           kind=kind, ret_code=reply.get('ret_code')))
                 if raw:
                     return reply
-                context = reply.get('ret_context')
                 is_status = isinstance(context, dict) and 'motion_msg' in context
                 if status and is_status:
                     return reply
@@ -458,6 +476,14 @@ class _FollowerConnection:
                 # Bounded skipping of delayed empty ACKs, or old status replies.
             raise A10ProtocolError('Too many unrelated replies')
         except Exception as exc:
+            self.last_request_failure = dict(
+                host=self.host, port=self.ws_port, command=command.split(maxsplit=1)[0],
+                addresses=self._ws_addresses,
+                timeout_s=budget, failed_wall_ns=time.time_ns(),
+                error=f'{type(exc).__name__}: {exc}', events=list(self._ws_trace))
+            logging.getLogger(__name__).error(
+                'A10 WS failure trace (sent means local send only; ACK has no command ID): %s',
+                json.dumps(self.last_request_failure, ensure_ascii=False))
             # An uncertain transaction cannot be reused for a later command.
             self.close()
             if isinstance(exc, TimeoutError):
@@ -699,6 +725,11 @@ class A10Operator(BaseOperator):
     def follower_stop_pending(self):
         """This session sent a start that hasn't been confirmed inactive yet."""
         return self._started_here
+
+    @property
+    def last_communication_failure(self):
+        """Bounded WS history captured before closing a failed direct connection."""
+        return getattr(self._connection, 'last_request_failure', None)
 
     def _parse_feedback(self, reply):
         return _parse_state(reply, joint_unit=self.feedback_joint_unit,

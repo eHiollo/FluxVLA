@@ -602,6 +602,9 @@ class VRTeleopRuntime:
                               dataset_recording=recording.status() if recording is not None else None,
                               client_monotonic_ns=time.monotonic_ns(), client_wall_ns=time.time_ns(),
                               stop_status=self.last_stop_status)
+                failure = getattr(self.robot, 'last_communication_failure', None)
+                if failure is not None:
+                    record['communication_failure'] = failure
                 self._diagnostics.write(record)
             self._frame_index += 1
 

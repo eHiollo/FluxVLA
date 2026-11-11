@@ -291,6 +291,12 @@ class FakeController:
                             else:
                                 self.pgm_vel = value
                         ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                elif command == 'manual_stop':
+                    self.motion = 'Stopped'
+                    ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
+                elif command == 'start_follower':
+                    # Module enable ACK precedes the actual Axis follower plan.
+                    ws.send(wire_reply({'ret_code': 0, 'ret_msg': '', 'ret_context': ''}))
                 elif command in ('follower_cart', 'follower_aj', 'stop_follower'):
                     if command != 'stop_follower' and self.start_rejected:
                         self.active = self.active_after_rejection

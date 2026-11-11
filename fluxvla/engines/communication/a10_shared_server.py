@@ -1,4 +1,4 @@
-"""One robot connection pair, serialized commands and exclusive target ownership."""
+"""Shared robot transport, serialized commands and exclusive target ownership."""
 import base64
 import errno
 import json
@@ -9,8 +9,22 @@ import threading
 import time
 
 from ..operators.a10_operator import _FollowerConnection, _parse_state, _set_controller_speed
+from .a10_shared_connection import ControlTransferredError
 
 logger = logging.getLogger(__name__)
+
+
+def _controller_state(reply):
+    """Parse global flags only; clients validate their own joint/TCP layout.
+
+    A relay must not apply the single-arm six-joint parser to dual-arm rows.
+    Fault, activation, mode, speed and coordinate fields retain full validation.
+    """
+    context = reply.get('ret_context', {})
+    motion = context.get('motion_msg', {})
+    global_motion = {k: v for k, v in motion.items() if k not in ('actual_pos', 'motor_pos', 'pq')}
+    return _parse_state(dict(reply, ret_context=dict(context, motion_msg=global_motion)),
+                        joint_unit='deg', position_unit=None, gripper_feedback_path=None)
 
 
 class SharedControl:
@@ -21,10 +35,16 @@ class SharedControl:
         self.udp_port, self.joint_udp_port = udp_port, joint_udp_port
         self.timeout_s = timeout_s
         self.control = _FollowerConnection(host, ws_port, udp_port, timeout_s, joint_udp_port)
-        self.status = _FollowerConnection(host, status_ws_port, udp_port, timeout_s, joint_udp_port)
-        self._control_lock, self._status_lock = threading.RLock(), threading.RLock()
+        self.status = (self.control if status_ws_port == ws_port else
+                       _FollowerConnection(host, status_ws_port, udp_port, timeout_s, joint_udp_port))
+        self._control_lock = threading.RLock()
+        self._status_lock = self._control_lock if self.status is self.control else threading.RLock()
         self.owner = None
         self.revoked = set()
+        self.preempted = set()
+        self.recording_owner = None
+        self.console_operation = None
+        self.console_operation_depth = 0
         self.stopped = set()
         self._speed_restore_allowed = set()
         self.recorder = None
@@ -32,7 +52,8 @@ class SharedControl:
     def connect(self):
         try:
             self.control.connect()
-            self.status.connect()
+            if self.status is not self.control:
+                self.status.connect()
             self.read_state()
         except BaseException:
             self.control.close()
@@ -62,9 +83,10 @@ class SharedControl:
         while time.monotonic() < deadline:
             reply = self.control.request('get', status=True,
                                          timeout_s=max(.001, deadline - time.monotonic()))
-            state = _parse_state(reply, joint_unit='deg', position_unit=None, gripper_feedback_path=None)
+            state = _controller_state(reply)
             mode = 'Axis' if command.split(maxsplit=1)[0] in ('follower_aj', 'follower_aj_tg') else 'Cart'
             if (state.follower_active is active and (not active or state.follower_mode == mode)
+                    and (active or state.raw['ret_context'].get('robot_msg', {}).get('motion') == 'Stopped')
                     and (not stop_motion or (
                         not state.has_error and
                         state.raw['ret_context'].get('robot_msg', {}).get('motion') == 'Stopped'))):
@@ -77,8 +99,11 @@ class SharedControl:
         if owner is None:
             return
         self.revoked.add(owner)
-        state = _parse_state(self.read_state(), joint_unit='deg', position_unit=None, gripper_feedback_path=None)
-        if state.follower_active is not False:
+        if reason.startswith('console'):
+            self.preempted.add(owner)
+        state = _controller_state(self.read_state())
+        if (state.follower_active is not False
+                or state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped'):
             self.mode_command('stop_follower', False)
         self.owner = None
         self.stopped.add(owner)
@@ -89,28 +114,38 @@ class SharedControl:
         self.note('owner_stopped', session_id=owner, reason=reason, confirmed=True)
 
     def claim(self, session_id, role):
+        if self.console_operation not in (None, session_id):
+            error = ControlTransferredError if role == 'teleop' else PermissionError
+            raise error('Console command is still running')
         if self.owner == session_id:
             if session_id in self.revoked:
                 raise RuntimeError('Previous stop is not confirmed; stop the follower before reacquiring')
             return
         if self.owner is not None and self.owner != session_id:
             if role != 'console':
-                raise PermissionError('Another session owns the follower; stop it before starting inference')
+                error = ControlTransferredError if role == 'teleop' else PermissionError
+                raise error('Another session owns the follower; stop it before starting inference')
             self.stop_owner('console_takeover')
         if self.owner is None:
-            state = _parse_state(self.read_state(), joint_unit='deg', position_unit=None, gripper_feedback_path=None)
+            state = _controller_state(self.read_state())
             if state.follower_active is not False:
                 raise PermissionError('An unmanaged follower is active; the shared service will not take it over')
         self.revoked.discard(session_id)
+        self.preempted.discard(session_id)
         self.stopped.discard(session_id)
         self._speed_restore_allowed.clear()
         self.owner = session_id
         self.note('owner_acquired', session_id=session_id, role=role)
 
+    def lease_status(self, session_id):
+        return dict(owns=self.owner == session_id, stopped_by_service=session_id in self.stopped,
+                    preempted=session_id in self.preempted,
+                    available=self.owner is None and self.console_operation is None)
+
     def handle(self, request):
         session_id, role = request['session_id'], request['role']
-        if role not in ('console', 'inference'):
-            raise ValueError('Shared client role must be console or inference')
+        if role not in ('console', 'inference', 'teleop'):
+            raise ValueError('Shared client role must be console, inference or teleop')
         op = request['op']
         if op == 'hello':
             expected = dict(robot_host=self.host, ws_port=(self.status_ws_port if request.get('status_channel') else self.ws_port),
@@ -121,13 +156,15 @@ class SharedControl:
         if op == 'request' and request['command'].strip() == 'get':
             return self.read_state()
         if op == 'lease' and request['operation'] == 'status':
-            return dict(owns=self.owner == session_id, stopped_by_service=session_id in self.stopped)
+            return self.lease_status(session_id)
         if op == 'stop':
             if role != 'console':
                 raise PermissionError('Only the console may issue a global stop')
             owner = self.owner
             if owner is not None:
                 self.revoked.add(owner)
+                if owner != session_id:
+                    self.preempted.add(owner)
             # A native command may be holding the control lock while awaiting
             # a long reply. Isolate that socket before obtaining the lock.
             self.control.interrupt()
@@ -142,10 +179,10 @@ class SharedControl:
         if op == 'target':
             while not self._control_lock.acquire(timeout=.02):
                 if self.owner != session_id or session_id in self.revoked:
-                    raise InterruptedError('Control was transferred to the console; no joint target sent')
+                    raise ControlTransferredError('Control was transferred to the console; no target sent')
             try:
                 if self.owner != session_id or session_id in self.revoked:
-                    raise InterruptedError('Control was transferred to the console; no joint target sent')
+                    raise ControlTransferredError('Control was transferred to the console; no target sent')
                 packet = base64.b64decode(request['packet'], validate=True)
                 if len(packet) > 65507:
                     raise ValueError('Datagram is too large')
@@ -167,16 +204,35 @@ class SharedControl:
                     raise ConnectionError('Robot control connection unavailable; reconnect explicitly')
                 def get_state(*, timeout_s):
                     reply = self.control.request('get', status=True, timeout_s=timeout_s)
-                    return _parse_state(reply, joint_unit='deg', position_unit=None,
-                                        gripper_feedback_path=None)
+                    return _controller_state(reply)
                 result = _set_controller_speed(self.control, get_state,
                     request['percent'], request['expected_mode'], self.timeout_s,
                     request.get('expected_percent'))
                 self.note('controller_speed_override', session_id=session_id, confirmed=result)
                 return result
             if op == 'lease':
-                if request['operation'] == 'acquire':
+                if request['operation'] == 'begin_console':
+                    if role != 'console' or self.console_operation not in (None, session_id):
+                        raise PermissionError('Another console command is still running')
+                    if self.owner != session_id:
+                        self.stop_owner('console_command_begin')
+                    self.console_operation = session_id
+                    self.console_operation_depth += 1
+                elif request['operation'] == 'end_console':
+                    if self.console_operation == session_id:
+                        self.console_operation_depth -= 1
+                        if self.console_operation_depth == 0:
+                            self.console_operation = None
+                elif request['operation'] == 'acquire':
                     self.claim(session_id, role)
+                elif request['operation'] == 'acknowledge':
+                    if self.owner is not None or self.console_operation is not None:
+                        raise PermissionError('Another session still owns control')
+                    state = _controller_state(self.read_state())
+                    if state.follower_active is not False:
+                        raise PermissionError('Follower stop is not confirmed')
+                    self.preempted.discard(session_id)
+                    self.revoked.discard(session_id)
                 elif request['operation'] == 'prepare_command':
                     if role != 'console':
                         raise PermissionError('Only the console may preempt for a control command')
@@ -184,7 +240,7 @@ class SharedControl:
                     # A newly requested console command may set its temporary speed
                     # after the old follower was stopped; target ownership stays empty.
                     self.revoked.discard(session_id)
-                return dict(owns=self.owner == session_id, stopped_by_service=session_id in self.stopped)
+                return self.lease_status(session_id)
             if op not in ('command', 'request'):
                 raise ValueError(f'Unknown shared operation: {op}')
             command = request['command']
@@ -199,6 +255,21 @@ class SharedControl:
                     raise PermissionError('This session does not own the follower')
                 self.stop_owner('explicit_stop')
                 return self.read_state()
+            if name in ('record_start', 'record_status', 'record_heartbeat'):
+                if name == 'record_start':
+                    if self.recording_owner not in (None, session_id):
+                        raise PermissionError('Another session owns controller recording')
+                elif name == 'record_heartbeat' and self.recording_owner != session_id:
+                    raise PermissionError('This session does not own controller recording')
+                reply = self.control.request(command)
+                if name == 'record_start':
+                    self.recording_owner = session_id
+                return reply
+            if role == 'teleop' and command == 'set_jog_coordinate --tool':
+                if (self.owner not in (None, session_id) or session_id in self.preempted
+                        or self.console_operation not in (None, session_id)):
+                    raise ControlTransferredError('Console owns control; release VR grips before resuming')
+                return self.control.request(command)
             if role != 'console':
                 raise PermissionError('Arbitrary controller commands require the console role')
             self._speed_restore_allowed.clear()
@@ -213,6 +284,11 @@ class SharedControl:
 
     def disconnected(self, session_id):
         with self._control_lock:
+            if self.console_operation == session_id:
+                self.console_operation = None
+                self.console_operation_depth = 0
+            if self.recording_owner == session_id:
+                self.recording_owner = None
             if self.owner == session_id:
                 try:
                     self.stop_owner('client_disconnected')
@@ -231,6 +307,19 @@ class SharedControl:
 
 
 class _Handler(socketserver.StreamRequestHandler):
+    def setup(self):
+        super().setup()
+        with self.server.clients_lock:
+            self.server.clients += 1
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            with self.server.clients_lock:
+                self.server.clients -= 1
+                self.server.last_client_time = time.monotonic()
+
     def handle(self):
         session_id = None
         status_channel = True
@@ -269,11 +358,24 @@ class SharedControlServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address, robot):
+    def __init__(self, address, robot, *, idle_timeout_s=None):
         if address[0] not in ('127.0.0.1', 'localhost'):
             raise ValueError('Shared control service must bind to loopback')
         self.robot = robot
+        self.clients_lock = threading.Lock()
+        self.clients = 0
+        self.last_client_time = time.monotonic()
+        self.idle_timeout_s = idle_timeout_s
+        self._idle_shutdown = False
         super().__init__(address, _Handler)
+
+    def service_actions(self):
+        with self.clients_lock:
+            expired = (self.idle_timeout_s is not None and self.clients == 0
+                       and time.monotonic() - self.last_client_time >= self.idle_timeout_s)
+        if expired and not self._idle_shutdown:
+            self._idle_shutdown = True
+            threading.Thread(target=self.shutdown, daemon=True).start()
 
 
 class ConsoleSharedControl:

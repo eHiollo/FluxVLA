@@ -15,7 +15,12 @@ class SharedControlTest(unittest.TestCase):
     def setUp(self):
         self.controller = FakeController().__enter__()
         self.ws_port = self.controller.server.socket.getsockname()[1]
-        self.robot = SharedControl('127.0.0.1', self.ws_port, self.ws_port,
+        from websockets.sync.server import serve
+        self.status_server = serve(self.controller.handle, '127.0.0.1', 0)
+        self.status_port = self.status_server.socket.getsockname()[1]
+        self.status_thread = threading.Thread(target=self.status_server.serve_forever, daemon=True)
+        self.status_thread.start()
+        self.robot = SharedControl('127.0.0.1', self.ws_port, self.status_port,
             self.controller.udp.getsockname()[1], self.controller.joint_udp.getsockname()[1], timeout_s=.6)
         self.robot.connect()
         self.server = SharedControlServer(('127.0.0.1', 0), self.robot)
@@ -30,11 +35,13 @@ class SharedControlTest(unittest.TestCase):
         self.thread.join(2)
         self.server.server_close()
         self.robot.close()
+        self.status_server.shutdown()
+        self.status_thread.join(2)
         self.controller.__exit__(None, None, None)
 
     def client(self, role, **kwargs):
         options = dict(host='127.0.0.1', ws_port=self.ws_port,
-            status_ws_port=self.ws_port, udp_port=self.controller.udp.getsockname()[1],
+            status_ws_port=self.status_port, udp_port=self.controller.udp.getsockname()[1],
             joint_udp_port=self.controller.joint_udp.getsockname()[1], timeout_s=.6,
             command_mode='joint', allow_motion=True,
             shared_control=dict(host='127.0.0.1', port=self.server.server_address[1], role=role))
@@ -101,7 +108,11 @@ class SharedControlTest(unittest.TestCase):
         result = move_to_init(console)
         self.assertTrue(result['completed'])
         commands = [c for c in self.controller.commands if c != 'get']
-        self.assertEqual(commands, ['follower_aj', 'stop_follower', 'follower_aj', 'stop_follower'])
+        self.assertEqual(commands, [
+            'start_follower', 'follower_aj', 'stop_follower', 'set_jog_vel --vel_percent=5',
+            'start_follower', 'follower_aj', 'stop_follower', 'set_jog_vel --vel_percent=10',
+            'start_follower', 'follower_aj'])
+        self.assertTrue(result['control_state_restored'])
         with self.assertRaises((InterruptedError, RuntimeError)):
             inference.send_joints({'right': [0.] * 6})
 
@@ -175,7 +186,7 @@ class SharedControlTest(unittest.TestCase):
             line = next(lines)
             if line == 'get':
                 inference = A10Operator(
-                    host='127.0.0.1', ws_port=self.ws_port, status_ws_port=self.ws_port,
+                    host='127.0.0.1', ws_port=self.ws_port, status_ws_port=self.status_port,
                     udp_port=self.robot.udp_port, joint_udp_port=self.robot.joint_udp_port,
                     allow_motion=True, command_mode='joint', timeout_s=.6,
                     shared_control=dict(host='127.0.0.1', port=port, role='inference'))
@@ -189,7 +200,7 @@ class SharedControlTest(unittest.TestCase):
                     inference.close()
             return line
         result = main(['--host', '127.0.0.1', '--ws-port', str(self.ws_port),
-                       '--status-ws-port', str(self.ws_port), '--shared-port', str(port),
+                       '--status-ws-port', str(self.status_port), '--shared-port', str(port),
                        '--udp-port', str(self.robot.udp_port),
                        '--joint-udp-port', str(self.robot.joint_udp_port), 'shell'],
                       input_fn=read, output=out.append)
@@ -201,7 +212,7 @@ class SharedControlTest(unittest.TestCase):
     def test_auto_start_failure_frees_port_for_explicit_reconnect(self):
         from unittest.mock import patch
         service = ConsoleSharedControl(('127.0.0.1', 0), output=lambda _: None,
-            host='127.0.0.1', ws_port=self.ws_port, status_ws_port=self.ws_port,
+            host='127.0.0.1', ws_port=self.ws_port, status_ws_port=self.status_port,
             udp_port=self.robot.udp_port, joint_udp_port=self.robot.joint_udp_port)
         with patch.object(SharedControl, 'connect', side_effect=ConnectionRefusedError('offline')):
             with self.assertRaises(ConnectionRefusedError):

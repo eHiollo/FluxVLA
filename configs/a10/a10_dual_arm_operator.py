@@ -3,7 +3,7 @@
 XML inspected 2026-10-23; separate WS entries added 2026-10-29.
 Load the updated controller XML before connecting to 5999; 5867 stays for the pendant.
 Physical left/right and live GET groups/units still require onsite confirmation.
-Use one command/status WS connection; no background polling connection.
+Console and VR use one local relay owning a single command/status WS connection.
 No recording or VR calibration. m_init supports the full joint follower group;
 gripper initialization is reserved for a future driver.
 """
@@ -12,6 +12,8 @@ operator = dict(
     type='A10Operator', host='192.168.0.150',
     ws_port=5999, status_ws_port=5999, udp_port=9998, joint_udp_port=9999,
     status_poll_interval_s=None, timeout_s=2.,
+    # First console/VR auto-starts the relay; either UI may open or close first.
+    shared_control=dict(mode='managed', host='127.0.0.1', port=5870, role='teleop'),
     joint_follower_velocity_percent=100,  # follower_aj parameter; not set_jog_vel.
     allow_motion=False, command_mode='cartesian', cartesian_wire_format='pe321',
     feedback_joint_unit='deg', feedback_position_unit='mm',

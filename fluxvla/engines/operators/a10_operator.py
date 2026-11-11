@@ -693,8 +693,9 @@ class A10Operator(BaseOperator):
         self._cartesian_eulers = {name: np.zeros(3) for name in self.arm_names}
         self.shared_control = dict(shared_control) if shared_control else None
         self._shared_control_options = dict(self.shared_control) if self.shared_control else None
-        if self.shared_control and self.shared_control.get('mode', 'shared') not in ('shared', 'auto'):
-            raise ValueError('shared_control.mode must be shared or auto')
+        self._init_shared_reserved = False
+        if self.shared_control and self.shared_control.get('mode', 'shared') not in ('shared', 'auto', 'managed'):
+            raise ValueError('shared_control.mode must be shared, auto or managed')
         if self.shared_control:
             from ..communication.a10_shared_connection import SharedFollowerConnection
             self._connection = SharedFollowerConnection(host, ws_port, udp_port, self.timeout_s,
@@ -728,7 +729,7 @@ class A10Operator(BaseOperator):
 
     @property
     def last_communication_failure(self):
-        """Bounded WS history captured before closing a failed direct connection."""
+        """Direct WS history or shared RPC failure captured before connection cleanup."""
         return getattr(self._connection, 'last_request_failure', None)
 
     def _parse_feedback(self, reply):
@@ -888,8 +889,8 @@ class A10Operator(BaseOperator):
     def _runtime_recording_request(self, command):
         """Recorder commands share the control WS transaction lock, not motion ownership."""
         with self._io_lock:
-            if self.shared_control or self.status_poll_interval_s is not None:
-                raise ValueError('Runtime recording requires one direct WebSocket connection without status polling')
+            if self.status_poll_interval_s is not None:
+                raise ValueError('Runtime recording requires one WebSocket transaction stream without status polling')
             if not self.is_connected:
                 raise ConnectionError('A10 operator is not connected')
             reply = self._connection.request(command)
@@ -1195,6 +1196,30 @@ class A10Operator(BaseOperator):
     def set_tool_coordinate(self):
         """Explicitly select Tool jog coordinates and verify feedback; no target sent."""
         return self.set_jog_coordinate('Tool')
+
+    def get_shared_control_status(self):
+        """Read local ownership without touching robot motion or another owner."""
+        if not self.shared_control:
+            return None
+        with self._io_lock:
+            status = self._connection.lease('status')
+            if status.get('preempted'):
+                self._started_here = self._confirmed_active = self._start_confirmed = False
+                self._follower_mode = None
+                self._reset_cartesian_encoding()
+            return status
+
+    def acknowledge_shared_takeover(self):
+        with self._io_lock:
+            return self._connection.lease('acknowledge')
+
+    def begin_shared_console_operation(self):
+        if self.shared_control and self.shared_control.get('role') == 'console':
+            self._connection.lease('begin_console')
+
+    def end_shared_console_operation(self):
+        if self.shared_control and self.shared_control.get('role') == 'console' and self.is_connected:
+            self._connection.lease('end_console')
 
     def _prepare_shared_console_command(self):
         if self.shared_control and self.shared_control.get('role') == 'console':
@@ -1882,7 +1907,12 @@ class A10Operator(BaseOperator):
     def _release_init_motion(self):
         with self._io_lock:
             self._trajectory_owner = None
-        self._trajectory_lock.release()
+        try:
+            if self._init_shared_reserved:
+                self._init_shared_reserved = False
+                self.end_shared_console_operation()
+        finally:
+            self._trajectory_lock.release()
 
     def _prepare_init_motion(self):
         with self._io_lock:
@@ -1895,6 +1925,11 @@ class A10Operator(BaseOperator):
                             jog_coordinate=state.raw['ret_context']['motion_msg'].get('jog_coordinate'))
             if state.follower_active and state.follower_mode not in ('Axis', 'Cart'):
                 raise RuntimeError('Cannot restore an unknown follower mode')
+            # Reserve only after capturing the original mode/activation, so
+            # console m_init retains its existing restoration semantics.
+            if self.shared_control and self.shared_control.get('role') == 'console':
+                self.begin_shared_console_operation()
+                self._init_shared_reserved = True
             self._prepare_shared_console_command()
             if state.follower_active and not self.shared_control and not self._started_here:
                 # Explicit m_init temporarily borrows the controller's existing follower.

@@ -2,12 +2,58 @@
 import base64
 import json
 import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
 import threading
 import uuid
 
 
+class ControlTransferredError(InterruptedError):
+    """The console revoked this client; old targets must not be replayed."""
+
+
 class SharedServiceUnavailable(ConnectionRefusedError):
     """The local service refused the initial TCP connection, before any RPC."""
+
+
+def _start_managed_service(connection):
+    """Start the existing relay entrypoint, independently of either UI process.
+
+    The child reserves the local port before connecting to the robot, so a
+    concurrent launcher cannot open a second robot connection.
+    """
+    address = (connection.shared.get('host', '127.0.0.1'), connection.shared.get('port', 5870))
+    if address[0] not in ('127.0.0.1', 'localhost'):
+        raise ValueError('Managed shared control must use loopback')
+    root = Path(__file__).resolve().parents[3]
+    log = Path(connection.shared.get('log_path', root / 'work_dirs/a10/shared_control/service.log'))
+    log.parent.mkdir(parents=True, exist_ok=True)
+    args = [sys.executable, str(root / 'scripts/a10_shared_control.py'),
+            '--host', connection.host, '--ws-port', str(connection.ws_port),
+            '--status-ws-port', str(connection.shared.get('status_ws_port', connection.ws_port)),
+            '--udp-port', str(connection.udp_port), '--joint-udp-port', str(connection.joint_udp_port),
+            '--timeout', str(connection.timeout_s), '--port', str(address[1]),
+            '--idle-timeout', str(connection.shared.get('idle_timeout_s', 5.))]
+    with log.open('ab') as output:
+        process = subprocess.Popen(args, cwd=root, stdin=subprocess.DEVNULL, stdout=output,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+    threading.Thread(target=process.wait, name='a10-relay-child', daemon=True).start()
+    deadline = time.monotonic() + connection.shared.get('startup_timeout_s', 15.)
+    while time.monotonic() < deadline:
+        try:
+            return socket.create_connection(address, min(.3, connection.timeout_s))
+        except ConnectionRefusedError:
+            if process.poll() is not None:
+                # A competing launcher may have won the local bind. Recheck
+                # once before reporting failure, never fall back to direct.
+                try:
+                    return socket.create_connection(address, .3)
+                except ConnectionRefusedError:
+                    raise ConnectionError(f'A10 shared service failed to start; see {log}') from None
+            time.sleep(.05)
+    raise TimeoutError(f'A10 shared service startup timed out; see {log}')
 
 
 class _Datagram:
@@ -32,22 +78,33 @@ class SharedFollowerConnection:
         self._lock = threading.RLock()
         self._request_pending = threading.Event()
         self.command_cancelled = None
+        self.last_request_failure = None
 
     def connect(self):
+        if not self.status_channel:
+            # A late disconnect callback from the old socket must not revoke
+            # this newly connected control session.
+            self.session_id = uuid.uuid4().hex
+        self.last_request_failure = None
         try:
             address = (self.shared.get('host', '127.0.0.1'), self.shared.get('port', 5870))
             try:
                 self._sock = socket.create_connection(address, self.timeout_s)
             except ConnectionRefusedError as exc:
-                raise SharedServiceUnavailable(
-                    f'A10 shared service {address[0]}:{address[1]} is not listening; '
-                    'start python scripts/a10_control.py shell first '
-                    '(the console starts the shared service automatically)') from exc
+                if self.shared.get('mode') == 'managed':
+                    self._sock = _start_managed_service(self)
+                else:
+                    raise SharedServiceUnavailable(
+                        f'A10 shared service {address[0]}:{address[1]} is not listening; '
+                        'start python scripts/a10_control.py shell first '
+                        '(the console starts the shared service automatically)') from exc
             self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._reader = self._sock.makefile('rb')
             self.ws = self._sock
             self.call('hello', robot_host=self.host, ws_port=self.ws_port,
-                      joint_udp_port=self.joint_udp_port, udp_port=self.udp_port)
+                      joint_udp_port=self.joint_udp_port, udp_port=self.udp_port,
+                      timeout_s=max(self.timeout_s, self.shared.get('startup_timeout_s', 15.))
+                      if self.shared.get('mode') == 'managed' else None)
             self.udp, self.joint_udp = _Datagram(self, 'Cart'), _Datagram(self, 'Axis')
         except BaseException:
             self.close()
@@ -73,18 +130,28 @@ class SharedFollowerConnection:
                 if not line:
                     raise ConnectionError('Shared A10 service disconnected')
                 response = json.loads(line)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as exc:
+                self._note_failure(op, data, exc)
                 self.close()
                 raise
             finally:
                 self._request_pending.clear()
             if 'error' in response:
+                self._note_failure(op, data, response['error'])
                 from ..operators.a10_operator import A10ControllerError, A10ProtocolError
-                kinds = dict(InterruptedError=InterruptedError, PermissionError=PermissionError,
+                kinds = dict(ControlTransferredError=ControlTransferredError,
+                             InterruptedError=InterruptedError, PermissionError=PermissionError,
                              TimeoutError=TimeoutError, ConnectionError=ConnectionError,
                              A10ControllerError=A10ControllerError, A10ProtocolError=A10ProtocolError)
                 raise kinds.get(response.get('error_type'), RuntimeError)(response['error'])
             return response.get('result')
+
+    def _note_failure(self, op, data, error):
+        self.last_request_failure = dict(
+            command=data.get('command', op), failed_wall_ns=time.time_ns(),
+            error=str(error), transport='shared', host=self.host, port=self.ws_port,
+            shared_host=self.shared.get('host', '127.0.0.1'),
+            shared_port=self.shared.get('port', 5870), events=[])
 
     def interrupt(self):
         sock = self._sock

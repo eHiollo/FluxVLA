@@ -1357,3 +1357,16 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 验证限制：本次本地组合回归104项，报告2项失败、9项错误，均位于test_a10_init_motion；可见初始位断言与配置不一致、测试参数含当前接口不接受的max_velocity_rad_s/max_acceleration_rad_s2，以及模拟控制器start_follower连接关闭。尚未修复，不将本次归档标记为全量回归通过。测试只使用本地模拟设备，未连接真实控制器。
 - a10_dual_record.zip为本地数据压缩包（约16MB），保留原文件，不纳入代码提交。
 - 单独复核录制、双臂保持与双臂运行时：test_vr_recording、test_vr_dual_hold_session、test_vr_dual_runtime共93项通过（6.082秒）。
+
+### 2026-11-11：双臂控制台与遥操作共存
+
+- 问题：双臂控制台显式拒绝shared模式，双臂VR默认直连；两者争用控制器单客户端WebSocket。原共享服务按单臂解析双臂GET，还会对同一5999端口打开两条连接；VR初始化Tool坐标和record_*指令也未支持共享角色。
+- 实现：复用engines/communication中的共享服务，双臂operator默认managed模式；本机首个客户端自动拉起独立服务，先绑定5870再打开唯一机器人5999连接，防止同时启动重复占用。两个UI可任意顺序启动或退出；最后一个客户端退出约5秒后服务自行退出。旧single/shared/auto模式和显式直连接口保留。
+- 共享服务只解析控制器全局状态，完整双臂反馈仍由A10Operator按配置映射验证；相同命令/状态端口共用socket与事务锁。保留双臂UDP行顺序、ID映射和今日速度/旋转算法。
+- 查询不接管，控制台动作先停止并撤销原发送权；m_init在读取原始控制状态后保留整个多步骤操作的控制权，结束时恢复原模式。VR被接管后保留界面，停止旧目标与配件操作，正常释放控制权并松开侧键后下次按下重新取实际锚点。VR退出不会停止控制台的新跟随；不会自动恢复仍按住的旧输入。
+- --record-controller通过服务的同一机器人连接发送record_start/status/heartbeat；录制权限独立于运动权限，控制台GET不打断记录。服务故障不自动回退直连或重发运动，启动/所有权事件保留日志。
+- 文件：双臂operator配置、a10_shared_connection.py、a10_shared_server.py、A10Operator、VR runtime、a10_control.py、a10_shared_control.py，以及命令速查/现场指南/CLI。新增严格单客户端的本地双臂VR集成测试；修正既有模拟控制器漏实现的start_follower模块ACK，旧双通道测试明确用独立状态端口。
+- 全部验证使用回环模拟控制器和合成手柄，未连接实机、SSH或修改控制器；真实双臂并行窗口验收留待现场。
+- 最终回归：`PYTHONPATH=.:test python -m unittest test_a10_vr_shared_control test_a10_shared_control test_a10_control test_vr_dual_hold_session test_vr_dual_runtime test_vr_recording test_vr_controller_recording`，185项通过（46.644秒）。覆盖双臂同连接并行查询与目标、任意/同时启动、独立退出与空闲释放、离线不回退、控制权接管/竞态旧包、完整m_init恢复、GET超时保留界面、旧连接迟到清理、控制器记录心跳、闲置手柄和HUD提示。
+- 更新旧控制台测试驱动：明确等待上一条协议命令回复后再注入故障，避免异步输入导致故障被施加在错误阶段；Ctrl+C按当前stop流程断言，模拟器补齐start_follower/manual_stop ACK，双臂共享测试改为允许并验证配置。并发行为由新增真实回环集成测试独立验证。
+- 命令预览以127.0.0.1覆盖机器人地址通过，未启动服务或连接设备。自动审批拒绝了最初含实机地址的预览请求，之后仅执行回环版本；没有执行实机连接。完整离线输出保存至`work_dirs/a10/shared_control/offline_tests.log`（不提交运行日志）。

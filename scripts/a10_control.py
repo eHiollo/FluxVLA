@@ -39,7 +39,7 @@ HELP = """可用指令：
   jog right rz 1                右臂绕本次开始时工具 Z 轴旋转 1 度
   jog left x 5 right x 5        两臂各沿自身工具 X 轴移动 5 mm
   g_move --pos=毫米数            发送夹爪目标，范围 0..100 mm
-  m_init                        返回机器人定义的唯一初始位置，完成后停止跟随
+  m_init                        回到初始位置，成功后恢复原控制模式与跟随状态
   stop                          取消当前及排队命令，停止动作下发并请求停止 follower
   其他未注册指令                原文发送到控制器，显示完整回复
   raw 控制器指令                显式透传，可发送与内置名称相同的原生命令
@@ -286,6 +286,22 @@ class A10Console:
             self.output('旧会话的跟随尚未确认停止，请在现场控制器处理；新连接不继承控制权限。')
 
     def execute(self, args):
+        # Keep a multi-step console operation (notably m_init) exclusive until
+        # its speed/mode restoration is complete. Queries never claim control.
+        shared = getattr(self.robot, 'shared_control', None)
+        controls = (args.command not in ('get', 'help', 'exit', 'reconnect', 'm_init')
+                    and not (args.command == 'joints' and not args.targets))
+        reserved = (controls and isinstance(shared, dict) and shared.get('role') == 'console'
+                    and self.robot.allow_motion and self.robot.is_connected)
+        if reserved:
+            self.robot.begin_shared_console_operation()
+        try:
+            return self._execute(args)
+        finally:
+            if reserved:
+                self.robot.end_shared_console_operation()
+
+    def _execute(self, args):
         """Execute parsed commands via public operator methods only."""
         robot, out, cmd = self.robot, self.output, args.command
         if cmd not in ('joints', 'get', 'help'):
@@ -563,8 +579,6 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
             settings['allow_motion'] = True
         shared = args.shared if args.shared is not None else (
             args.config is None or bool(settings.get('shared_control')))
-        if shared and len(settings.get('arms') or {}) > 1:
-            raise CommandError('双臂控制台目前使用 --direct；共享服务尚未验证双臂反馈。')
         if args.read_only:
             settings['allow_motion'] = False
             # Monitor-only, with no accessory opens or extra background socket.
@@ -584,13 +598,15 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
                 shared_options['port'] = args.shared_port
             shared_options.setdefault('host', '127.0.0.1')
             shared_options.setdefault('port', 5870)
-            shared_service = ConsoleSharedControl(
-                (shared_options['host'], shared_options['port']), output=output,
-                host=settings['host'], ws_port=settings.get('ws_port', 5999),
-                status_ws_port=settings.get('status_ws_port', 5888),
-                udp_port=settings.get('udp_port', 9998),
-                joint_udp_port=settings.get('joint_udp_port', 9999),
-                timeout_s=settings.get('timeout_s', 5.))
+            if shared_options.get('mode') != 'managed':
+                shared_service = ConsoleSharedControl(
+                    (shared_options['host'], shared_options['port']), output=output,
+                    host=settings['host'], ws_port=settings.get('ws_port', 5999),
+                    status_ws_port=settings.get('status_ws_port', 5888),
+                    udp_port=settings.get('udp_port', 9998),
+                    joint_udp_port=settings.get('joint_udp_port', 9999),
+                    timeout_s=settings.get('timeout_s', 5.))
+            shared_options.setdefault('status_ws_port', settings.get('status_ws_port', 5888))
             settings['shared_control'] = shared_options
         else:
             settings.pop('shared_control', None)

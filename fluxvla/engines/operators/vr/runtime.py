@@ -228,6 +228,7 @@ class VRTeleopRuntime:
             raise ValueError('keep_session_on_query_error must be bool')
         self.keep_session_on_query_error = keep_session_on_query_error
         self.communication_pause = None
+        self.shared_control_pause = None
         self.last_tracking_warning = None
         self._tracking_warning_logged = False
         self.controller_recording = dict(state='disabled' if not record_controller else 'pending')
@@ -432,7 +433,12 @@ class VRTeleopRuntime:
                 if self.record_controller:
                     self._controller_recording_request(start=True)
                 self._checked_frame(require_active=False)
-            self._apply_speed_override()
+            lease = self.robot.get_shared_control_status() if (
+                self.execute and getattr(self.robot, 'shared_control', None)) else None
+            if lease is not None and not lease['owns'] and not lease['available']:
+                self._pause_shared_control()
+            else:
+                self._apply_speed_override()
             if self.execute or self.observe_only:
                 if self.gripper is not None:
                     self.gripper.connect()
@@ -441,6 +447,67 @@ class VRTeleopRuntime:
             self.close()
             raise
         return self
+
+    def _pause_shared_control(self):
+        """The relay already stopped the old owner; never stop the new one."""
+        if self.shared_control_pause is None:
+            self._cancel_accessories()
+            recording = getattr(self, 'recording', None)
+            if recording is not None and recording.state == 'recording':
+                recording.fail('Console took control; episode interrupted')
+            self.robot.get_shared_control_status()
+            self._speed_restore = None  # Console now owns settings; old VR cleanup must not overwrite them.
+            self.shared_control_pause = dict(state='console_control')
+            self._started_follower = False
+            self._reference_time = None
+            if hasattr(self, '_dual_time'):
+                self._dual_time = None
+            self._follower_anchor_pose = None
+            if self.teleoperator is not None:
+                self.teleoperator.reset_reference()
+            self._shared_control_hud(paused=True)
+            logging.getLogger(__name__).info('控制台已接管：VR界面保留；控制台停止后，松开侧键再按可重新接管。')
+        self.last_reference_result = dict(state='console_control', arms={}, transmitted=False)
+
+    def _shared_control_hud(self, *, paused):
+        if self.teleoperator is not None:
+            try:
+                self.teleoperator.send_feedback(dict(type='hud',
+                    phase='console_control' if paused else 'idle', error='',
+                    hint='CONSOLE HAS CONTROL' if paused else 'VR READY - PRESS SIDE GRIP',
+                    controls=dict(visible=False, ready=not paused)))
+            except Exception:
+                logging.getLogger(__name__).warning('控制权状态提示发送失败', exc_info=True)
+
+    def _step_shared_control(self, raw):
+        if not self.execute or not getattr(self.robot, 'shared_control', None):
+            return False
+        lease = self.robot.get_shared_control_status()
+        if (not lease.get('preempted') and (lease['owns'] or lease['available'])
+                and self.shared_control_pause is None):
+            return False
+        self._pause_shared_control()
+        samples = list(raw.values()) if getattr(self.teleoperator, 'is_dual', False) else [raw]
+        released = bool(samples) and all(
+            not (sample.get('xlevr.enabled') or sample.get('xlevr.grip_active')
+                 or sample.get('xlevr.buttons', {}).get('squeeze')) for sample in samples)
+        # An unused, untracked hand must not prevent a fresh release of the
+        # active hand from returning control. Active-hand validation is unchanged.
+        fresh_release = released and any(
+            isinstance(sample.get('xlevr.sample_age_s'), (int, float))
+            and 0 <= sample['xlevr.sample_age_s'] <= self.max_feedback_age_s
+            for sample in samples)
+        if lease['available'] and fresh_release:
+            self.robot.acknowledge_shared_takeover()
+            self.shared_control_pause = None
+            self._require_release = False
+            if hasattr(self, '_dual_require_release'):
+                self._dual_require_release = False
+            self._reference_stop_attempted = False
+            self.last_reference_result = dict(state='idle', arms={}, transmitted=False)
+            self._shared_control_hud(paused=False)
+            logging.getLogger(__name__).info('VR控制权可用：下一次按侧键时重新取实际位姿，不重发旧目标。')
+        return True
 
     def _checked_frame(self, *, require_active):
         frame = self.robot.get_frame()
@@ -576,11 +643,26 @@ class VRTeleopRuntime:
             latency = getattr(self.vr, 'latency', None)
             if latency is not None:
                 latency.consume(raw, self._input_read_time)
+            if self._step_shared_control(raw):
+                return action
             blocked = recording.before_step(raw, action) if recording is not None else False
             result = action if blocked else self._step(raw, action)
             if recording is not None: recording.after_step()
             return result
         except BaseException as exc:
+            from ...communication.a10_shared_connection import ControlTransferredError
+            transferred = isinstance(exc, ControlTransferredError)
+            if (not transferred and isinstance(exc, Exception) and self.execute
+                    and getattr(self.robot, 'shared_control', None) and self.robot.is_connected):
+                try:
+                    transferred = self.robot.get_shared_control_status().get('preempted', False)
+                except Exception:
+                    pass  # Preserve the original transport/controller failure.
+            if transferred:
+                if recording is not None and recording.state == 'recording':
+                    recording.fail('Console took control; episode interrupted')
+                self._pause_shared_control()
+                return action
             if recording is not None and recording.state == 'recording':
                 recording.fail(f'Control interrupted: {exc}')
             self._cancel_accessories()
@@ -660,6 +742,8 @@ class VRTeleopRuntime:
                     record['tracking_limit_warning'] = dict(self.last_tracking_warning)
                 if self.communication_pause is not None:
                     record['communication_pause'] = dict(self.communication_pause)
+                if self.shared_control_pause is not None:
+                    record['shared_control_pause'] = dict(self.shared_control_pause)
                 failure = getattr(self.robot, 'last_communication_failure', None)
                 if failure is not None:
                     record['communication_failure'] = failure

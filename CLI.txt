@@ -227,3 +227,19 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
     except KeyboardInterrupt:
         print('\nUDP 发送已结束')
 PY
+====双臂控制台与VR同时打开（默认共享连接，先开哪个都可以）====
+# 终端一：查询不打断VR；控制命令接管，VR窗口保留
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
+
+# 终端二：沿用已调好的默认参数
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-controller \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True
+
+# 控制台接管/回位后恢复VR：控制台先输入 stop_follower，双手松开侧键，再按侧键接管。
+# 单独关闭查询控制台不影响VR；最后一个客户端退出约5秒后服务自动退出。
+# 服务日志：work_dirs/a10/shared_control/service.log

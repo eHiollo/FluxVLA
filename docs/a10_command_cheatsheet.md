@@ -4,6 +4,38 @@
 旧开发工作树已归档并移除；仍停留在旧目录的终端请先执行 `cd /home/robot/VLA/FluxVLA`。
 切换前已打开的控制台请退出后重开。
 
+## 双臂控制台与 VR 同时使用（2026-11-11）
+
+双臂默认通过本机共享服务连接 `.150`，不用再手动开启第三个终端。
+**控制台或 VR 都可以先开**，第二个自动复用连接。两个终端都先进入仓库并激活 `fluxvla` 环境。
+
+终端一：
+
+```bash
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
+```
+
+终端二：
+
+```bash
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-controller \
+  --cfg-options \
+    teleop.vr_only=False \
+    teleop.observe_only=False \
+    teleop.operator.allow_motion=True
+```
+
+- 控制台输入 `get`、`joints` 只查询，不打断 VR。
+- 控制台执行控制指令会先停止并接管当前跟随；VR 窗口保留，不再发送旧目标。
+- `m_init` 正常到位后仍恢复原来的模式和跟随开启状态。如果它恢复了跟随，先在控制台输入 `stop_follower`；然后双手松开侧键，再按需要控制的侧键，VR 会从当前实际位姿建立新锚点。
+- 关闭仅查询的控制台不会停止 VR。控制台接管后关闭 VR，也不会停止控制台的新跟随。
+- 本机服务独立于两个窗口；最后一个客户端退出约 5 秒后自动释放端口。5999 为唯一机器人命令/状态连接，5870 只用于本机程序之间共享，UDP 格式与原控制器不变。
+- 保留已调好的运动速度和算法。服务失败不会自动改成直连、重新使能或重发运动目标。机器人离线时控制台保留，可输入 `reconnect`；VR 启动失败后需要重新运行命令。
+- 服务启动日志：`work_dirs/a10/shared_control/service.log`；所有权切换明细：`work_dirs/a10/inference_logs/*_shared_control/`。
+- 本次切换前退出旧版本的直连窗口；旧的独立共享服务也应先退出。双臂不用添加 `--direct`。单臂旧配置不受影响。
+
 ## 换 USB 接口后检查设备
 
 在 `/home/robot/VLA/FluxVLA`、`fluxvla` 环境运行：

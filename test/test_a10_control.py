@@ -12,13 +12,22 @@ import time
 import unittest
 from unittest.mock import patch
 
-from scripts.a10_control import main as control_main, parse_command, CommandError
+from scripts.a10_control import main as control_main, parse_command, CommandError, A10Console
 from test_a10_operator import FakeController, DUAL_ARMS, dual_motion
 
 
 def main(argv=None, **kwargs):
-    # Existing protocol regressions explicitly exercise the direct transport.
-    return control_main(['--direct', *(argv or [])], **kwargs)
+    # These protocol scenarios intentionally submit the next input after the
+    # previous reply. Production input is asynchronous; concurrent takeover and
+    # cancellation are exercised separately, without this deterministic driver.
+    class OrderedInputConsole(A10Console):
+        def shell(self, input_fn=input):
+            def read(prompt):
+                self._commands.join()
+                return input_fn(prompt)
+            return super().shell(read)
+    with patch('scripts.a10_control.A10Console', OrderedInputConsole):
+        return control_main(['--direct', *(argv or [])], **kwargs)
 
 
 class ConsoleTest(unittest.TestCase):
@@ -36,7 +45,7 @@ class ConsoleTest(unittest.TestCase):
             self.assertNotIn('操作未完成', result.stdout)
             self.assertIn('手动使能成功', result.stdout)
             self.assertEqual([cmd for cmd in c.commands if cmd != 'get'],
-                ['manual_en', 'follower_aj', 'stop_follower', 'follower_cart', 'stop_follower', 'manual_ds'])
+                ['manual_en', 'start_follower', 'follower_aj', 'stop_follower', 'follower_cart', 'stop_follower', 'manual_ds'])
             packet,_ = c.joint_udp.recvfrom(65535)
             self.assertEqual(packet[40:], b'jp --motor_pos=[0,90,-90,180,0,45]')
 
@@ -76,7 +85,7 @@ class ConsoleTest(unittest.TestCase):
             self.assertEqual(int.from_bytes(packet[:4],'little'),len(packet)-40)
             self.assertEqual(packet[40:],b'jp --motor_pos=[0,90,-90,180,0,45]')
             self.assertEqual([cmd for cmd in c.commands if cmd!='get'],
-                             ['set_jog_coordinate --axis','follower_aj','stop_follower'])
+                             ['set_jog_coordinate --axis','start_follower','follower_aj','stop_follower'])
             self.assertIsNone(c.operators[0]._connection.joint_udp)
 
     def test_joint_send_before_start_or_wrong_mode_refused(self):
@@ -110,7 +119,7 @@ class ConsoleTest(unittest.TestCase):
                 code,output = self.run_console(c,['follower_aj',*end])
                 self.assertEqual(code,expected)
                 self.assertFalse(c.active)
-                self.assertIn('本次跟随已停止',output)
+                self.assertIn('Stopped 反馈已确认' if expected == 130 else '本次跟随已停止',output)
 
     def test_joint_query_does_not_substitute_target_feedback(self):
         with FakeController() as c:
@@ -173,7 +182,7 @@ class ConsoleTest(unittest.TestCase):
                 code, output = self.run_console(c, ['follower_cart', *end])
                 self.assertEqual(code, expected)
                 self.assertEqual(c.commands.count('stop_follower'), 1)
-                self.assertIn('本次跟随已停止', output)
+                self.assertIn('Stopped 反馈已确认' if expected == 130 else '本次跟随已停止', output)
                 self.assertNotIn('manual_ds', c.commands)
 
     def test_exit_does_not_stop_existing_follower(self):
@@ -604,7 +613,7 @@ class DualConsoleTest(unittest.TestCase):
             self.assertIn('right（ee_id=1）', output)
             self.assertIn('整个双臂控制组', output)
             self.assertIn('双臂模式拒绝', output)
-            self.assertNotIn('可复制为目标', output)
+            self.assertIn('可复制为目标', output)
             self.assertEqual([x for x in c.commands if x!='get'], ['follower_cart','stop_follower'])
             for sock in (c.udp,c.joint_udp):
                 with self.assertRaises(TimeoutError):
@@ -687,7 +696,7 @@ class MergedConsoleCompatibilityTest(unittest.TestCase):
         self.assertFalse(captured[0]['allow_motion'])
         constructor.assert_not_called()
 
-    def test_shared_override_and_dual_shared_rejected_before_connection(self):
+    def test_shared_override_and_dual_shared_config_are_accepted(self):
         code, captured, constructor, _ = self.capture(['--shared-port','12345'],
             dict(host='example', shared_control=dict(port=9876)))
         self.assertEqual(code, 0)
@@ -695,9 +704,9 @@ class MergedConsoleCompatibilityTest(unittest.TestCase):
         self.assertEqual(constructor.call_args.args[0], ('127.0.0.1', 12345))
         code, captured, constructor, _ = self.capture(['--shared'],
             dict(host='example', arms=DUAL_ARMS))
-        self.assertEqual(code, 1)
-        self.assertEqual(captured, [])
-        constructor.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(captured[0]['shared_control']['role'], 'console')
+        constructor.assert_called_once()
 
 
 if __name__ == '__main__':

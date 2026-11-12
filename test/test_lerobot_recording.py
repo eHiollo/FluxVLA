@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -161,6 +162,38 @@ class NativeSessionTests(SessionTests):
         session.command('stop'); self.settle(); session.close()
         self.assertTrue(session.quit_requested)
         self.assertEqual(validate_dataset(self.root)['episodes'], 2)
+
+    def test_native_episode_contains_m_init_measurements_and_three_videos(self):
+        import pyarrow.parquet as pq
+        self.use_native_writer()
+        session = self.session; session.workflow = 'lerobot'
+        self.update(); self.start()
+        release = threading.Event()
+        def moving(*args, **kwargs): release.wait(3.)
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=moving):
+            session.command('up'); session.command('up')
+            try:
+                self.assertTrue(session.capturing)
+                self._background_inputs()  # Exercise the independent sampler too.
+                initial = session.frames
+                deadline = time.monotonic()+1.
+                while session.frames < initial+3 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertGreaterEqual(session.frames, initial+3)
+                session._stop_sampling(); session._background_sampling = False
+            finally:
+                release.set(); session.reset_thread.join(2.)
+            session._poll_reset()
+        self.assertEqual(session.state, 'recording', session.error)
+        self.update()
+        session.command('right'); session.command('right'); self.settle(); session.close()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+        rows = [json.loads(l) for l in next((self.root/'meta/xlevr_diagnostics').glob('*.jsonl')).read_text().splitlines()]
+        self.assertGreaterEqual(sum(row['details']['control_phase']=='m_init' for row in rows), 3)
+        phases = [row['details']['control_phase'] for row in rows]
+        self.assertEqual((phases[0], phases[-1]), ('teleop', 'teleop'))
+        self.assertEqual(pq.read_table(next(self.root.glob('data/**/*.parquet'))).num_rows, len(rows))
+        self.assertEqual(len(list(self.root.glob('videos/**/*.mp4'))), 3)
 
     def test_control_loop_adds_one_frame_after_slow_stop_without_filling_gap(self):
         session = self.session

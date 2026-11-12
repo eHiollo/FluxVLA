@@ -85,15 +85,128 @@ class LeRobotWorkflowTests(SessionTests):
         self.settle()
         self.assertEqual(self.session.state, 'recording', self.session.notice)
 
-    def test_reset_during_episode_keeps_buffer_and_returns_to_scene_reset(self):
+    def test_reset_during_episode_keeps_recording_until_finish(self):
         self.start()
         count = self.session.frames
         self.reset_arms()
-        self.assertEqual(self.session.state, 'review')
+        self.assertEqual(self.session.state, 'recording')
         self.assertEqual(self.session.frames, count)
         self.assertIsNotNone(self.writer.active)
+        self.update()
+        self.assertGreater(self.session.frames, count)
+        self.right()
+        self.assertEqual(self.session.state, 'review')
         self.right(); self.settle()
         self.assertEqual(self.writer.info['total_episodes'], 1)
+
+    def test_reset_records_measured_motion_and_images_in_same_episode(self):
+        import pyarrow.parquet as pq
+        self.session.sampling_mode = 'control_loop'
+        self.start()
+        entered, release = threading.Event(), threading.Event()
+        def moving(*args, **kwargs):
+            entered.set(); release.wait(3.)
+        # Use the real writer and changing read-only feedback, while the normal
+        # runtime frame stays at the pre-reset position.
+        frame = self.runtime.last_frame
+        measured = dict(frame, arms={n: dict(a, joints=[.7 if a['ee_id'] == 1 else .8]*6)
+                                     for n, a in frame['arms'].items()})
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=moving):
+            self.session.command('up')
+            self.assertEqual(self.session.state, 'recording')
+            self.assertTrue(self.session.capturing)  # Confirmation does not finish the episode.
+            self.session.command('up'); self.assertTrue(entered.wait(1.))
+            try:
+                self.assertTrue(self.session.blocks_motion)
+                self.assertTrue(self.session.capturing)
+                self.runtime.robot.get_feedback_snapshot.side_effect = lambda _: measured
+                count = self.session.frames
+                self.update(); self.update()
+                self.assertEqual(self.session.frames, count+2)
+                self.session._hud(time.monotonic())
+                hud = self.runtime.teleoperator.send_feedback.call_args.args[0]
+                self.assertEqual(hud['phase'], 'resetting')
+                self.assertTrue(hud['capture_active'])
+                self.assertIn('capture active', hud['hint'])
+                self.assertFalse(hud['controls']['directions']['right']['enabled'])
+                self.runtime.robot.get_state.assert_not_called()
+                self.runtime.robot.send_joints.assert_not_called()
+            finally:
+                release.set(); self.session.reset_thread.join(2.)
+            self.session._poll_reset()
+        self.assertEqual(self.session.state, 'recording')
+        self.right(); self.right(); self.settle()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+        table = pq.read_table(next(self.root.glob('data/**/*.parquet'))).to_pydict()
+        self.assertTrue(any(abs(row[0]-.7)<1e-5 and abs(row[7]-.8)<1e-5
+                            for row in table['observation.state']))
+        self.assertEqual(len(list(self.root.glob('videos/**/*.mp4'))), 3)
+
+    def test_reset_after_finish_or_before_start_does_not_capture(self):
+        for initial in ('idle', 'review'):
+            with self.subTest(initial=initial):
+                if initial == 'review':
+                    self.update(); self.start(); self.right()
+                    self.assertEqual(self.session.state, 'review')
+                entered, release = threading.Event(), threading.Event()
+                def moving(*args, **kwargs):
+                    entered.set(); release.wait(3.)
+                with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=moving):
+                    count = self.session.frames
+                    self.session.command('up'); self.session.command('up')
+                    self.assertTrue(entered.wait(1.))
+                    try:
+                        self.update()
+                        self.assertFalse(self.session.capturing)
+                        self.assertEqual(self.session.frames, count)
+                    finally:
+                        release.set(); self.session.reset_thread.join(2.)
+                    self.session._poll_reset()
+                self.assertEqual(self.session.state, initial)
+
+    def test_reset_data_fault_cancels_motion_and_never_resumes_or_saves_episode(self):
+        self.start()
+        entered = threading.Event()
+        def moving(robot, *, cancel_event):
+            entered.set(); cancel_event.wait(3.)
+            # Even a successful worker return cannot erase a sampling error.
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=moving):
+            self.session.command('up'); self.session.command('up')
+            self.assertTrue(entered.wait(1.))
+            count = self.session.frames
+            self.runtime.robot.get_feedback_snapshot.side_effect = lambda _: dict(self.runtime.last_frame, has_error=True)
+            self.update()
+            self.assertTrue(self.session.reset_cancel.is_set())
+            self.session.reset_thread.join(2.); self.session._poll_reset()
+        self.assertEqual(self.session.state, 'reset_failed')
+        self.assertEqual(self.session.frames, count)
+        self.assertIn('faulted', self.session.error)
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+
+    def test_reset_cancel_invalidates_recording_even_if_worker_returns_success(self):
+        self.start()
+        def moving(robot, *, cancel_event): cancel_event.wait(3.)
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=moving):
+            self.session.command('up'); self.session.command('up')
+            self.session.command('down')
+            self.assertFalse(self.session.capturing)
+            self.session.reset_thread.join(2.); self.session._poll_reset()
+        self.assertEqual(self.session.state, 'reset_failed')
+        self.assertIn('cancelled', self.session.error)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+
+    def test_reset_rejected_or_confirmation_expired_does_not_finish_episode(self):
+        self.start(); self.update(grip=True)
+        self.session.command('up')
+        self.assertEqual(self.session.state, 'recording')
+        self.assertIsNone(self.session.pending)
+        self.update(); self.session.command('up')
+        self.session.pending_at -= 20.
+        self.update()
+        self.assertIsNone(self.session.pending)
+        self.assertEqual(self.session.state, 'recording')
 
     def test_disabled_gripper_with_real_feedback_can_record_without_automatic_enable(self):
         for channel in self.channels.values():

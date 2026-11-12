@@ -199,7 +199,7 @@ class _ZXGripperChannel:
                     if target is not None and target != self._last_sent:
                         try:
                             self.client.set_position_raw(self.device_id, target, speed=self.speed, torque=self.torque,
-                                                         motion_deadline_s=deadline, motion_cancel_event=self._motion_cancel)
+                                                         motion_deadline_s=deadline, motion_cancel_event=self._motion_cancel, feedback=state)
                             self._last_sent = target
                         except ZXGripperCommunicationError as exc:
                             self._communication_failed(exc)

@@ -273,6 +273,37 @@ class ZXGripperTests(unittest.TestCase):
         self.assertEqual(struct.unpack('>6H', writes[1][7:-2]), (0, 4720, 10, 60, 1000, 1000))
         self.assertEqual(writes[-1][2:6], bytes.fromhex('01 08 00 01'))
 
+    def test_live_feedback_avoids_duplicate_alarm_read_and_redundant_enable(self):
+        self.fake.alarms = (0, 0)
+        self.client.connect()
+        state = self.client.read_state(1)
+        self.fake.writes.clear()
+        self.client.set_position_raw(1, 4500, feedback=state)
+        self.assertEqual([p[1] for p in self.fake.writes], [6, 16, 6])
+        self.assertEqual([int.from_bytes(p[2:4], 'big') for p in self.fake.writes],
+                         [0x0108, 0x0102, 0x0108])
+        self.assertEqual(self.fake.position, 4500)
+        self.assertEqual(self.fake.enabled, 1)
+
+    def test_live_disabled_feedback_still_enables_before_trigger(self):
+        self.fake.alarms = (0, 0)
+        self.fake.enabled = 0
+        self.client.connect()
+        state = self.client.read_state(1)
+        self.fake.writes.clear()
+        self.client.set_position_raw(1, 4500, feedback=state)
+        self.assertEqual([int.from_bytes(p[2:4], 'big') for p in self.fake.writes],
+                         [0x0108, 0x0102, 0x0100, 0x0108])
+        self.assertEqual(self.fake.enabled, 1)
+
+    def test_live_alarm_feedback_prevents_all_motion_writes(self):
+        self.client.connect()
+        state = self.client.read_state(1)
+        self.fake.writes.clear()
+        with self.assertRaisesRegex(zx.ZXGripperError, 'blocked by alarms'):
+            self.client.set_position_raw(1, 4500, feedback=state)
+        self.assertEqual(self.fake.writes, [])
+
     def test_motion_alarms_validation_and_timeout(self):
         self.client.connect()
         with self.assertRaisesRegex(zx.ZXGripperError, 'blocked by alarms'):

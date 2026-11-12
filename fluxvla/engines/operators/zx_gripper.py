@@ -327,13 +327,15 @@ class ZXGripper:
             device_id, int(position * self.max_position_raw + 0.5), **options)
 
     def set_position_raw(self, device_id, position, *, speed=10, torque=60,
-                         wait=False, move_timeout=10, motion_deadline_s=None, motion_cancel_event=None):
+                         wait=False, move_timeout=10, motion_deadline_s=None, motion_cancel_event=None, feedback=None):
         """Update the latest target, returning a command ID or (wait=True) state.
 
         wait=False waits for bounded serial ACKs only, not mechanical motion.
         Repeated identical targets retain the existing command and holding force.
         Optional monotonic motion_deadline_s / motion_cancel_event are checked
         before motion writes. Expiry does not undo a target already triggered.
+        Teleop may reuse its just-read feedback to avoid another alarm read
+        and an enable write when the device is already confirmed enabled.
         """
         device_id = _integer(device_id, 'device_id', 1, 247)
         position = _integer(position, 'position', 0, self.max_position_raw)
@@ -351,7 +353,12 @@ class ZXGripper:
                 raise ZXGripperInputExpired('VR input expired/cancelled before motion write')
         with self._io_lock:
             check_deadline()
-            alarm_a, alarm_b = self.read_registers(device_id, ALARM_REGISTER, 2)
+            if feedback is None:
+                alarm_a, alarm_b = self.read_registers(device_id, ALARM_REGISTER, 2)
+            else:
+                if not isinstance(feedback, ZXGripperState) or feedback.device_id != device_id:
+                    raise ValueError('feedback must be the current device state')
+                alarm_a, alarm_b = feedback.alarm_a, feedback.alarm_b
             if alarm_a or alarm_b:
                 raise ZXGripperError(f'Motion blocked by alarms: {alarm_a:#06x}, {alarm_b:#06x}')
             check_deadline()
@@ -365,7 +372,8 @@ class ZXGripper:
                 self.write_registers(device_id, 0x0102,
                                      (position >> 16, position & 0xFFFF, speed, torque, 1000, 1000))
                 check_deadline()
-                self.write_register(device_id, 0x0100, 1)
+                if feedback is None or not feedback.enabled:
+                    self.write_register(device_id, 0x0100, 1)
                 check_deadline()
                 self.write_register(device_id, 0x0108, 1)
                 self._command_sequence += 1

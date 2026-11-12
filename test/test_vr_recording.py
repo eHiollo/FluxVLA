@@ -124,6 +124,7 @@ class SessionTests(unittest.TestCase):
         cfg['record'].update(backend='legacy')
         cfg['record'].pop('image_writer_threads', None)
         cfg['capture']['sampling_mode']='background_30hz'
+        cfg['capture']['workflow']='legacy'
         cfg['capture'].update(terminal=False, max_clock_drift_s=10., max_sample_gap_s=10.)
         for group in ('record',''):
             cams=cfg['record']['cameras'] if group else cfg['cameras']

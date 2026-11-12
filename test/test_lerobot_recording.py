@@ -116,7 +116,7 @@ class NativeWriterTests(unittest.TestCase):
 class NativeSessionTests(SessionTests):
     # Inherit the existing UI, m_init and lifecycle regressions below only via
     # targeted load_tests. New cases use its synthetic device setup.
-    def test_native_writer_through_recording_ui_save_discard_and_next_episode(self):
+    def use_native_writer(self):
         session = self.session
         self.writer.close()
         self.root = Path(self.temp.name)/'real-native'
@@ -129,6 +129,10 @@ class NativeSessionTests(SessionTests):
         session.cameras.snapshot.side_effect = lambda _: {
             n: dict(image=np.zeros((64,64,3), np.uint8), received_monotonic_s=time.monotonic(), sequence=self.seq)
             for n in CAMERAS}
+
+    def test_native_writer_through_recording_ui_save_discard_and_next_episode(self):
+        self.use_native_writer()
+        session = self.session
         self.update(); self.start()
         session.command('discard'); session.command('discard'); self.settle()
         self.assertEqual(session.state, 'idle')
@@ -137,6 +141,25 @@ class NativeSessionTests(SessionTests):
             session.command('save'); self.settle()
             self.assertEqual(session.state, 'idle', session.error)
         session.close()
+        self.assertEqual(validate_dataset(self.root)['episodes'], 2)
+
+    def test_old_stage_workflow_with_actual_native_save_clear_and_next_episode(self):
+        self.use_native_writer()
+        session = self.session; session.workflow = 'lerobot'
+        self.update(); self.start()
+        session.command('right')
+        self.assertEqual(session.state, 'review')
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+        session.command('right'); self.settle()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+        session._saved_until = 0.
+        self.update(); self.settle(); self.update(); self.update()
+        self.assertEqual(session.state, 'recording')
+        session.command('left'); session.command('right'); self.settle()
+        self.update(); self.settle(); self.update(); self.update()
+        self.assertEqual(self.writer.info['total_episodes'], 1)  # Re-record keeps the same episode index.
+        session.command('stop'); self.settle(); session.close()
+        self.assertTrue(session.quit_requested)
         self.assertEqual(validate_dataset(self.root)['episodes'], 2)
 
     def test_control_loop_adds_one_frame_after_slow_stop_without_filling_gap(self):

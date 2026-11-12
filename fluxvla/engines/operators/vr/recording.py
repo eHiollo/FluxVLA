@@ -53,6 +53,13 @@ class RecordingSession:
             raise ValueError('record.backend must be legacy or lerobot')
         self.cameras_config = copy.deepcopy(dict(config['cameras']))
         self.options = dict(config['capture'])
+        self.workflow = self.options.get('workflow', 'legacy')
+        if self.workflow not in ('legacy', 'lerobot'):
+            raise ValueError('capture.workflow must be legacy or lerobot')
+        # Same event contract and stage order as lerobot_record.record().
+        self.events = dict(exit_early=False, rerecord_episode=False, stop_recording=False)
+        self._auto_start = False
+        self._reset_return_state = 'idle'
         self.sampling_mode = self.options.get('sampling_mode', 'background_30hz')
         if self.sampling_mode not in ('control_loop', 'background_30hz'):
             raise ValueError('capture.sampling_mode must be control_loop or background_30hz')
@@ -196,6 +203,8 @@ class RecordingSession:
         if self.blocks_motion:
             for channel in self.runtime._zx_channels.values():
                 channel.check_health()
+                if channel.snapshot().get('error'):
+                    self.reset_cancel.set()
                 channel.submit(0., time.monotonic()+.1)
         return self.blocks_motion or self.button_check
 
@@ -233,8 +242,8 @@ class RecordingSession:
             # A single missed reply pauses this gripper's writes, but the last
             # measured position remains usable within the SAME age/skew bounds.
             # Preserve its timestamp and communication_error in diagnostics.
-            if (grip.get('error') or grip.get('alarm_a')
-                    or grip.get('alarm_b') or grip.get('enabled') is not True):
+            if (grip.get('error') or grip.get('alarm_a') or grip.get('alarm_b')
+                    or (self.backend != 'lerobot' and grip.get('enabled') is not True)):
                 raise ValueError(f'{side} gripper not healthy/enabled')
             times.append(t); grippers[side] = grip.get('actual_raw'); grip_details[side] = grip
         cameras = self.cameras.snapshot(stamp)
@@ -301,7 +310,11 @@ class RecordingSession:
                 self.frames += 1; self._last_sample = now; self.elapsed = now-self._first_sample
                 if self.frames >= self.record.get('max_episode_frames',18000):
                     self.state = 'review'  # One save request; never enqueue it every sampler tick.
-                    self.commands.put_nowait('save')
+                    if self.workflow == 'lerobot':
+                        self.events['exit_early'] = True
+                        self.notice = 'FRAME LIMIT: RESET SCENE; RIGHT = SAVE + NEXT'
+                    else:
+                        self.commands.put_nowait('save')
             except Exception as exc:
                 self.fail(str(exc))
 
@@ -356,6 +369,12 @@ class RecordingSession:
                 try: command = self.commands.get_nowait()
                 except queue.Empty: break
                 self.command(command)
+            if (self._auto_start and self.future is None and self.state == 'idle'
+                    and self.ready_sample is not None and self.input_fresh and not self.blocks_motion
+                    and getattr(self.runtime, 'input_pause_status', None) is None
+                    and time.monotonic() >= self._saved_until):
+                self._auto_start = False
+                self.command('start')
             if not self._background_sampling:
                 self._append_sample(time.monotonic())
         now = time.monotonic()
@@ -395,6 +414,12 @@ class RecordingSession:
                 self._camera_sequences = {}; self.repeated_images = 0
                 self.skipped_samples = self.sample_gaps = 0
                 self._missing_since = None
+                if self.workflow == 'lerobot':
+                    self.notice = 'RIGHT = FINISH EP / LEFT = REDO / UP = RESET / DOWN = STOP'
+                    if self.events['stop_recording']:
+                        self.state = 'review'
+                        self.quit_requested = True
+                        self.notice = 'Stopped before the first frame; buffer preserved'
                 if self._input_pause_invalid:
                     self.state = 'failed'
             else:
@@ -405,6 +430,15 @@ class RecordingSession:
                 self._saved_episode = value + 1
             self.error = self._input_pause_invalid if operation == 'starting' and self._input_pause_invalid else ''
             if operation != 'starting': self._input_pause_invalid = None
+            if self.workflow == 'lerobot' and operation != 'starting':
+                if self.events['stop_recording']:
+                    self.quit_requested = True
+                    self.notice = 'Recording stopped'
+                else:
+                    self._auto_start = True
+                    self.notice = (f'Episode {value+1} saved; NEXT EP STARTS AUTOMATICALLY'
+                                   if operation == 'saving' else 'Re-recording; waiting for fresh measurements')
+                self.events.update(exit_early=False, rerecord_episode=False)
             LOG.info('录制：%s %s', self.state, self.notice)
         except Exception as exc:
             self.state = 'failed'; self.error = str(exc)
@@ -431,7 +465,8 @@ class RecordingSession:
         if command == 'status':
             LOG.info('录制状态：%s', json.dumps(self.status(), ensure_ascii=False)); return
         if command == 'help':
-            LOG.info('start/save/discard/status/reset/stop/quit；右手功能键+左摇杆右/左/下/上。discard/reset需再次确认。'); return
+            LOG.info('start/save/discard/status/reset/stop/quit；右A+左摇杆右/左/下/上。'
+                     'gripper-reset left/right，gripper-disable left/right为人工夹爪维护。'); return
         if not command: return
         if self.button_check:
             self.notice = f'CHECK ONLY: {command}'; return
@@ -441,7 +476,32 @@ class RecordingSession:
             else: self.notice = 'Reset owns motion; wait or use DOWN/stop to cancel'
             return
         if self.future is not None:
+            if self.workflow == 'lerobot' and command in ('down', 'stop'):
+                self.events['stop_recording'] = True
+                self._auto_start = False
+                self.notice = 'STOP requested; waiting for current disk operation'
+                return
             self.notice = 'Disk operation in progress; wait'; return
+        if command.split()[0] in ('gripper-reset', 'gripper-disable'):
+            parts = command.split()
+            pause = getattr(self.runtime, 'input_pause_status', None)
+            if (len(parts) != 2 or parts[1] not in ('left', 'right')
+                    or not self._released() or not pause or not pause.get('stopped')):
+                self.notice = 'Release both grips; confirmed stop required. Use gripper-reset left/right'; return
+            action = 'reset' if parts[0] == 'gripper-reset' else 'disable'
+            if action == 'disable':
+                LOG.warning('人工掉使能将释放%s夹爪夹持力；此指令不用于自动故障恢复。', parts[1])
+            try:
+                self.runtime._zx_channels[parts[1]].request_alarm_action(action)
+            except Exception as exc:
+                self.notice = f'Gripper action unavailable: {exc}; check device or restart session'
+                LOG.warning('%s', self.notice)
+                return
+            self.notice = f'{parts[1]} gripper {action} requested; check feedback, then rearm'
+            LOG.info('人工夹爪操作：%s', self.notice)
+            return
+        if self.workflow == 'lerobot':
+            return self._lerobot_command(command)
         command = {'right':'save' if self.state in ('recording','review','failed') else 'start',
                    'left':'discard', 'up':'reset', 'down':'stop'}.get(command,command)
         if self.pending and command != self.pending: self.pending = None
@@ -472,6 +532,81 @@ class RecordingSession:
             self.pending = None
             if command == 'discard': self._work('discarding', self.writer.discard)
             else: self._start_reset()
+        else:
+            self.notice = 'Unknown command; use help'
+
+    def _lerobot_command(self, command):
+        """Old initial reset -> recording -> reset/rerecord -> save -> next loop.
+
+        RIGHT ends a stage; LEFT marks re-record, never silently saves it.
+        Keep A gating and the existing m_init stop/confirmation boundary.
+        """
+        LOG.info('录制指令：%s；阶段=%s，设备=%s', command, self.state, self.health)
+        if command == 'down': command = 'stop'
+        if command == 'up': command = 'reset'
+        if command in ('left', 'discard'):
+            self.pending = None
+            if self.state not in ('recording', 'review', 'failed'):
+                self.notice = 'No current episode. RIGHT = START'; return
+            self.events.update(exit_early=True, rerecord_episode=True)
+            if self.state == 'recording': self.state = 'review'
+            self.notice = 'RERECORD: RESET SCENE; RIGHT = DISCARD + START AGAIN'
+            return
+        if command == 'right' and self.state == 'recording':
+            self.events['exit_early'] = True
+            self.state = 'review'; self.pending = None
+            self.notice = 'RESET SCENE; RIGHT = SAVE + NEXT; LEFT = REDO'
+            return
+        if command == 'right':
+            command = 'start' if self.state == 'idle' else 'save'
+        if command == 'start':
+            self.pending = None
+            if self.state != 'idle':
+                self.notice = 'Finish/reset the current episode first'; return
+            if not self.input_fresh:
+                self.notice = 'Waiting for fresh VR input'; return
+            if getattr(self.runtime, 'input_pause_status', None) is not None:
+                self.notice = 'Release controls, resolve faults and rearm VR first'; return
+            if self.ready_sample is None:
+                self.notice = 'Cannot start: ' + self.health
+                LOG.warning('录制未开始：%s', self.health)
+                return
+            self.events.update(exit_early=False, rerecord_episode=False, stop_recording=False)
+            self._auto_start = False
+            self._input_pause_invalid = None
+            self.notice = 'Starting episode'
+            self._work('starting', self.writer.start, self.task)
+        elif command == 'save':
+            self.pending = None
+            if self.events['rerecord_episode'] and self.state in ('review', 'failed'):
+                self._work('discarding', self.writer.discard)
+            elif self.state in ('recording', 'review') and not self.error and self.frames >= 2:
+                self._work('saving', self.writer.save)
+            else:
+                self.notice = 'Need valid frames. LEFT = REDO, then RIGHT = START AGAIN'
+        elif command == 'stop':
+            self._auto_start = False
+            self.events.update(stop_recording=True, exit_early=True)
+            if self.events['rerecord_episode'] and self.writer.active is not None:
+                self._work('discarding', self.writer.discard)
+            elif self.state in ('recording', 'review') and not self.error and self.frames >= 2:
+                self._work('saving', self.writer.save)
+            else:
+                self.quit_requested = True  # Failed/empty buffers stay preserved, never published.
+        elif command == 'reset':
+            self._auto_start = False
+            if self.state == 'recording':
+                self.state = 'review'
+                self.events['exit_early'] = True
+            if (self.state not in ('idle', 'review') or not self._released()
+                    or getattr(self.runtime, 'input_pause_status', None) is not None):
+                self.notice = 'Release BOTH grips/triggers and resolve faults before m_init'; return
+            if self.pending != 'reset':
+                self.pending = 'reset'; self.pending_at = time.monotonic()
+                self.notice = 'CONFIRM RESET: recenter then repeat UP'; return
+            self.pending = None
+            self._reset_return_state = self.state
+            self._start_reset()
         else:
             self.notice = 'Unknown command; use help'
 
@@ -510,12 +645,20 @@ class RecordingSession:
         r._dual_time = None; r._dual_require_release = True
         r._reference_stop_attempted = False
         r.teleoperator.reset_reference()
-        self.buttons.reset(); self.pending = None
+        if self.workflow == 'lerobot' and not error:
+            # Old LeRobot allows UP -> recenter -> RIGHT while A remains held.
+            # Disarm the direction edge, not the already verified A session.
+            self.buttons.armed = False
+        else:
+            self.buttons.reset()
+        self.pending = None
         if error:
             self.reset_failed = True; self.state = 'reset_failed'; self.error = error
             self.notice = 'Reset failed/cancelled; restart session after checking controller'
         else:
-            self.state = 'idle'; self.notice = 'Reset complete; release grips before taking control'
+            self.state = self._reset_return_state if self.workflow == 'lerobot' else 'idle'
+            self.notice = ('Reset complete; RIGHT = START' if self.state == 'idle' else
+                           'Reset complete; RIGHT = SAVE + NEXT / START AGAIN')
         LOG.info('复位结果：%s %s', self.state, self.error)
 
     def status(self):
@@ -526,6 +669,7 @@ class RecordingSession:
                         pending=self.pending, health=self.health, error=self.error, hint=self.notice,
                         task=self.task, repeated_images=self.repeated_images,
                         writer_backend=self.backend, skipped_samples=self.skipped_samples,
+                        workflow=self.workflow, recording_events=dict(self.events),
                         sample_gaps=self.sample_gaps,
                         input_pause=getattr(self.runtime, 'input_pause_status', None),
                         effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
@@ -555,6 +699,22 @@ class RecordingSession:
                 if self.state != 'failed':
                     show('right', 'SAVE' if self.frames >= 2 else 'NEED 2 FRAMES', self.frames >= 2)
                 if self.state == 'recording': show('down', 'STOP CAPTURE')
+        if self.workflow == 'lerobot' and not self.button_check and self.future is None and not self.blocks_motion:
+            directions = {key: dict(label='UNAVAILABLE', enabled=False) for key in directions}
+            paused = getattr(self.runtime, 'input_pause_status', None) is not None
+            if self.state == 'idle':
+                show('right', 'REARM VR FIRST' if paused else 'START', self.ready_sample is not None and not paused)
+            elif self.state == 'recording':
+                show('right', 'FINISH EP / RESET SCENE')
+                show('left', 'REDO / RESET SCENE')
+            elif self.state in ('review', 'failed'):
+                show('left', 'REDO THIS EP')
+                redo = self.events['rerecord_episode']
+                show('right', 'DISCARD + START AGAIN' if redo else 'SAVE + NEXT',
+                     redo or (self.state == 'review' and not self.error and self.frames >= 2))
+            if self.state in ('idle', 'recording', 'review'):
+                show('up', 'RESET', self._released() and not paused)
+            show('down', 'STOP RECORDING')
         if self.pending:
             key = 'up' if self.pending == 'reset' else 'left'
             if directions[key]['enabled']: show(key, 'CONFIRM ' + self.pending.upper())
@@ -577,17 +737,28 @@ class RecordingSession:
         controls = self._hud_controls()
         phase = 'saved' if (self.state == 'idle' and now < self._saved_until
                             and self.pending is None and not self.error) else self.state
+        if self.workflow == 'lerobot' and phase in ('idle', 'review'):
+            from .hud import hud_phase_from_record
+            phase = hud_phase_from_record('reset', self.events['rerecord_episode'])
         status.update(type='hud', phase=phase, controls=controls)
         if phase == 'saved': status['episode'] = self._saved_episode
         # Hide the old success notice after the short nonblocking acknowledgement.
         if phase == 'idle' and self.notice.endswith(' saved'):
             status['hint'] = 'Ready for next episode'
+        if self.workflow == 'lerobot':
+            from .hud import build_hud_message
+            old = build_hud_message(phase=phase, hint=self.notice or None)
+            status['hint'] = old.get('hint', '')
+            if self.state == 'idle' and self.ready_sample is None:
+                status['hint'] += '\nWAIT FOR DEVICES: ' + self.health
         if self.button_check:
             status['hint'] = self.notice or 'Button check only - no device motion'
         if getattr(self.runtime, 'input_pause_status', None) is not None:
             pause = self.runtime.input_pause_hud()
             status.update({key: value for key, value in pause.items() if key != 'controls'})
-            if self.state == 'failed': status['hint'] += ' / INVALID EPISODE: LEFT TO DISCARD'
+            if self.state == 'failed':
+                status['hint'] += (' / INVALID EP: LEFT = REDO, RIGHT = CONFIRM'
+                                   if self.workflow == 'lerobot' else ' / INVALID EPISODE: LEFT TO DISCARD')
             controls['prompt'] = pause['controls']['prompt']
             phase = status['phase']
         # Clock/frame counts stay rate limited; input gates and state transitions do not.

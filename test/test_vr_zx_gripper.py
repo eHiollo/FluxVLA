@@ -52,6 +52,10 @@ class FakeZX:
         self.connected = False
         self.max_position_raw = 9000
         self.alarm = False
+        self.alarm_b = 0
+        self.enabled = True
+        self.reset_count = self.disable_count = 0
+        self.reset_succeeds = True
         self.block = threading.Event()
         self.block.set()
         self.reading = threading.Event()
@@ -70,7 +74,17 @@ class FakeZX:
             self.reading.set()
             self.block.wait(1.)
         return ZXGripperState(device_id, self.position, self.position / 9000, None,
-                              0x15, int(self.alarm), 0, True, 0, 0, time.monotonic(), 'idle')
+                              0x15, int(self.alarm), self.alarm_b, self.enabled, 0, 0, time.monotonic(), 'idle')
+
+    def reset_alarms(self, device_id):
+        self.reset_count += 1
+        if not self.reset_succeeds:
+            raise RuntimeError('alarm remains active')
+        self.alarm = False; self.alarm_b = 0
+
+    def disable(self, device_id):
+        self.disable_count += 1
+        self.enabled = False
 
     def set_position_raw(self, device_id, target, **kwargs):
         if kwargs['motion_cancel_event'].is_set() or time.monotonic() >= kwargs['motion_deadline_s']:
@@ -268,11 +282,49 @@ class ChannelTest(unittest.TestCase):
 
     def test_alarm_worker_failure_reports_error_without_opening_gripper(self):
         c = self.channel(); fake = FakeZX(); fake.alarm = True; c.client = fake
-        with self.assertRaisesRegex(RuntimeError, 'alarm'):
-            c.connect()
+        c.connect()
+        self.assertFalse(c.check_health())
+        self.assertTrue(c.snapshot()['alarm_latched'])
         c.close()
         self.assertEqual(fake.targets, [])
         self.assertFalse(fake.connected)
+
+    def test_alarm_readback_is_published_worker_stays_read_only_until_explicit_reset(self):
+        c = self.channel(); fake = FakeZX(); c.client = fake; c.connect()
+        fake.alarm_b = 0x1000
+        wait_for(lambda: c.snapshot().get('alarm_latched'))
+        self.assertEqual(c.snapshot()['alarm_b'], 0x1000)
+        self.assertTrue(c._thread.is_alive())
+        self.assertFalse(c.check_health())
+        c.submit(-1., time.monotonic()+1.)
+        time.sleep(.12)
+        self.assertEqual(fake.targets, [])
+        self.assertEqual(fake.reset_count, 0)
+        c.request_alarm_action('disable')
+        wait_for(lambda: not fake.enabled)
+        self.assertEqual(fake.disable_count, 1)
+        c.request_alarm_action('reset')
+        wait_for(lambda: c.snapshot().get('alarm_latched') is False)
+        self.assertEqual(fake.reset_count, 1)
+        self.assertEqual(c.snapshot()['alarm_b'], 0)
+        c.submit(-1., time.monotonic()+1.)
+        time.sleep(.12)
+        self.assertEqual(fake.targets, [])  # Holding the old axis never resumes writes.
+        c.submit(0., time.monotonic()+1.)
+        wait_for(lambda: c.snapshot()['phase'] == 'centered')
+        c.submit(-1., time.monotonic()+1.)
+        wait_for(lambda: bool(fake.targets))
+
+    def test_failed_manual_reset_keeps_fault_latched_and_never_retries_it(self):
+        c = self.channel(); fake = FakeZX(); c.client = fake; c.connect()
+        fake.alarm_b = 0x1000; fake.reset_succeeds = False
+        wait_for(lambda: c.snapshot().get('alarm_latched'))
+        c.request_alarm_action('reset')
+        wait_for(lambda: bool(c.snapshot().get('reset_error')))
+        time.sleep(.12)
+        self.assertEqual(fake.reset_count, 1)
+        self.assertTrue(c.snapshot()['alarm_latched'])
+        self.assertEqual(fake.targets, [])
 
 
 class DualZXRuntimeTest(unittest.TestCase):
@@ -392,7 +444,7 @@ class DualZXRuntimeTest(unittest.TestCase):
         records = [json.loads(line) for line in (Path(self.logs.name) / 'teleop.jsonl').read_text().splitlines()]
         self.assertTrue(any(set(r.get('gripper_command') or {}) == {'left', 'right'} for r in records))
 
-    def test_partial_gripper_startup_failure_closes_every_open_channel(self):
+    def test_startup_gripper_alarm_keeps_ui_and_read_only_polling_without_starting_arms(self):
         cfg = configuration(); cfg.zx_grippers.enabled = True
         cfg.vr_only = False; cfg.operator.allow_motion = True
         cfg.diagnostics_path = str(Path(self.logs.name) / 'teleop.jsonl')
@@ -401,8 +453,15 @@ class DualZXRuntimeTest(unittest.TestCase):
         rt.teleoperator.input = HandInput(); rt.vr = rt.teleoperator.input
         for channel in rt._zx_channels.values(): channel.client = FakeZX()
         rt._zx_channels['right'].client.alarm = True
-        with self.assertRaisesRegex(RuntimeError, 'alarm'):
-            rt.connect()
+        rt.connect()
+        self.addCleanup(rt.close)
+        self.assertTrue(rt._connected)
+        rt.vr.rows = {side: hand(1) for side in ('left', 'right')}
+        rt.step()
+        self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
+        self.assertNotIn('start', rt.robot.events)
+        self.assertTrue(all(not c.client.targets for c in rt._zx_channels.values()))
+        rt.close()
         self.assertTrue(all(not c.client.connected for c in rt._zx_channels.values()))
         self.assertIn('close', rt.robot.events)
 
@@ -418,10 +477,44 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.assertIn('start', rt.robot.events)
         rt._zx_channels['left'].client.alarm = True
         wait_for(lambda: rt._zx_channels['left'].snapshot()['error'] is not None)
-        with self.assertRaises(RuntimeError): rt.step()
+        rt.step()
         self.assertIn('stop', rt.robot.events)
         self.assertIn('wait_stopped', rt.robot.events)
-        self.assertTrue(all(c._stop.is_set() for c in rt._zx_channels.values()))
+        self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
+        self.assertTrue(rt.input_pause_status['stopped'])
+        self.assertTrue(all(c._thread.is_alive() for c in rt._zx_channels.values()))
+        starts = rt.robot.events.count('start')
+        seq = 20
+        def tick(pressed):
+            nonlocal seq
+            seq += 1
+            rt.vr.rows = {side: hand(seq, pressed=pressed) for side in ('left', 'right')}
+            rt.step()
+        for _ in range(3): tick(True)
+        self.assertEqual(rt.robot.events.count('start'), starts)
+        channel = rt._zx_channels['left']
+        channel.request_alarm_action('reset')  # Explicit test operator action, same USB owner.
+        wait_for(lambda: channel.snapshot().get('alarm_latched') is False)
+        for _ in range(3): tick(True)
+        self.assertEqual(rt.robot.events.count('start'), starts)
+        for _ in range(24):
+            tick(False); time.sleep(.025)
+        self.assertEqual(rt.input_pause_status['state'], 'ready')
+        for _ in range(3): tick(True)
+        self.assertEqual(rt.robot.events.count('start'), starts+1)
+
+    def test_unexpected_gripper_worker_failure_locks_targets_but_keeps_ui_alive(self):
+        rt = self.live()
+        channel = rt._zx_channels['left']
+        with patch.object(channel.client, 'read_state', side_effect=RuntimeError('synthetic USB worker failure')):
+            wait_for(lambda: bool(channel.snapshot()['error']))
+        rt.vr.rows = {side: hand(1) for side in ('left', 'right')}
+        rt.step()
+        self.assertTrue(rt._connected)
+        self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
+        self.assertTrue(rt.input_pause_status['stopped'])
+        with self.assertRaisesRegex(RuntimeError, 'worker is not running'):
+            channel.request_alarm_action('reset')
 
     def test_communication_error_only_pauses_one_gripper_and_vr_keeps_running(self):
         rt = self.live()
@@ -466,8 +559,13 @@ class DualZXRuntimeTest(unittest.TestCase):
                 wait_for(lambda: rt._zx_channels['left'].snapshot()['error'] is not None)
             else:
                 rt.robot.frame_fault = True
-            with self.assertRaises(RuntimeError): rt.step()
-            self.assertTrue(all(c._stop.is_set() for c in rt._zx_channels.values()))
+            if origin == 'gripper':
+                rt.step()
+                self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
+                self.assertTrue(all(not c._stop.is_set() for c in rt._zx_channels.values()))
+            else:
+                with self.assertRaises(RuntimeError): rt.step()
+                self.assertTrue(all(c._stop.is_set() for c in rt._zx_channels.values()))
             rt.close()
 
 

@@ -54,6 +54,8 @@ class _ZXGripperChannel:
         self._lock = threading.Lock()
         self._stop, self._ready = threading.Event(), threading.Event()
         self._motion_cancel = threading.Event()
+        self._reset_requested = threading.Event()
+        self._disable_requested = threading.Event()
         self._thread = None
         self._input = (0., 0.)
         self._target = None
@@ -74,6 +76,9 @@ class _ZXGripperChannel:
             self.request_stop()
             raise TimeoutError(f'ZX {self.side} startup did not complete')
         self.check_health()
+        if self.snapshot().get('error'):
+            logging.getLogger(__name__).warning('ZX %s 启动时不可用；保留VR界面并禁止该夹爪目标：%s',
+                                                 self.side, self.snapshot()['error'])
 
     def submit(self, axis, deadline):
         if not math.isfinite(axis) or abs(axis) > 1 or not math.isfinite(deadline):
@@ -97,7 +102,7 @@ class _ZXGripperChannel:
     def check_health(self):
         state = self.snapshot()
         if state['error']:
-            raise RuntimeError(f"ZX {self.side}: {state['error']}")
+            return False  # A failed accessory must not tear down the recording UI.
         if state.get('communication_error'):
             return False
         stamp = state['feedback_monotonic_s']
@@ -105,6 +110,14 @@ class _ZXGripperChannel:
             self._communication_failed('feedback is stale')
             return False
         return True
+
+    def request_alarm_action(self, action):
+        """Explicit operator request; serial writes stay on the owning worker."""
+        if (action not in ('reset', 'disable') or self._stop.is_set()
+                or self._thread is None or not self._thread.is_alive()):
+            raise RuntimeError('Invalid action or gripper worker is not running')
+        self.pause()
+        (self._reset_requested if action == 'reset' else self._disable_requested).set()
 
     def _communication_failed(self, error):
         # Only this gripper pauses. Never discard CRC or fabricate feedback,
@@ -166,13 +179,12 @@ class _ZXGripperChannel:
         if now - before > self.options['feedback_timeout_s']:
             from ..zx_gripper import ZXGripperTimeout
             raise ZXGripperTimeout('serial feedback read took too long')
-        if state.has_error:
-            raise RuntimeError(f'gripper alarm 0x{state.alarm_a:04X}/0x{state.alarm_b:04X}')
         if not max(0, self.low - self.tolerance) <= state.position_raw <= self.high + self.tolerance:
             raise RuntimeError('actual position exceeds the configured raw range')
         with self._lock:
             self._state.update(actual_raw=state.position_raw, feedback_monotonic_s=now,
                                enabled=state.enabled, alarm_a=state.alarm_a, alarm_b=state.alarm_b, communication_error=None,
+                               status=state.status, speed_raw=state.speed_raw, current_raw=state.current_raw,
                                completion=state.completion,
                                crc_errors=getattr(self.client, 'crc_error_count', 0),
                                crc_read_retries=getattr(self.client, 'crc_read_retry_count', 0),
@@ -186,12 +198,42 @@ class _ZXGripperChannel:
                 next_tick = time.monotonic()
                 while not self._stop.wait(max(0., next_tick - time.monotonic())):
                     next_tick = time.monotonic() + 1. / self.options['io_hz']
+                    if self._disable_requested.is_set() or self._reset_requested.is_set():
+                        disable = self._disable_requested.is_set()
+                        request = self._disable_requested if disable else self._reset_requested
+                        request.clear()
+                        try:
+                            if disable:
+                                self.client.disable(self.device_id)
+                            else:
+                                self.client.reset_alarms(self.device_id)
+                                with self._lock:
+                                    self._state.update(alarm_latched=False, error=None, reset_error=None)
+                            self._target = self._last_sent = None
+                            self.pause()
+                        except Exception as exc:
+                            with self._lock:
+                                self._state.update(reset_error=str(exc))
+                            logging.getLogger(__name__).error('ZX %s 人工%s未完成：%s',
+                                self.side, '掉使能' if disable else '清报警', exc)
                     try:
                         state, now = self._read()
                     except ZXGripperCommunicationError as exc:
                         self._communication_failed(exc)
                         self._ready.set()
                         continue  # Poll feedback only; no uncertain write is retried.
+                    if state.has_error or self.snapshot().get('alarm_latched'):
+                        first = not self.snapshot().get('alarm_latched')
+                        self.pause()
+                        with self._lock:
+                            self._state.update(phase='alarm_latched', alarm_latched=True,
+                                error=(f'gripper alarm 0x{state.alarm_a:04X}/0x{state.alarm_b:04X}'
+                                       if state.has_error else self._state['error']))
+                        self._ready.set()
+                        if first:
+                            logging.getLogger(__name__).error('ZX %s 硬件报警，停止新目标并保持只读查询：%s',
+                                self.side, self.snapshot()['error'])
+                        continue  # Never auto-clear, disable, or replay an old position.
                     if self._target is None:
                         self._target = float(np.clip(state.position_raw, self.low, self.high))
                     self._ready.set()
@@ -1187,7 +1229,10 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 '超差停止' if config.enforce_tracking_error_limits else '仅记录')
             for channel in self._zx_channels.values():
                 channel.connect()
-            if self._zx_channels:
+            faults = self._gripper_faults()
+            if faults:
+                logging.getLogger(__name__).warning('夹爪未就绪：%s；VR界面保留，禁止故障目标。', faults)
+            elif self._zx_channels:
                 logging.getLogger(__name__).info(
                     '两只知行夹爪已连接：左右摇杆X分别控制，向右张开、向左闭合；请先将摇杆回中。')
         except BaseException:
@@ -1218,6 +1263,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             self.last_gripper_command = {side: channel.snapshot() for side, channel in self._zx_channels.items()}
             health = {side: channel.check_health() for side, channel in self._zx_channels.items()}
         try:
+            faults = self._gripper_faults()
+            if faults and self._input_pause is None:
+                side = next(iter(faults))
+                raise _VRInputPause(self.teleoperator.hand_to_arm[side], 'gripper_alarm',
+                                    details=dict(gripper_faults=faults))
             result = self._step_arms(raw, action)
         except _VRInputPause as exc:
             if not self.execute:
@@ -1235,6 +1285,14 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             channel.submit(float(value) if valid else 0., time.monotonic() + budget - age - elapsed if valid else 0.)
         return result
 
+    def _gripper_faults(self):
+        faults = {}
+        for side, channel in self._zx_channels.items():
+            state = channel.snapshot()
+            if state.get('error'):
+                faults[side] = state['error']
+        return faults
+
 
     @property
     def input_pause_status(self):
@@ -1247,8 +1305,12 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         ready = status['state'] == 'ready'
         prompt = ('PRESS A SIDE GRIP TO RESUME' if ready else
                   'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING')
+        faults = self._gripper_faults()
+        if faults:
+            prompt = 'GRIPPER ALARM - CHECK DEVICE; TERMINAL: gripper-reset left/right'
         return dict(type='hud', phase='input_ready' if ready else 'input_paused',
-                    hint=('CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
+                    hint=(('; '.join(f'GRIPPER {side.upper()}: {error}' for side, error in faults.items())) if faults else
+                          'CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
                           'VR INPUT STREAM LOST' if status['reason'] == 'vr_stream_stale' else
                           f"{status['hand'].upper()} HAND: {status['reason']}"), error='',
                     pending=None, input_pause=status,
@@ -1346,6 +1408,12 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._checked_frame(require_active=False)  # Controller/transport failures remain fatal.
         if self.execute and self.last_frame.get('follower_active') is not False:
             raise RuntimeError('Follower restarted while VR input is paused')
+        faults = self._gripper_faults()
+        if faults:
+            self._input_pause.update(state='release_required', stable_s=0., gripper_faults=faults)
+            self._pause_stable_since = None
+            self._pause_result()
+            return
         valid, updated = self._pause_input_stable(raw, now)
         grips, neutral = [], True
         for sample in raw.values():

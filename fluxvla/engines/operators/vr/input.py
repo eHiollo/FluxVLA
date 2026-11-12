@@ -101,7 +101,9 @@ class VRInput:
                 self._vr_monitor.https_server.calibration_view = self.calibration_view
                 if self.measure_latency:
                     from .latency import VRLatencyRecorder
-                    self.latency = VRLatencyRecorder(context=getattr(self, 'latency_context', {}))
+                    self.latency = VRLatencyRecorder(
+                        root=getattr(self, 'latency_root', 'work_dirs/a10/vr/latency'),
+                        context=getattr(self, 'latency_context', {}))
                     self._vr_monitor.vr_server.latency = self.latency
                 init_ok = True
                 break

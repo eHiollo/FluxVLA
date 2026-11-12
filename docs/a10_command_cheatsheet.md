@@ -1,5 +1,15 @@
 # A10 常用命令速查
 
+## 两分钟独立VR停顿诊断（不用机械臂）
+
+退出原VR程序，在fluxvla环境运行；IP填头显地址：
+
+```bash
+python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
+```
+
+刷新头显网页、双手追踪正常后计时120秒，自动抓包、记录接收心跳并生成中文报告。结果在`work_dirs/a10/vr/network_checks/<本次目录>/report.md`。不连接相机、夹爪或机械臂；不写训练数据。[完整说明](vr_network_diagnostic.md)。
+
 ## 本次录制分支与变红后重录（2026-11-12）
 
 当前录制修复在`kaanh_lerobot_recording`；以下历史分支说明不代表本轮切换回`kaanh_follower`。启动命令沿用[采集指南第2节](a10_vr_recording.md#2-启动双臂实时采集)。

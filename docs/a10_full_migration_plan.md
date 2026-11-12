@@ -1370,3 +1370,13 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 最终回归：`PYTHONPATH=.:test python -m unittest test_a10_vr_shared_control test_a10_shared_control test_a10_control test_vr_dual_hold_session test_vr_dual_runtime test_vr_recording test_vr_controller_recording`，185项通过（46.644秒）。覆盖双臂同连接并行查询与目标、任意/同时启动、独立退出与空闲释放、离线不回退、控制权接管/竞态旧包、完整m_init恢复、GET超时保留界面、旧连接迟到清理、控制器记录心跳、闲置手柄和HUD提示。
 - 更新旧控制台测试驱动：明确等待上一条协议命令回复后再注入故障，避免异步输入导致故障被施加在错误阶段；Ctrl+C按当前stop流程断言，模拟器补齐start_follower/manual_stop ACK，双臂共享测试改为允许并验证配置。并发行为由新增真实回环集成测试独立验证。
 - 命令预览以127.0.0.1覆盖机器人地址通过，未启动服务或连接设备。自动审批拒绝了最初含实机地址的预览请求，之后仅执行回环版本；没有执行实机连接。完整离线输出保存至`work_dirs/a10/shared_control/offline_tests.log`（不提交运行日志）。
+
+### 2026-11-12：修复共享服务仍在线但控制器连接失效的启动失败
+
+- 现场日志：本机共享服务09:32:48建立到`.150:5999`的连接，09:34:49首次记录`ConnectionClosedError: no close frame received or sent`；09:35:52、09:37:05及后续启动继续对已关闭的机器人连接执行record_start，返回`A10 operator is not connected`。控制台仍连接127.0.0.1:5870，所以本机服务一直存在。初次断线的控制器/网络原因尚不能仅凭现有记录确认。
+- 确认软件缺口：hello只核对地址，未验证真正的机器人连接；VR connect返回后立即record_start，绕过可恢复连接的GET路径。昨日正常在线的并行测试没有覆盖服务存活、后端断线、再启动VR的路径。
+- 修复：新VR/推理客户端握手先通过GET验证真实控制通道。共用单WebSocket的读取路径复用同一恢复函数；空闲断流时隔离旧socket、重连并仅重试一次只读GET。已尝试发送的record_start及运动指令不自动重发。若读取重开连接时存在旧运动控制者，撤销其旧UDP发送权，必须显式停止和重新接管后才能发新目标。
+- 控制台hello保持本机握手，不等待机器人事务锁，确保停止用的重连仍能先interrupt正在等待回复的长命令。控制台正常GET会验证并恢复空闲通道。
+- 新增5项回环集成：控制台仍在线/后端已关闭后启动录制、缓存已远端关闭的WS对象、record_start回复丢失不重发且显式重试可恢复、运动中失联不恢复旧目标、长命令期间停止用控制台连接不被GET探测阻塞。未向真实机器人发送指令，未重启用户当前运行的共享服务。
+- 加载修复：当前旧控制台输入exit，等最后一个客户端退出后约5秒服务自行结束，再用原命令重开控制台和VR；不更改原速度、加速度、ID映射或控制器XML。
+- 回归结果：共享/双臂VR/控制台/录制相关7个模块共190项通过（47.141秒）；完整输出保存到work_dirs/a10/shared_control/offline_reconnect_tests.log。没有执行实机运动验证。

@@ -8,6 +8,8 @@ import socketserver
 import threading
 import time
 
+from websockets.exceptions import ConnectionClosed
+
 from ..operators.a10_operator import _FollowerConnection, _parse_state, _set_controller_speed
 from .a10_shared_connection import ControlTransferredError
 
@@ -65,8 +67,35 @@ class SharedControl:
         if self.recorder is not None:
             self.recorder.record(event, **data)
 
+    def _probe_control(self):
+        """Validate the real socket, not just the local RPC listener.
+
+        Only GET is repeated automatically, and only if no motion owner exists.
+        Once a command is attempted its result stays uncertain; never replay it.
+        Reopening a closed transport for GET revokes any old target owner;
+        motion still requires an explicit stop and a new takeover.
+        Call with _control_lock held.
+        """
+        if self.control.ws is None:
+            if self.owner is not None:
+                self.revoked.add(self.owner)
+                self.note('target_stream_revoked', session_id=self.owner, reason='transport_reconnect')
+            self.control.connect()
+        try:
+            return self.control.request('get', status=True)
+        except (OSError, ConnectionClosed) as exc:
+            if self.owner is not None:
+                self.revoked.add(self.owner)
+                raise
+            self.note('idle_transport_reconnect', reason=str(exc))
+            self.control.close()  # Isolate old or delayed replies before the GET retry.
+            self.control.connect()
+            return self.control.request('get', status=True)
+
     def read_state(self):
         with self._status_lock:
+            if self.status is self.control:
+                return self._probe_control()
             if self.status.ws is None:
                 self.status.connect()  # Read-only recovery; never repeats control commands.
             return self.status.request('get', status=True)
@@ -152,6 +181,13 @@ class SharedControl:
                             udp_port=self.udp_port, joint_udp_port=self.joint_udp_port)
             if any(request.get(k) != value for k, value in expected.items()):
                 raise ValueError(f'Shared service robot endpoints differ: {expected}')
+            # Managed services can outlive controller restarts or idle sockets.
+            # VR must validate feedback before record_start. Console hello
+            # stays local: a reconnect for explicit stop must be able to
+            # interrupt a long command before waiting for the control lock.
+            if role != 'console' and not request.get('status_channel'):
+                with self._control_lock:
+                    self._probe_control()
             return expected
         if op == 'request' and request['command'].strip() == 'get':
             return self.read_state()

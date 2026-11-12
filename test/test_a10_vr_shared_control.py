@@ -121,6 +121,100 @@ class DualSharedIntegrationTest(unittest.TestCase):
                                 for side in ('left', 'right')}
         runtime.step()
 
+    def wait_robot_disconnected(self):
+        deadline = time.monotonic() + 2
+        while self.controller.current_connections and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(self.controller.current_connections, 0)
+
+    def test_new_vr_recording_recovers_known_closed_transport_with_console_still_open(self):
+        console = self.client('console')
+        self.relay.control.close()
+        self.wait_robot_disconnected()
+        self.controller.command_replies['record_start'] = recording_reply()
+        runtime = self.runtime(record_controller=True)
+        self.assertTrue(runtime._connected)
+        self.assertTrue(console.is_connected)
+        self.assertEqual(set(console.get_state().arms), {'left', 'right'})
+        self.assertEqual(self.controller.commands.count('record_start'), 1)
+        self.assertEqual(set(self.controller.commands), {'get', 'record_start'})
+        self.assertEqual(self.controller.max_connections, 1)
+        self.assertEqual(self.controller.total_connections, 2)
+
+    def test_new_vr_recording_recovers_remotely_closed_socket_not_yet_used(self):
+        self.client('console')
+        # Closed WS object remains cached, matching a silent disconnect while idle.
+        self.relay.control.ws.close()
+        self.wait_robot_disconnected()
+        self.assertIsNotNone(self.relay.control.ws)
+        self.controller.command_replies['record_start'] = recording_reply()
+        runtime = self.runtime(record_controller=True)
+        self.assertTrue(runtime._connected)
+        self.assertEqual(self.controller.commands.count('record_start'), 1)
+        self.assertEqual(set(self.controller.commands), {'get', 'record_start'})
+        self.assertEqual(self.controller.max_connections, 1)
+
+    def test_uncertain_record_start_is_not_replayed_and_explicit_retry_can_recover(self):
+        console = self.client('console')
+        self.controller.command_replies['record_start'] = None  # Close instead of ACK.
+        with self.assertRaises(Exception):
+            self.runtime(record_controller=True)
+        self.wait_robot_disconnected()
+        self.assertEqual(self.controller.commands.count('record_start'), 1)
+        self.controller.command_replies['record_start'] = recording_reply()
+        # A deliberate new startup validates GET and sends exactly one new request.
+        runtime = self.runtime(record_controller=True)
+        self.assertTrue(runtime._connected)
+        self.assertTrue(console.is_connected)
+        self.assertEqual(self.controller.commands.count('record_start'), 2)
+        self.assertNotIn('follower_cart', self.controller.commands)
+
+    def test_transport_loss_while_owned_does_not_reconnect_or_resume_motion(self):
+        console = self.client('console')
+        runtime = self.runtime()
+        self.tick(runtime, False)
+        for _ in range(5): self.tick(runtime)
+        self.relay.control.close()
+        self.wait_robot_disconnected()
+        connections = self.controller.total_connections
+        try:
+            # Fresh read-only recovery must revoke the old UDP stream, not
+            # leave a permanently broken relay or silently resume motion.
+            self.assertTrue(console.get_state().follower_active)
+            self.assertEqual(self.controller.total_connections, connections + 1)
+            self.assertIn(self.relay.owner, self.relay.revoked)
+            self.tick(runtime)
+            self.assertIsNotNone(runtime.shared_control_pause)
+            self.assertTrue(runtime._connected)
+            self.assertEqual(self.controller.commands.count('follower_cart'), 1)
+        finally:
+            console.stop_all_actions()
+        self.assertFalse(console.get_state().follower_active)
+
+    def test_console_reconnect_for_stop_does_not_wait_for_long_command_probe(self):
+        console = self.client('console')
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def wait_reply():
+            entered.set()
+            release.wait(3)
+            return dict(ret_code=0, ret_context='', ret_msg='done')
+        self.controller.command_replies['native_wait'] = wait_reply
+        def run():
+            try: console.send_controller_command('native_wait')
+            except Exception as exc: errors.append(exc)
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            started = time.monotonic()
+            self.client('console')  # Local hello must not queue a robot GET here.
+            self.assertLess(time.monotonic() - started, .4)
+            self.assertEqual(self.controller.total_connections, 1)
+        finally:
+            release.set(); worker.join(4)
+        self.assertEqual(errors, [])
+
     def test_queries_and_console_close_do_not_interrupt_live_vr(self):
         console = self.client('console')
         runtime = self.runtime()

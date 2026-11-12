@@ -37,6 +37,19 @@ def actions():
 
 
 class ButtonTests(unittest.TestCase):
+    def test_gradual_push_and_dominant_diagonal_emit_once_per_neutral(self):
+        b = RecordingButtons()
+        b.update(hands(1)); b.update(hands(2, modifier=True))
+        for seq, x in enumerate((-.205, -.4, -.69), 3):
+            self.assertIsNone(b.update(hands(seq, modifier=True, x=x))['command'])
+            self.assertTrue(b.armed)
+        self.assertEqual(b.update(hands(6, modifier=True, x=-.93, y=.37))['command'], 'left')
+        self.assertIsNone(b.update(hands(7, modifier=True, x=-.95, y=.35))['command'])
+        b.update(hands(8, modifier=True))
+        self.assertEqual(b.update(hands(9, modifier=True, x=-.8, y=.59))['command'], 'left')
+        b.update(hands(10, modifier=True))
+        self.assertEqual(b.update(hands(11, modifier=True, x=.35, y=-.9))['command'], 'up')
+
     def test_neutral_gates_edges_diagonals_and_gripper_restore(self):
         b=RecordingButtons()
         self.assertTrue(b.update(hands(1,modifier=True,x=1))['block_left'])
@@ -315,6 +328,34 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.writer.info['total_episodes'],0)
         self.session.command('discard'); self.session.command('discard'); self.settle()
         self.assertEqual(self.session.state,'idle')
+
+    def test_failed_episode_discards_after_two_real_gradual_left_gestures(self):
+        self.start()
+        self.runtime.input_pause_status = dict(state='release_required', reason='control_gap')
+        self.runtime.input_pause_hud = lambda: dict(type='hud', phase='input_paused', error='',
+            hint='CONTROL LOOP DELAY', pending=None,
+            controls=dict(prompt='RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS'))
+        self.session.input_paused('Control interrupted: control_gap')
+        self.update(modifier=True)
+        self.update(modifier=True, x=-.205)
+        self.update(modifier=True, x=-.93, y=.37)
+        self.assertEqual(self.session.pending, 'discard')
+        self.assertEqual(self.session.state, 'failed')
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+        self.update(modifier=True)  # Recenter, then repeat within confirmation time.
+        self.update(modifier=True, x=-.25)
+        self.update(modifier=True, x=-.9, y=.4)
+        self.settle()
+        self.assertEqual(self.session.state, 'idle')
+        self.assertIsNone(self.writer.active)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+        self.session.command('start')
+        self.assertIsNone(self.session.future)  # Discarding data does not rearm motion.
+        self.runtime.input_pause_status = None
+        self.update(modifier=True)
+        self.update(modifier=True, x=.9)
+        self.settle()
+        self.assertEqual(self.session.state, 'recording')
 
     def test_gap_and_skew_are_not_silently_accepted(self):
         self.start(); self.session._last_sample-=100

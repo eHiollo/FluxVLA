@@ -20,6 +20,63 @@ class HoldSessionTest(unittest.TestCase):
     tick = dual.DualRuntimeTest.tick
     move = dual.DualRuntimeTest.move
 
+    def test_delayed_feedback_stops_without_exit_and_requires_fresh_reclutch(self):
+        self.move()
+        sent = len(self.robot.targets)
+        get_frame = self.robot.get_frame
+        delayed = False
+
+        def slow_query_once():
+            nonlocal delayed
+            if not delayed:
+                delayed = True
+                self.clock.value += .24  # Successful, but much too late for this control tick.
+            return get_frame()
+
+        with patch.object(self.robot, 'get_frame', side_effect=slow_query_once):
+            self.tick()
+        pause = self.runtime.input_pause_status
+        self.assertEqual(pause['reason'], 'control_gap')
+        self.assertTrue(pause['stopped'])
+        self.assertGreater(pause['control_gap_s'], .24)
+        self.assertAlmostEqual(pause['io_timing_s']['robot_feedback_s'], .24)
+        self.assertEqual(pause['max_control_gap_s'], .1)
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertEqual(self.robot.events.count('stop'), 1)
+        self.assertTrue(self.vr.is_connected)
+        self.assertIn('CONTROL LOOP DELAY', self.vr.input.hud[-1]['hint'])
+        for _ in range(25):
+            self.tick()  # Holding the old side keys cannot restart motion.
+        self.assertEqual(self.robot.events.count('start'), 1)
+        for _ in range(21):
+            self.tick(False, False)
+        self.assertEqual(self.runtime.input_pause_status['state'], 'ready')
+        for _ in range(3):
+            self.tick(True, False)
+        self.assertIsNone(self.runtime.input_pause_status)
+        self.assertEqual(self.robot.events.count('start'), 2)
+
+    def test_control_gap_stop_failure_remains_fatal(self):
+        self.move()
+        sent = len(self.robot.targets)
+        self.robot.stop_timeout = True
+        self.clock.value += .12
+        with self.assertRaisesRegex(TimeoutError, 'stop unconfirmed'):
+            self.tick()
+        self.assertTrue(self.runtime._dual_stop_failed)
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertFalse(self.runtime.input_pause_status['stopped'])
+
+    def test_control_gap_during_read_only_observation_cannot_claim_a_stop(self):
+        self.move()
+        self.runtime.execute = False
+        self.runtime.observe_only = True
+        self.clock.value += .12
+        with self.assertRaisesRegex(RuntimeError, 'control_gap'):
+            self.tick()
+        self.assertIsNone(self.runtime.input_pause_status)
+        self.assertNotIn('stop', self.robot.events)
+
     def test_both_release_holds_without_stop_queries_and_reclutches_same_follower(self):
         self.runtime.stop_on_both_release = False
         self.move()

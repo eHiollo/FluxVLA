@@ -77,7 +77,9 @@ class RecordingButtons:
     """Right modifier + left stick; fresh neutral before/after mode changes.
 
     Releases/reconnects cannot replay commands. Direction edges require a neutral
-    sample, diagonal input is ignored. Left gripper stays gated until recentered.
+    sample. Gradual motion may cross the neutral zone before reaching a command
+    threshold. Dominant-axis input accepts a modest diagonal; ambiguous diagonals
+    require recentering. Left gripper stays gated until recentered.
     """
     def __init__(self, modifier_button='a', threshold=.7, neutral=.2, max_age_s=.25):
         if modifier_button not in ('a', 'b', 'thumbstick'):
@@ -131,9 +133,14 @@ class RecordingButtons:
             if centered:
                 self.armed = True
             elif self.armed and not duplicate:
-                self.armed = False  # diagonals also require recentering
-                if abs(y) <= self.neutral and abs(x) >= self.threshold:
+                # Do not consume the edge at x=.21 while the user is still
+                # moving towards the .7 command threshold.
+                if max(abs(x), abs(y)) < self.threshold:
+                    return dict(command=None, block_left=self.block_left, fresh=True,
+                                mode=self.mode, restarted=restarted)
+                self.armed = False
+                if abs(x) >= self.threshold and abs(x) >= 1.25 * abs(y):
                     command = 'right' if x > 0 else 'left'
-                elif abs(x) <= self.neutral and abs(y) >= self.threshold:
+                elif abs(y) >= self.threshold and abs(y) >= 1.25 * abs(x):
                     command = 'down' if y > 0 else 'up'
         return dict(command=command, block_left=self.block_left, fresh=True, mode=self.mode, restarted=restarted)

@@ -60,10 +60,12 @@ class DualReferenceSpeedTest(unittest.TestCase):
         self.assertNotIn('stop', self.robot.events)
         count = len(self.robot.targets)
         self.clock.value += .11 - 1. / 30.
-        with self.assertRaisesRegex(RuntimeError, 'control_gap'):
-            self.tick(xleft=.006 * 64, xright=.003 * 64, angle=.08 * 64)
+        self.tick(xleft=.006 * 64, xright=.003 * 64, angle=.08 * 64)
         self.assertEqual(len(self.robot.targets), count)
         self.assertIn('stop', self.robot.events)
+        self.assertEqual(self.runtime.input_pause_status['reason'], 'control_gap')
+        self.assertTrue(self.runtime.input_pause_status['stopped'])
+        self.assertTrue(self.vr.is_connected)
 
 
 class DualSDKReferenceSpeedTest(DualReferenceSpeedTest):

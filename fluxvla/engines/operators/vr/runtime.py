@@ -220,9 +220,10 @@ class _ZXGripperChannel:
 
 
 class _VRInputPause(RuntimeError):
-    """Only expected input guards may enter recoverable pause."""
-    def __init__(self, arm, reason):
+    """Only known input/timing guards may enter recoverable pause."""
+    def __init__(self, arm, reason, *, details=None):
         self.arm, self.reason = arm, reason
+        self.details = dict(details or {})
         super().__init__(f'Dual VR {arm}: {reason}')
 
 
@@ -331,6 +332,7 @@ class VRTeleopRuntime:
         self._diagnostics = None
         self.last_frame = self.last_relative_target = None
         self._frame_index = 0
+        self.last_io_timing = {}
         self.execute = execute
         self.max_position_step_m = max_position_step_m
         self.max_rotation_step_rad = max_rotation_step_rad
@@ -360,6 +362,14 @@ class VRTeleopRuntime:
         if self._diagnostics is not None:
             self._diagnostics.write(dict(event='controller_recording',
                                          controller_recording=self.controller_recording))
+
+    def _timed_call(self, stage, function, *args, **kwargs):
+        """Measure blocking work without adding requests or changing deadlines."""
+        started = time.monotonic()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self.last_io_timing[stage] = self.last_io_timing.get(stage, 0.) + time.monotonic() - started
 
     def _controller_recording_request(self, *, start=False):
         before = dict(client_send_monotonic_ns=time.monotonic_ns(), client_send_wall_ns=time.time_ns())
@@ -542,7 +552,7 @@ class VRTeleopRuntime:
         return True
 
     def _checked_frame(self, *, require_active):
-        frame = self.robot.get_frame()
+        frame = self._timed_call('robot_feedback_s', self.robot.get_frame)
         self.last_frame = frame
         if not isinstance(frame, dict) or frame.get('has_error') is not False:
             raise RuntimeError('A10 feedback is missing or reports a fault')
@@ -650,6 +660,7 @@ class VRTeleopRuntime:
         self.last_tracking_warning = None
         started = time.monotonic()
         started_wall_ns = time.time_ns()
+        self.last_io_timing = {}
         self.last_gripper_command = None
         recording = getattr(self, 'recording', None)
         raw, action = {}, {}
@@ -658,7 +669,7 @@ class VRTeleopRuntime:
             if not self._connected or not self.vr.is_connected:
                 raise ConnectionError('VR input is not connected')
             if self.communication_pause is None and (recording is None or not recording.blocks_motion):
-                self._poll_controller_recording()
+                self._timed_call('controller_recording_s', self._poll_controller_recording)
             if self.teleoperator is not None:
                 action = self.teleoperator.get_action()
                 raw = self.teleoperator.last_raw
@@ -675,7 +686,7 @@ class VRTeleopRuntime:
             latency = getattr(self.vr, 'latency', None)
             if latency is not None:
                 latency.consume(raw, self._input_read_time)
-            if self._step_shared_control(raw):
+            if self._timed_call('shared_control_s', self._step_shared_control, raw):
                 return action
             blocked = recording.before_step(raw, action) if recording is not None else False
             result = action if blocked else self._step(raw, action)
@@ -754,6 +765,7 @@ class VRTeleopRuntime:
                               feedback=self.last_frame,
                               sent_relative_target=self.last_relative_target,
                               step_elapsed_s=time.monotonic() - started,
+                              io_timing_s=dict(self.last_io_timing),
                               error=error, execute=self.execute,
                               cartesian_adapter=self.cartesian_adapter,
                               sdk_tool_command=self.last_sdk_command,
@@ -840,10 +852,10 @@ class VRTeleopRuntime:
         self._reference_stop_attempted = True
         self.last_stop_status = dict(requested=True, mode_inactive=False, reported_stopped=False)
         try:
-            self.robot.stop_follower()
+            self._timed_call('stop_request_s', self.robot.stop_follower)
             self._started_follower = False
             self.last_stop_status['mode_inactive'] = True
-            self.robot.wait_stopped()
+            self._timed_call('stop_confirm_s', self.robot.wait_stopped)
             self.last_stop_status['reported_stopped'] = True
             logging.getLogger(__name__).info('参考跟随停止确认：inactive + Stopped')
         except BaseException as exc:
@@ -1231,7 +1243,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         prompt = ('PRESS A SIDE GRIP TO RESUME' if ready else
                   'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING')
         return dict(type='hud', phase='input_ready' if ready else 'input_paused',
-                    hint=('VR INPUT STREAM LOST' if status['reason'] == 'vr_stream_stale' else
+                    hint=('CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
+                          'VR INPUT STREAM LOST' if status['reason'] == 'vr_stream_stale' else
                           f"{status['hand'].upper()} HAND: {status['reason']}"), error='',
                     pending=None, input_pause=status,
                     controls=dict(visible=False, ready=ready, prompt=prompt, directions={}))
@@ -1256,6 +1269,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._input_pause = dict(state='release_required', arm=error.arm,
                                  hand=self._arms[error.arm]['hand'], reason=error.reason,
                                  stopped=False, stable_s=0.)
+        self._input_pause.update(error.details)
         self._pause_samples.clear()
         self._pause_stable_since = None
         self._pause_hud_signature = None
@@ -1280,7 +1294,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._dual_require_release = True
         self.teleoperator.reset_reference()
         self._pause_result()
-        logging.getLogger(__name__).warning('VR输入异常已暂停：%s；双手松开并回中，输入稳定后重新按侧键接管。', error)
+        logging.getLogger(__name__).warning(
+            'VR已停止并锁定接管：%s；双手松开并回中，输入稳定后重新按侧键接管。诊断=%s',
+            error, error.details)
 
     def _pause_input_stable(self, raw, now):
         """New paired poses, fresh tracking and the existing position-speed guard."""
@@ -1362,7 +1378,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
 
     def _checked_frame(self, *, require_active):
         from .control import pose
-        frame = self.robot.get_frame()
+        frame = self._timed_call('robot_feedback_s', self.robot.get_frame)
         self.last_frame = frame
         now = time.monotonic()
         if not isinstance(frame, dict) or frame.get('has_error') is not False:
@@ -1400,14 +1416,14 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     def _send_dual_targets(self, targets):
         """Send both planned poses together; SDK state survives per-hand re-clutch."""
         if self.cartesian_adapter == 'sdk_tool_cumulative':
-            self.last_sdk_command = self.robot.send_sdk_tool_pose(
+            self.last_sdk_command = self._timed_call('target_send_s', self.robot.send_sdk_tool_pose,
                 targets, max_position_step_m=None, max_rotation_step_rad=None)
             self.last_relative_target = None
         else:
             from .control import follower_relative
             relative = {name: follower_relative(self._arms[name]['control'].startup_anchor, target)
                         for name, target in targets.items()}
-            self.robot.send_eepose(relative)
+            self._timed_call('target_send_s', self.robot.send_eepose, relative)
             self.last_relative_target = relative
         self.last_reference_result['transmitted'] = True
 
@@ -1516,6 +1532,13 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             return action
         now = time.monotonic()
         dt = now - self._dual_time
+        if dt > self.reference_control.config.max_dt_s:
+            # A delayed GET/relay transaction must not advance either arm's
+            # integrator with a large dt, nor terminate the recording UI.
+            # Discard this input, confirm native stop and require fresh re-clutch.
+            raise _VRInputPause(self.arm_names[0], 'control_gap', details=dict(
+                control_gap_s=dt, max_control_gap_s=self.reference_control.config.max_dt_s,
+                io_timing_s=dict(self.last_io_timing)))
         feedback_age = now - self.last_frame['received_monotonic_s']
         targets, results = {}, {}
         for name, context in self._arms.items():

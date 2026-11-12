@@ -123,8 +123,8 @@ python scripts/teleoperate.py \
     record.root=/home/robot/VLA/FluxVLA/datasets/a10_dual_record \
     record.resume=True \
     record.recover=True \
-  --record-controller \
   --cfg-options \
+    teleop.record_controller=False \
     teleop.vr_only=False \
     teleop.observe_only=False \
     teleop.operator.allow_motion=True \

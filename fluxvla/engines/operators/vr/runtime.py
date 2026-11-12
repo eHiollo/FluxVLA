@@ -1321,6 +1321,35 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     pending=None, input_pause=status,
                     controls=dict(visible=False, ready=ready, prompt=prompt, directions={}))
 
+    def resume_recording_input(self):
+        """An explicitly queued recording retry can rearm a stopped, stable input.
+
+        This is called after the current pause step checked real robot feedback
+        and neutral controls. Recording may resume; motion still needs a new grip.
+        """
+        status = self._input_pause
+        if status is None:
+            return True
+        if (status.get('state') != 'ready' or status.get('stopped') is not True
+                or self._dual_stop_failed or self._started_follower):
+            return False
+        frame = self.last_frame or {}
+        stamp = frame.get('received_monotonic_s')
+        if self.execute and (frame.get('has_error') is not False
+                or frame.get('follower_active') is not False
+                or not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
+                or not 0 <= time.monotonic()-stamp <= self.max_feedback_age_s):
+            return False
+        self._input_pause = None
+        self._pause_stable_since = None
+        self._pause_samples.clear()
+        self._dual_time = None
+        self._dual_require_release = True
+        self.teleoperator.reset_reference()
+        self.last_reference_result = dict(state='input_resumed', arms={}, transmitted=False)
+        logging.getLogger(__name__).info('录制重试：输入已稳定且停止已确认；重新按侧键才接管机械臂。')
+        return True
+
     def _pause_result(self):
         self.last_reference_result = dict(state='input_paused', arms={}, transmitted=False,
                                          input_pause=self.input_pause_status)

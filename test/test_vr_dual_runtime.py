@@ -412,6 +412,43 @@ class DualRuntimeTest(unittest.TestCase):
         for _ in range(20): self.tick(False, False)
         self.assertEqual(self.runtime.input_pause_status['state'], 'ready')
 
+    def test_recording_retry_rearms_only_stable_stopped_input_without_moving(self):
+        self.move()
+        sent = len(self.robot.targets)
+        self.tick(age=.3)
+        self.assertFalse(self.runtime.resume_recording_input())
+        self.wait_input_ready()
+        # A menu direction while holding A must finish before a retry can run.
+        self.vr.input.rows['left']['xlevr.thumbstick'] = dict(x=1., y=0.)
+        self.runtime.step()
+        self.assertFalse(self.runtime.resume_recording_input())
+        self.wait_input_ready()
+        self.runtime.last_frame['follower_active'] = True
+        self.assertFalse(self.runtime.resume_recording_input())
+        self.tick(False, False)
+        self.assertTrue(self.runtime.resume_recording_input())
+        self.assertIsNone(self.runtime.input_pause_status)
+        self.assertTrue(self.runtime._dual_require_release)
+        for _ in range(4): self.tick(False, False)
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertEqual(self.robot.events.count('start'), 1)
+        self.tick(left=True, right=False)
+        self.tick(left=True, right=False)
+        self.tick(left=True, right=False)
+        self.assertEqual(self.robot.events.count('start'), 2)
+
+    def test_recording_retry_never_clears_unconfirmed_stop_or_stale_robot_feedback(self):
+        self.move(); self.tick(age=.3); self.wait_input_ready()
+        self.runtime._input_pause['stopped'] = False
+        self.assertFalse(self.runtime.resume_recording_input())
+        self.runtime._input_pause['stopped'] = True
+        self.runtime.last_frame['received_monotonic_s'] -= 1.
+        self.assertFalse(self.runtime.resume_recording_input())
+        self.tick(False, False)
+        self.runtime._dual_stop_failed = True
+        self.assertFalse(self.runtime.resume_recording_input())
+        self.assertIsNotNone(self.runtime.input_pause_status)
+
     def test_position_spike_pauses_held_grips_never_restart_and_reclutch_anchors_actual_pose(self):
         self.move()
         sent = len(self.robot.targets)

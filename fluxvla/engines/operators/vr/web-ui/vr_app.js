@@ -78,19 +78,23 @@ AFRAME.registerComponent('controller-updater', {
         idle: '#FFFFFF', button_check: '#FFFFFF', starting: '#FFD54F', discarding: '#FFD54F'
       };
       const titles = {
-        input_paused: 'INPUT PAUSED / MOTION STOPPED', input_ready: 'INPUT STABLE / PRESS GRIP',
-        resetting: 'RESETTING / DOWN TO CANCEL', reset_failed: 'RESET FAILED',
-        failed: 'INVALID EPISODE', review: 'CAPTURE STOPPED', starting: 'STARTING',
-        discarding: 'DISCARDING', button_check: 'BUTTON CHECK / NO MOTION',
-        reset: 'RESET',
-        initial_reset: 'RESET',
-        recording: 'RECORDING',
-        rerecord: 'RERECORD',
-        saving: 'SAVING DATA',
-        saved: 'SAVE COMPLETE',
-        save_failed: 'SAVE FAILED',
-        stop: 'STOP',
-        idle: 'WAITING'
+        input_paused: 'input paused', input_ready: 'input ready',
+        resetting: 'resetting', reset_failed: 'reset failed',
+        failed: 'episode invalid', review: 'episode paused', starting: 'starting',
+        discarding: 'discarding', button_check: 'button check',
+        reset: 'ready', initial_reset: 'ready', recording: 'recording',
+        rerecord: 'redo episode', saving: 'saving', saved: 'saved',
+        save_failed: 'save failed', stop: 'stopped', idle: 'waiting'
+      };
+      const shortText = (value, limit = 48) => {
+        const text = String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        return text.length <= limit ? text : text.slice(0, limit - 3).trimEnd() + '...';
+      };
+      const shortLabels = {
+        'finish ep / reset scene': 'finish episode', 'redo / reset scene': 'redo episode',
+        'redo this ep': 'redo episode', 'discard + start again': 'restart',
+        'save / discard first': 'finish episode first', 'rearm vr first': 'resume input',
+        'stop recording': 'stop session', 'wait for devices': 'wait for devices'
       };
       // Keep the original phase vocabulary; separate status, body and command hints.
       const setText = (id, value, color) => {
@@ -100,24 +104,42 @@ AFRAME.registerComponent('controller-updater', {
           if (color) node.setAttribute('color', color);
         }
       };
-      el.setAttribute('value', data.pending ? `CONFIRM ${String(data.pending).toUpperCase()}` : (titles[phase] || phase.toUpperCase()));
+      el.setAttribute('value', data.pending ? `confirm ${shortText(data.pending, 20)}` : (titles[phase] || shortText(phase, 28)));
       el.setAttribute('color', data.pending ? '#FFD54F' : (colors[phase] || '#FFFFFF'));
       const details = [];
-      if (Number.isFinite(data.episode) && data.episode > 0) details.push(`EP ${data.episode}`);
-      if (Number.isFinite(data.elapsed_s)) details.push(`TIME ${data.elapsed_s.toFixed(1)}s`);
+      if (Number.isFinite(data.episode) && data.episode > 0) details.push(`ep ${data.episode}`);
+      if (Number.isFinite(data.elapsed_s)) details.push(`time ${data.elapsed_s.toFixed(1)}s`);
       const remaining = this.formatHudRemaining(data.remaining_s);
-      if (remaining) details.push(`LEFT ${remaining}`);
-      setText('#recordHudDetails', details.join(' / ') + (data.task ? '\n' + String(data.task).slice(0, 55) : ''), '#FFFFFF');
-      setText('#recordHudNotice', String(data.error || data.hint || '').slice(0, 125), data.error ? '#FF7070' : '#FFD54F');
+      if (remaining) details.push(`left ${remaining}`);
+      setText('#recordHudDetails', details.join(' / '), '#FFFFFF');
+      const diagnostic = String(data.error || data.hint || '').toLowerCase();
+      let notice = shortText(diagnostic);
+      // Full diagnostics stay in the terminal/JSONL, not across the headset.
+      if (diagnostic.includes('retry pending') || diagnostic.includes('retry queued')) notice = 'retry queued; center sticks';
+      else if (diagnostic.includes('gripper locked')) notice = 'gripper fault; arms available';
+      else if (diagnostic.includes('vr input stale') || diagnostic.includes('vr input stream lost')) notice = 'vr signal delayed';
+      else if (diagnostic.includes('rerecord:')) notice = 'reset scene; right to restart';
+      else if (diagnostic.includes('reset scene; right')) notice = 'reset scene; right to save';
+      else if (phase === 'recording' && !data.error) notice = 'capture active';
+      setText('#recordHudNotice', notice, data.error ? '#FF7070' : '#FFD54F');
       const controls = data.controls || {};
-      setText('#recordHudPrompt', controls.prompt || '', controls.visible ? '#FFD54F' : '#FFFFFF');
+      let prompt = shortText(controls.prompt);
+      const modifier = prompt.match(/right (a|b|thumbstick)/)?.[1] || 'a';
+      if (prompt.includes('release both grips')) prompt = 'release grips; center sticks';
+      else if (prompt.includes('press a side grip')) prompt = 'press side grip to resume';
+      else if (prompt.includes('release right')) prompt = `release ${modifier}; center left stick`;
+      else if (prompt.includes('held - left stick')) prompt = `${modifier} held: left stick menu`;
+      else if (prompt.includes('hold right')) prompt = `hold right ${modifier} for menu`;
+      else if (prompt.includes('vr input lost')) prompt = 'release grips; wait for signal';
+      setText('#recordHudPrompt', prompt, controls.visible ? '#FFD54F' : '#FFFFFF');
       const menu = document.querySelector('#recordHudDirections');
       if (menu) menu.setAttribute('visible', !!controls.visible);
       for (const direction of ['up', 'left', 'right', 'down']) {
         const item = controls.directions?.[direction] || {};
         const color = !item.enabled ? '#8B9199' : (controls.ready ? '#FFFFFF' : '#FFD54F');
+        const label = shortText(item.label || 'unavailable', 32);
         setText('#recordHud' + direction[0].toUpperCase() + direction.slice(1),
-          direction.toUpperCase() + '\n' + (item.label || 'UNAVAILABLE'), color);
+          direction + '\n' + (shortLabels[label] || label), color);
       }
     };
 

@@ -171,6 +171,49 @@ class LeRobotWorkflowTests(SessionTests):
         self.assertEqual(self.session.frames, 0)
         self.assertEqual(self.writer.info['total_episodes'], 0)
 
+    def test_redo_after_stale_input_waits_for_stability_then_restarts_same_episode(self):
+        self.start()
+        self.session.fail('VR input stale; episode is incomplete')
+        self.runtime.input_pause_status = dict(state='release_required', stopped=True)
+        def resume():
+            if self.runtime.input_pause_status['state'] != 'ready': return False
+            self.runtime.input_pause_status = None
+            return True
+        self.runtime.resume_recording_input = Mock(side_effect=resume)
+        menu = self.session._hud_controls()['directions']
+        self.assertTrue(menu['left']['enabled'])
+        self.session.command('left'); self.session.command('right'); self.settle()
+        self.update()
+        self.assertEqual(self.session.state, 'idle')
+        self.assertTrue(self.session._auto_start)
+        menu = self.session._hud_controls()['directions']
+        self.assertTrue(menu['left']['enabled'])
+        self.assertEqual(menu['left']['label'], 'RETRY QUEUED')
+        self.session._hud(time.monotonic())
+        hud = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual(hud['controls']['prompt'], 'release grips; center sticks')
+        self.assertFalse(self.session.quit_requested)
+        self.runtime.input_pause_status['state'] = 'ready'
+        self.update(); self.settle(); self.update()
+        self.assertEqual(self.session.state, 'recording', self.session.health)
+        self.assertIsNone(self.runtime.input_pause_status)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+        self.assertFalse(self.session.quit_requested)
+
+    def test_idle_start_queues_retry_without_saving_or_unlocking_unstable_input(self):
+        self.runtime.input_pause_status = dict(state='release_required', stopped=True)
+        self.runtime.resume_recording_input = Mock(return_value=False)
+        self.session.command('right'); self.update()
+        self.assertTrue(self.session._auto_start)
+        self.assertEqual(self.session.state, 'idle')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_frames'], 0)
+        self.session.command('left')
+        self.assertTrue(self.session._auto_start)
+        self.session.command('stop')
+        self.assertTrue(self.session.quit_requested)
+        self.assertFalse(self.session._auto_start)
+
 
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite(LeRobotWorkflowTests(name) for name in LeRobotWorkflowTests.__dict__

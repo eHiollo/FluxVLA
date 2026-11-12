@@ -358,6 +358,14 @@ class RecordingSession:
         with self._sample_lock:
             self._poll_future()
             self._poll_reset()
+            if (self.workflow == 'lerobot' and self._auto_start and self.state == 'idle'
+                    and self.future is None and self.input_fresh and not self.blocks_motion
+                    and getattr(self.runtime, 'input_pause_status', None) is not None):
+                # A confirmed redo/start remains queued through an input pause.
+                # Runtime only releases it after fresh neutral input + real stop;
+                # this acknowledgement never starts a follower or sends a target.
+                resume = getattr(self.runtime, 'resume_recording_input', None)
+                if callable(resume): resume()
             if not self._background_sampling:
                 frame = None
                 if self.backend == 'lerobot' and not self.button_check and not self.blocks_motion:
@@ -559,6 +567,9 @@ class RecordingSession:
         if command == 'up': command = 'reset'
         if command in ('left', 'discard'):
             self.pending = None
+            if self.state == 'idle' and self._auto_start:
+                self.notice = 'Retry queued; release grips and center sticks'
+                return
             if self.state not in ('recording', 'review', 'failed'):
                 self.notice = 'No current episode. RIGHT = START'; return
             self.events.update(exit_early=True, rerecord_episode=True)
@@ -579,7 +590,8 @@ class RecordingSession:
             if not self.input_fresh:
                 self.notice = 'Waiting for fresh VR input'; return
             if getattr(self.runtime, 'input_pause_status', None) is not None:
-                self.notice = 'Release controls, resolve faults and rearm VR first'; return
+                self._auto_start = True
+                self.notice = 'Retry queued; release grips and center sticks'; return
             if self.ready_sample is None:
                 self.notice = 'Cannot start: ' + self.health
                 LOG.warning('录制未开始：%s', self.health)
@@ -717,7 +729,10 @@ class RecordingSession:
             directions = {key: dict(label='UNAVAILABLE', enabled=False) for key in directions}
             paused = getattr(self.runtime, 'input_pause_status', None) is not None
             if self.state == 'idle':
-                show('right', 'REARM VR FIRST' if paused else 'START', self.ready_sample is not None and not paused)
+                show('right', 'QUEUE RETRY' if paused else 'START',
+                     self.input_fresh if paused else self.ready_sample is not None)
+                if self._auto_start:
+                    show('left', 'RETRY QUEUED')
             elif self.state == 'recording':
                 show('right', 'FINISH EP / RESET SCENE')
                 show('left', 'REDO / RESET SCENE')
@@ -778,6 +793,11 @@ class RecordingSession:
                 status['hint'] += (' / INVALID EP: LEFT = REDO, RIGHT = CONFIRM'
                                    if self.workflow == 'lerobot' else ' / INVALID EPISODE: LEFT TO DISCARD')
             controls['prompt'] = pause['controls']['prompt']
+            if self._auto_start and self.state == 'idle':
+                # Do not replace the pending recording retry with "press grip".
+                # Centering the menu stick is enough; moving an arm is optional.
+                controls['prompt'] = 'release grips; center sticks'
+                status['hint'] = 'retry pending'
             phase = status['phase']
         # Clock/frame counts stay rate limited; input gates and state transitions do not.
         signature = (phase, self.pending, self.error, status['hint'],

@@ -90,12 +90,8 @@ teleop.cartesian_adapter=legacy_anchor/sdk_tool_cumulative
 
 ====双臂VR遥操作=====：
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-controller \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True
+  --config configs/a10/a10_dual_arm_vr_teleop.py
+# 默认：实机双臂 + 两只知行夹爪 + 控制器高频记录。
 
 python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
@@ -233,12 +229,8 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
 
 # 终端二：沿用已调好的默认参数
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-controller \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True
+  --config configs/a10/a10_dual_arm_vr_teleop.py
+# 默认：实机双臂 + 两只知行夹爪 + 控制器高频记录。
 
 # 控制台接管/回位后恢复VR：控制台先输入 stop_follower，双手松开侧键，再按侧键接管。
 # 单独关闭查询控制台不影响VR；最后一个客户端退出约5秒后服务自动退出。

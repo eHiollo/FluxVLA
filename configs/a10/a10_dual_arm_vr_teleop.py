@@ -1,13 +1,13 @@
 """Dual A10 VR: relative anchors + reference + SDK tool cumulative targets.
 
-Default VR-only; no recording, pose calibration or automatic motor enable. ZX grippers are opt-in.
-Confirm the actual dual XML / GET row layout before opting into live motion.
+Onsite default: live dual-arm VR, ZX grippers and controller state recording.
+No automatic motor enable. Use --preview for configuration checks without devices.
 """
 
 _base_ = ['./a10_vr_teleop.py', './a10_dual_arm_operator.py', './a10_devices.py']
 
 teleop = dict(
-    vr_only=True, observe_only=False,
+    vr_only=False, observe_only=False, record_controller=True,
     control_mode='reference', pose_mapping='anchor_relative',
     input_recovery_stable_s=.5,  # 松手回中、追踪稳定后，重新按侧键才恢复。
     # 现场出现无输入晚运动：双手松开时结束原生跟随并确认停止，不持续重发旧保持包。
@@ -16,7 +16,7 @@ teleop = dict(
     # 查询失败保留VR界面，但冻结新目标；不使用过期反馈继续运动或自动重连。
     keep_session_on_query_error=True,
     cartesian_adapter='sdk_tool_cumulative', fps=30,
-    # 2026-11-11：旋转响应调整，待现场验证；启动实机仍需显式开放运动权限。
+    # 2026-11-12：保留已验收的运动参数，按用户要求默认开启实机与夹爪。
     # 以下约束前端末端目标；不是电机限速或碰撞距离。
     controller_speed_percent=70,
     reference_options=dict(
@@ -33,7 +33,7 @@ teleop = dict(
     ),
     zx_grippers=dict(
         # 2026-11-06: user-confirmed live settings; device checks retain 5%.
-        enabled=False, devices=dict(
+        enabled=True, devices=dict(
             left=dict(_base_.grippers.left, speed=15),
             right=dict(_base_.grippers.right, speed=15)),
         target_rate_raw_s=3000., deadzone=.1, direction=dict(left=1, right=1),
@@ -44,6 +44,6 @@ teleop = dict(
     input=dict(arm='both', hand_to_arm=dict(left='right', right='left'),
                # Both hands use the shared mapping; no left-only translation swap.
                enable_left_events=False, network=dict(host_ip='0.0.0.0')),
-    operator={{_base_.operator}},
+    operator=dict(_base_.operator, allow_motion=True),
     diagnostics_path='work_dirs/a10/vr/dual_teleop_diagnostics.jsonl',
 )

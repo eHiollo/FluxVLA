@@ -120,6 +120,81 @@ class ZXGripperTests(unittest.TestCase):
                 with self.assertRaisesRegex(error, message):
                     self.client.read_registers(1, 0x0401)
 
+    def test_crc_read_retries_same_register_and_recovers_without_motion_writes(self):
+        self.client.connect()
+        write = self.fake.write
+        bad = [True]
+        def damaged_once(request):
+            result = write(request)
+            if bad[0]:
+                bad[0] = False
+                self.fake.rx = self.fake.rx[:-1] + bytes([self.fake.rx[-1] ^ 1])
+            return result
+        with patch.object(self.fake, 'write', damaged_once):
+            self.assertEqual(self.client.read_registers(1, 0x0401), (0x8011,))
+        self.assertEqual(len(self.fake.writes), 2)
+        self.assertEqual(self.fake.writes[0], self.fake.writes[1])
+        self.assertTrue(all(frame[1] == 3 for frame in self.fake.writes))
+        self.assertEqual(self.client.crc_error_count, 1)
+        self.assertEqual(self.client.crc_read_retry_count, 1)
+        self.assertIn('register=0x0401', self.client.last_crc_error)
+        self.assertIn('RX=', self.client.last_crc_error)
+
+    def test_persistent_crc_read_is_bounded_and_invalid_frame_is_never_accepted(self):
+        self.client.connect()
+        self.fake.override = bytes.fromhex('01 03 02 00 01 00 00')
+        with self.assertRaises(zx.ZXGripperCRCError):
+            self.client.read_registers(1, 0x0401)
+        self.assertEqual(len(self.fake.writes), 3)
+        self.assertEqual(self.client.crc_error_count, 3)
+        self.assertEqual(self.client.crc_read_retry_count, 2)
+
+    def test_crc_damaged_write_ack_never_retransmits_enable_or_trigger(self):
+        self.fake.alarms = (0, 0)
+        self.client.connect()
+        write = self.fake.write
+        for register in (0x0108, 0x0102, 0x0100):
+            self.fake.writes.clear()
+            def corrupt_write(request):
+                result = write(request)
+                if request[1] in (6, 16) and int.from_bytes(request[2:4], 'big') == register:
+                    self.fake.rx = self.fake.rx[:-1] + bytes([self.fake.rx[-1] ^ 1])
+                return result
+            with self.subTest(register=register), patch.object(self.fake, 'write', corrupt_write):
+                with self.assertRaises(zx.ZXGripperCRCError):
+                    self.client.set_position_raw(1, 4500)
+            packets = [p for p in self.fake.writes if p[1] in (6, 16)
+                       and int.from_bytes(p[2:4], 'big') == register]
+            self.assertEqual(len(packets), 1)
+            self.assertNotIn(1, self.client._commands)
+            self.assertEqual(self.client.crc_read_retry_count, 0)
+
+    def test_bad_final_trigger_ack_can_execute_but_is_never_replayed(self):
+        self.fake.alarms = (0, 0)
+        self.client.connect()
+        write = self.fake.write
+        def corrupt_trigger(request):
+            result = write(request)
+            if request[1:6] == bytes.fromhex('06 01 08 00 01'):
+                self.fake.rx = self.fake.rx[:-1] + bytes([self.fake.rx[-1] ^ 1])
+            return result
+        with patch.object(self.fake, 'write', corrupt_trigger):
+            with self.assertRaises(zx.ZXGripperCRCError): self.client.set_position_raw(1, 4500)
+        self.assertEqual(self.fake.position, 4500)  # Hardware may have accepted it.
+        triggers = [p for p in self.fake.writes if p[1:6] == bytes.fromhex('06 01 08 00 01')]
+        self.assertEqual(len(triggers), 1)
+        self.assertNotIn(1, self.client._commands)
+        self.assertFalse(any(p[1:6] == bytes.fromhex('06 01 00 00 00') for p in self.fake.writes))
+
+    def test_device_exception_and_timeout_are_not_crc_retries(self):
+        self.client.connect()
+        for response, error in ((frame(bytes.fromhex('01 83 02')), zx.ZXGripperDeviceError),
+                                (b'', zx.ZXGripperTimeout)):
+            self.fake.writes.clear()
+            self.fake.override = response
+            with self.assertRaises(error): self.client.read_registers(1, 0x0401)
+            self.assertEqual(len(self.fake.writes), 1)
+
     def test_validation_and_short_write(self):
         for options in ({'timeout': float('nan')}, {'timeout': 0},
                         {'baudrate': 0}, {'timeout': True}):

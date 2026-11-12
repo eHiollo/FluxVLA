@@ -185,7 +185,8 @@ class RecordingSession:
         for side, channel in self.runtime._zx_channels.items():
             grip = channel.snapshot(); t = grip.get('feedback_monotonic_s')
             fresh(t, time.monotonic(), self.options['max_gripper_age_s'], side+' gripper')
-            if grip.get('error') or grip.get('alarm_a') or grip.get('alarm_b') or grip.get('enabled') is not True:
+            if (grip.get('error') or grip.get('communication_error') or grip.get('alarm_a')
+                    or grip.get('alarm_b') or grip.get('enabled') is not True):
                 raise ValueError(f'{side} gripper not healthy/enabled')
             times.append(t); grippers[side] = grip.get('actual_raw'); grip_details[side] = grip
         cameras = self.cameras.snapshot(stamp)

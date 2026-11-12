@@ -164,12 +164,7 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-controller \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True
+  --config configs/a10/a10_dual_arm_vr_teleop.py
 ```
 
 - 控制台输入 `get`、`joints` 只查询，不打断 VR。

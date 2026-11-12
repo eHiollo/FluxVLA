@@ -4,9 +4,9 @@
 旧开发工作树已归档并移除；仍停留在旧目录的终端请先执行 `cd /home/robot/VLA/FluxVLA`。
 切换前已打开的控制台请退出后重开。
 
-## 双臂控制台与 VR 同时使用（2026-11-11）
+## 双臂控制台与 VR 同时使用（2026-11-12）
 
-双臂默认通过本机共享服务连接 `.150`，不用再手动开启第三个终端。
+双臂默认通过本机共享服务连接 `.150`，默认开启实机、两只知行夹爪和控制器高频记录；不会自动使能机械臂。不用再手动开启第三个终端。
 **控制台或 VR 都可以先开**，第二个自动复用连接。两个终端都先进入仓库并激活 `fluxvla` 环境。
 
 终端一：
@@ -19,12 +19,7 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-controller \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True
+  --config configs/a10/a10_dual_arm_vr_teleop.py
 ```
 
 - 控制台输入 `get`、`joints` 只查询，不打断 VR。
@@ -36,6 +31,16 @@ python scripts/teleoperate.py \
 - 服务启动日志：`work_dirs/a10/shared_control/service.log`；所有权切换明细：`work_dirs/a10/inference_logs/*_shared_control/`。
 - 本次切换前退出旧版本的直连窗口；旧的独立共享服务也应先退出。双臂不用添加 `--direct`。单臂旧配置不受影响。
 - 11月12日修复：空闲期间控制器断线后，新VR启动会先恢复真实连接并读取状态；不会重发已尝试的运动/录制请求。加载修复前，退出旧控制台并等待约5秒，再按原命令重开两个窗口。
+
+### 夹爪偶发通信问题
+
+坏包不会用于控制，只读查询遇到CRC错误最多再读2次。持续通信异常只暂停对应夹爪，
+机械臂、另一夹爪和VR窗口继续；不自动张开或掉使能。反馈恢复后摇杆回中再推即可。
+写指令回复不明时不自动重发旧动作。通信异常提示按5秒节流，详细寄存器/TX/RX与计数保留在诊断中。
+
+临时不使用夹爪：在短命令后加 `--cfg-options teleop.zx_grippers.enabled=False`。
+只看头显输入、不连接设备：加 `--cfg-options teleop.vr_only=True teleop.zx_grippers.enabled=False`；会自动关闭控制器记录。
+单独检查配置：加 `--preview`。
 
 ## 换 USB 接口后检查设备
 
@@ -164,23 +169,18 @@ python scripts/a10_devices.py --gripper left --close
 与机械臂内部历史键分开：左手摇杆→FTDI DU0EMMMM→物理左臂夹爪；右手摇杆→CP2102N→物理右臂夹爪。
 设备地址、ID和工作端点直接继承 `configs/a10/a10_devices.py`，无需在VR配置中重复填写。
 
-**沿用之前能用的双臂VR命令，在 `--cfg-options` 中增加 `teleop.zx_grippers.enabled=True` 即可。**
+**双臂配置已默认开启知行夹爪、实机与控制器高频记录，直接用下面的短命令即可。**
 之前的机械臂速度/加速度等覆盖参数可以继续保留。下面是不带额外机械臂调参的基本命令：
 
 ```bash
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True \
-    teleop.zx_grippers.enabled=True
+  --config configs/a10/a10_dual_arm_vr_teleop.py
 ```
 
 可额外加 `--preview` 检查配置，不启动VR、机器人连接或串口；输出包含 `zx_grippers=True`。
-`vr_only=True` 或 `--observe` 时也不打开知行串口。默认夹爪开关为False，旧单臂/老夹爪入口沿用原逻辑。
+`vr_only=True` 或 `--observe` 时也不打开知行串口。默认夹爪开关为True，旧单臂/老夹爪入口沿用原逻辑。
 不要同时运行设备动作/校准脚本或其他程序占用相同夹爪串口。
 
 机械臂需先由现场明确使能；`allow_motion=True` 仅允许发送目标，不会自动使能。
@@ -235,12 +235,7 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py --al
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True \
-    teleop.zx_grippers.enabled=True
+  --config configs/a10/a10_dual_arm_vr_teleop.py
 ```
 
 两侧speed可分别设为1～15的整数，超过15或填写小数会在连接设备前报错。
@@ -618,7 +613,7 @@ conda activate fluxvla
 | ④ 只检查机器人状态和通信 | `--inspect-controller` | 只读状态 | 否 |
 | **⑤ 用旧锚点相对算法遥操作实机** | **`control_mode=reference` + `pose_mapping=anchor_relative`** | 是 | **是** |
 | ⑥ 查询双臂控制器的基础状态 | `a10_control.py --config … --read-only get` | 只读状态 | 否 |
-| ⑦ 双臂 VR 独立接管/释放 | `a10_dual_arm_vr_teleop.py` | 默认不连接；实机需显式开启 | 默认否 |
+| ⑦ 双臂 VR 独立接管/释放 | `a10_dual_arm_vr_teleop.py` | 默认连接实机，侧键接管 | 默认开启知行夹爪与控制器记录 |
 | 重新记录一份标定 | `--calibrate-pose` | 只读状态 | 否；会保存标定文件 |
 | 调试 reference 的计算过程（旧观察入口） | `--observe` | 只读状态 | 否；静止时可能触发追踪误差 |
 

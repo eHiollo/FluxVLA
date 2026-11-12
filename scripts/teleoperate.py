@@ -104,6 +104,9 @@ def main(argv=None):
         return 0
     if args.observe:
         cfg.teleop.update(vr_only=False, observe_only=True, control_mode='reference')
+    if (args.observe or args.check_record_buttons or cfg.teleop.get('vr_only', True)) and not args.record_controller:
+        # Explicit observation/input-only modes do not inherit live recording.
+        cfg.teleop.record_controller = False
     if args.check_record_buttons:
         cfg.teleop.update(vr_only=True, observe_only=False)
         cfg.teleop.zx_grippers.enabled = False

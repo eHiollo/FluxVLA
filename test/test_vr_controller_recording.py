@@ -198,6 +198,7 @@ class RecorderRuntimeTest(unittest.TestCase):
     def test_record_flag_requires_feedback_and_local_diagnostics(self):
         cfg = Config.fromfile(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py').teleop
         cfg.record_controller = True
+        cfg.vr_only = True
         with self.assertRaisesRegex(ValueError, 'live/observe'): build_runtime(cfg)
         cfg.vr_only = False; cfg.observe_only = True; cfg.diagnostics_path = None
         with self.assertRaisesRegex(ValueError, 'diagnostics_path'): build_runtime(cfg)

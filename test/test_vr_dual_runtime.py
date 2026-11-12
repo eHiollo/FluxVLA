@@ -28,6 +28,8 @@ IDENTITY = np.array([0., 0., 0., 0., 0., 0., 1.])
 
 def configuration(*, identity_bindings=False):
     cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
+    cfg.update(vr_only=True, record_controller=False)
+    cfg.zx_grippers.enabled = False
     if identity_bindings:
         # Lifecycle fixtures name arms after their hands; site mapping is tested separately.
         cfg.input.hand_to_arm = dict(left='left', right='right')

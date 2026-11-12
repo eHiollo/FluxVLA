@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from mmengine import Config
 from fluxvla.engines.operators.vr.runtime import _ZXGripperChannel, build_runtime
-from fluxvla.engines.operators.zx_gripper import ZXGripperState, ZXGripper, ZXGripperInputExpired
+from fluxvla.engines.operators.zx_gripper import ZXGripperState, ZXGripper, ZXGripperInputExpired, ZXGripperCRCError
 from test_vr_dual_runtime import configuration, hand, HandInput, DualRobot
 from test_zx_gripper import FakeSerial
 
@@ -203,6 +203,58 @@ class ChannelTest(unittest.TestCase):
         c.close()
         self.assertEqual(fake.targets, [])
 
+    def test_write_crc_waits_for_fresh_center_and_never_replays_held_target(self):
+        c = self.channel(); fake = FakeZX(); c.client = fake
+        c.connect()
+        c.submit(0., time.monotonic() + 1.)
+        wait_for(lambda: c.snapshot()['phase'] == 'centered')
+        attempts = []
+        real_send = fake.set_position_raw
+        def crc_once(device_id, target, **kwargs):
+            attempts.append(target)
+            if len(attempts) == 1:
+                raise ZXGripperCRCError(1, 6, 0x0108, b'badtx', b'badrx')
+            return real_send(device_id, target, **kwargs)
+        with patch.object(fake, 'set_position_raw', crc_once):
+            c.submit(-1., time.monotonic() + 1.)
+            wait_for(lambda: bool(attempts))
+            wait_for(lambda: c.snapshot().get('last_io_error') is not None)
+            c.submit(-1., time.monotonic() + 1.)
+            wait_for(lambda: c.snapshot()['phase'] == 'neutral_required')
+            c.check_health()
+            for _ in range(4):
+                c.submit(-1., time.monotonic() + 1.)
+                time.sleep(.06)
+            self.assertEqual(len(attempts), 1)
+            self.assertIsNone(c.snapshot()['error'])
+            self.assertIn('CRC', c.snapshot()['last_io_error'])
+            c.submit(0., time.monotonic() + 1.)
+            wait_for(lambda: c.snapshot()['phase'] == 'centered')
+            c.submit(-1., time.monotonic() + 1.)
+            wait_for(lambda: len(fake.targets) > 0)
+        c.close()
+
+    def test_driver_recovers_read_crc_without_killing_background_channel(self):
+        c = self.channel()
+        fake = FakeSerial(); fake.alarms = (0, 0)
+        c.client.expected_usb_serial = None
+        write = fake.write
+        damaged = [False]
+        def once(request):
+            result = write(request)
+            if not damaged[0] and request[1] == 3:
+                damaged[0] = True
+                fake.rx = fake.rx[:-1] + bytes([fake.rx[-1] ^ 1])
+            return result
+        with patch('serial.Serial', return_value=fake), patch.object(fake, 'write', once):
+            c.connect()
+            self.assertTrue(damaged[0])
+            self.assertEqual(c.snapshot()['crc_errors'], 1)
+            self.assertEqual(c.snapshot()['crc_read_retries'], 1)
+            c.check_health()
+            self.assertTrue(all(p[1] == 3 for p in fake.writes))
+            c.close()
+
     def test_alarm_worker_failure_reports_error_without_opening_gripper(self):
         c = self.channel(); fake = FakeZX(); fake.alarm = True; c.client = fake
         with self.assertRaisesRegex(RuntimeError, 'alarm'):
@@ -217,15 +269,19 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.logs = tempfile.TemporaryDirectory()
         self.addCleanup(self.logs.cleanup)
 
-    def test_config_defaults_and_opt_in_preview_never_open_usb(self):
-        cfg = configuration()
-        self.assertFalse(cfg.zx_grippers.enabled)
+    def test_live_defaults_and_input_only_preview_never_open_usb(self):
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
+        self.assertTrue(cfg.zx_grippers.enabled)
+        self.assertFalse(cfg.vr_only)
+        self.assertFalse(cfg.observe_only)
+        self.assertTrue(cfg.record_controller)
+        self.assertTrue(cfg.operator.allow_motion)
         self.assertEqual(cfg.zx_grippers.target_rate_raw_s, 3000.)
         self.assertEqual(cfg.zx_grippers.max_lead_raw, 600.)
         for side in ('left', 'right'):
             self.assertEqual(cfg.zx_grippers.devices[side].speed, 15)
             self.assertEqual(device(side)['speed'], 5)
-        cfg.zx_grippers.enabled = True
+        cfg.vr_only = True; cfg.record_controller = False
         with patch('serial.Serial') as serial:
             rt = build_runtime(cfg)
             self.assertTrue(rt.zx_grippers_enabled)
@@ -237,6 +293,33 @@ class DualZXRuntimeTest(unittest.TestCase):
             self.assertEqual(rt._zx_channels['left'].client.expected_usb_serial, 'DU0EMMMM')
             rt.close()
             serial.assert_not_called()
+
+    def test_short_default_command_preview_has_recording_and_grippers_but_no_io(self):
+        from scripts.teleoperate import main
+        import contextlib
+        import io
+        output = io.StringIO()
+        with patch('socket.socket', side_effect=AssertionError('network IO')), \
+                patch('serial.Serial', side_effect=AssertionError('USB IO')), \
+                patch('subprocess.Popen', side_effect=AssertionError('service startup')), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(main(['--config', str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py'), '--preview']), 0)
+        self.assertIn('vr_only=False', output.getvalue())
+        self.assertIn('record_controller=True', output.getvalue())
+        self.assertIn('zx_grippers=True', output.getvalue())
+
+    def test_input_only_and_observe_overrides_do_not_inherit_recording(self):
+        from scripts.teleoperate import main
+        import contextlib
+        import io
+        for args in (['--cfg-options', 'teleop.vr_only=True'], ['--observe']):
+            output = io.StringIO()
+            with patch('socket.socket', side_effect=AssertionError('network IO')), \
+                    patch('serial.Serial', side_effect=AssertionError('USB IO')), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(main(['--config', str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py'),
+                                       '--preview', *args]), 0)
+            self.assertIn('record_controller=False', output.getvalue())
 
     def test_opt_in_observe_does_not_construct_active_channels(self):
         cfg = configuration(); cfg.zx_grippers.enabled = True
@@ -272,6 +355,7 @@ class DualZXRuntimeTest(unittest.TestCase):
         cfg = configuration(); cfg.zx_grippers.enabled = True
         cfg.vr_only = False; cfg.operator.allow_motion = True
         cfg.diagnostics_path = str(Path(self.logs.name) / 'teleop.jsonl')
+        cfg.controller_speed_percent = None
         rt = build_runtime(cfg)
         rt.robot = DualRobot(); rt.cartesian_adapter = 'legacy_anchor'
         rt.teleoperator.input = HandInput(); rt.vr = rt.teleoperator.input
@@ -301,6 +385,7 @@ class DualZXRuntimeTest(unittest.TestCase):
         cfg = configuration(); cfg.zx_grippers.enabled = True
         cfg.vr_only = False; cfg.operator.allow_motion = True
         cfg.diagnostics_path = str(Path(self.logs.name) / 'teleop.jsonl')
+        cfg.controller_speed_percent = None
         rt = build_runtime(cfg); rt.robot = DualRobot()
         rt.teleoperator.input = HandInput(); rt.vr = rt.teleoperator.input
         for channel in rt._zx_channels.values(): channel.client = FakeZX()
@@ -326,6 +411,40 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.assertIn('stop', rt.robot.events)
         self.assertIn('wait_stopped', rt.robot.events)
         self.assertTrue(all(c._stop.is_set() for c in rt._zx_channels.values()))
+
+    def test_communication_error_only_pauses_one_gripper_and_vr_keeps_running(self):
+        rt = self.live()
+        seq = [0]
+        def tick(right_axis=-1.):
+            seq[0] += 1
+            rt.vr.rows = {side: hand(seq[0], pressed=True) for side in ('left', 'right')}
+            rt.vr.rows['right']['xlevr.thumbstick'] = {'x': right_axis}
+            rt.vr.rows['left']['xlevr.thumbstick'] = {'x': -1.}
+            rt.step()
+        rt.vr.rows = {side: hand(1) for side in ('left', 'right')}
+        rt.step()
+        wait_for(lambda: all(c.snapshot()['phase'] == 'centered' for c in rt._zx_channels.values()))
+        for _ in range(6): tick(); time.sleep(.025)
+        self.assertIn('start', rt.robot.events)
+        right = rt._zx_channels['right']
+        left_count = len(rt._zx_channels['left'].client.targets)
+        old_count = len(right.client.targets)
+        with patch.object(right.client, 'read_state', side_effect=ZXGripperCRCError(1, 3, 0x0418, b'tx', b'rx')):
+            wait_for(lambda: bool(right.snapshot()['communication_error']))
+            for _ in range(8): tick(); time.sleep(.04)
+            self.assertTrue(rt._connected)
+            self.assertTrue(rt.robot.follower_stop_pending)
+            self.assertNotIn('stop', rt.robot.events)
+            self.assertEqual(len(right.client.targets), old_count)
+            self.assertGreater(len(rt._zx_channels['left'].client.targets), left_count)
+            self.assertFalse(right.check_health())
+        wait_for(lambda: right.snapshot()['communication_error'] is None)
+        for _ in range(3): tick(); time.sleep(.04)
+        self.assertEqual(len(right.client.targets), old_count)  # No replay while held.
+        tick(right_axis=0.)
+        wait_for(lambda: right.snapshot()['phase'] == 'centered')
+        for _ in range(4): tick(); time.sleep(.04)
+        self.assertGreater(len(right.client.targets), old_count)
 
     def test_gripper_failure_and_arm_fault_cancel_both_channels(self):
         for origin in ('gripper', 'arm'):

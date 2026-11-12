@@ -451,7 +451,7 @@ class EntryTest(unittest.TestCase):
               '--record-config',str(ROOT/'configs/a10/a10_dual_arm_record.py'),'--preview']
         with patch('fluxvla.engines.operators.vr.recording.RecordingSession.connect',side_effect=AssertionError('IO')):
             self.assertEqual(main(args+['--check-record-buttons']),0)
-            with self.assertRaisesRegex(ValueError,'live dual'): main(args)
+            self.assertEqual(main(args),0)  # Live + grippers is now the explicit site default.
             self.assertEqual(main(args+['--cfg-options','teleop.vr_only=False','teleop.observe_only=False',
                                        'teleop.operator.allow_motion=True','teleop.zx_grippers.enabled=True']),0)
 

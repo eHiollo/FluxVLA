@@ -57,8 +57,9 @@ class _ZXGripperChannel:
         self._need_center = True
         self._active = False
         self._last_sent = None
+        self._last_link_warning = float('-inf')
         self._state = dict(phase='not_started', serial=self.serial, actual_raw=None,
-                           target_raw=None, last_sent_raw=None, error=None, feedback_monotonic_s=None)
+                           target_raw=None, last_sent_raw=None, error=None, communication_error=None, feedback_monotonic_s=None)
 
     def connect(self):
         if self._thread is not None or self._stop.is_set():
@@ -93,9 +94,31 @@ class _ZXGripperChannel:
         state = self.snapshot()
         if state['error']:
             raise RuntimeError(f"ZX {self.side}: {state['error']}")
+        if state.get('communication_error'):
+            return False
         stamp = state['feedback_monotonic_s']
         if stamp is None or not 0 <= time.monotonic() - stamp <= self.options['feedback_timeout_s']:
-            raise RuntimeError(f'ZX {self.side}: feedback is stale')
+            self._communication_failed('feedback is stale')
+            return False
+        return True
+
+    def _communication_failed(self, error):
+        # Only this gripper pauses. Never discard CRC or fabricate feedback,
+        # release holding torque, replay a write, or stop the arm VR loop.
+        self.pause()
+        self._last_sent = None
+        with self._lock:
+            self._state.update(phase='communication_wait', communication_error=str(error),
+                               last_io_error=str(error), last_sent_raw=None,
+                               crc_errors=getattr(self.client, 'crc_error_count', 0),
+                               crc_read_retries=getattr(self.client, 'crc_read_retry_count', 0),
+                               last_crc_error=getattr(self.client, 'last_crc_error', self._state.get('last_crc_error')))
+        now = time.monotonic()
+        if now - self._last_link_warning >= 5.:
+            self._last_link_warning = now
+            logging.getLogger(__name__).warning(
+                'ZX %s 通信异常，仅暂停此夹爪，机械臂遥操作继续；反馈恢复后摇杆回中再操作：%s',
+                self.side, error)
 
     def request_stop(self):
         self._stop.set()
@@ -137,32 +160,37 @@ class _ZXGripperChannel:
         state = self.client.read_state(self.device_id)
         now = time.monotonic()
         if now - before > self.options['feedback_timeout_s']:
-            raise TimeoutError('serial feedback read took too long')
+            from ..zx_gripper import ZXGripperTimeout
+            raise ZXGripperTimeout('serial feedback read took too long')
         if state.has_error:
             raise RuntimeError(f'gripper alarm 0x{state.alarm_a:04X}/0x{state.alarm_b:04X}')
         if not max(0, self.low - self.tolerance) <= state.position_raw <= self.high + self.tolerance:
             raise RuntimeError('actual position exceeds the configured raw range')
         with self._lock:
             self._state.update(actual_raw=state.position_raw, feedback_monotonic_s=now,
-                               enabled=state.enabled, alarm_a=state.alarm_a, alarm_b=state.alarm_b,
-                               completion=state.completion)
+                               enabled=state.enabled, alarm_a=state.alarm_a, alarm_b=state.alarm_b, communication_error=None,
+                               completion=state.completion,
+                               crc_errors=getattr(self.client, 'crc_error_count', 0),
+                               crc_read_retries=getattr(self.client, 'crc_read_retry_count', 0),
+                               last_crc_error=getattr(self.client, 'last_crc_error', self._state.get('last_crc_error')))
         return state, now
 
     def _run(self):
-        from ..zx_gripper import ZXGripperInputExpired
+        from ..zx_gripper import ZXGripperInputExpired, ZXGripperCommunicationError
         try:
             with self.client:
-                state, now = self._read()
-                self._target = float(np.clip(state.position_raw, self.low, self.high))
-                with self._lock:
-                    self._state.update(phase='neutral_required', target_raw=self._target)
-                self._ready.set()
-                next_tick = time.monotonic() + 1. / self.options['io_hz']
+                next_tick = time.monotonic()
                 while not self._stop.wait(max(0., next_tick - time.monotonic())):
-                    # io_hz is a maximum rate; account for I/O instead of adding
-                    # a full extra period after every serial transaction.
                     next_tick = time.monotonic() + 1. / self.options['io_hz']
-                    state, now = self._read()
+                    try:
+                        state, now = self._read()
+                    except ZXGripperCommunicationError as exc:
+                        self._communication_failed(exc)
+                        self._ready.set()
+                        continue  # Poll feedback only; no uncertain write is retried.
+                    if self._target is None:
+                        self._target = float(np.clip(state.position_raw, self.low, self.high))
+                    self._ready.set()
                     if self._stop.is_set():
                         break
                     with self._lock:
@@ -173,6 +201,10 @@ class _ZXGripperChannel:
                             self.client.set_position_raw(self.device_id, target, speed=self.speed, torque=self.torque,
                                                          motion_deadline_s=deadline, motion_cancel_event=self._motion_cancel)
                             self._last_sent = target
+                        except ZXGripperCommunicationError as exc:
+                            self._communication_failed(exc)
+                            self._target = float(state.position_raw)
+                            continue
                         except ZXGripperInputExpired:
                             self._need_center, self._active = True, False
                             phase = 'input_expired_during_io'
@@ -1167,8 +1199,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     def _step(self, raw, action):
         if self._zx_channels:
             self.last_gripper_command = {side: channel.snapshot() for side, channel in self._zx_channels.items()}
-            for channel in self._zx_channels.values():
-                channel.check_health()
+            health = {side: channel.check_health() for side, channel in self._zx_channels.items()}
         try:
             result = self._step_arms(raw, action)
         except _VRInputPause as exc:
@@ -1181,7 +1212,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             age = sample.get('xlevr.sample_age_s', -1.)
             elapsed = max(0., time.monotonic() - self._input_read_time)
             budget = channel.options['input_timeout_s']
-            valid = (self._input_pause is None and isinstance(age, (int, float))
+            valid = (health[side] and self._input_pause is None and isinstance(age, (int, float))
                      and math.isfinite(age) and 0 <= age and age + elapsed <= budget)
             value = action[self.teleoperator.hand_to_arm[side]].get('gripper.pos', 0.)
             channel.submit(float(value) if valid else 0., time.monotonic() + budget - age - elapsed if valid else 0.)

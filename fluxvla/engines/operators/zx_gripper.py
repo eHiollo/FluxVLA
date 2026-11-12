@@ -42,6 +42,7 @@ No robot/VLA config is switched by this standalone module.
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import logging
 import math
 from numbers import Integral, Real
 from pathlib import Path
@@ -69,11 +70,26 @@ class ZXGripperError(RuntimeError):
     """Transport or malformed Modbus response."""
 
 
+class ZXGripperCommunicationError(ZXGripperError):
+    """Serial link or invalid reply; no valid device alarm is implied."""
+
+
+class ZXGripperCRCError(ZXGripperCommunicationError):
+    """A complete reply failed CRC; write execution is therefore uncertain."""
+
+    def __init__(self, device_id, function, address, request, response):
+        self.device_id, self.function, self.address = device_id, function, address
+        self.request_hex, self.response_hex = request.hex(), bytes(response).hex()
+        super().__init__(
+            f'Response CRC mismatch: ID={device_id} function=0x{function:02X} '
+            f'register=0x{address:04X} TX={self.request_hex} RX={self.response_hex}')
+
+
 class ZXGripperInputExpired(ZXGripperError):
     """Input expired before a motion write; never retry the stale target."""
 
 
-class ZXGripperTimeout(ZXGripperError, TimeoutError):
+class ZXGripperTimeout(ZXGripperCommunicationError, TimeoutError):
     """No complete response before the transaction deadline."""
 
 
@@ -150,7 +166,7 @@ class ZXGripper:
 
     def __init__(self, port=DEFAULT_PORT, *, baudrate=115200, timeout=0.2,
                  trace=None, max_position_raw=8900,
-                 expected_usb_serial=None, expected_usb_interface=None):
+                 expected_usb_serial=None, expected_usb_interface=None, read_crc_retries=2):
         if not isinstance(port, str) or not port:
             raise ValueError('port must be a nonempty device path')
         self.port = port
@@ -162,6 +178,10 @@ class ZXGripper:
                 or not math.isfinite(timeout) or not 0 < timeout <= 60):
             raise ValueError('timeout must be finite and within (0, 60] seconds')
         self.timeout = timeout
+        self.read_crc_retries = _integer(read_crc_retries, 'read_crc_retries', 0, 3)
+        self.crc_error_count = self.crc_read_retry_count = 0
+        self.last_crc_error = None
+        self._last_crc_warning = float('-inf')
         self.trace = trace
         self._serial = None
         self._last_activity = 0.0
@@ -408,7 +428,24 @@ class ZXGripper:
 
     def _transaction(self, device_id, body, *, read_count=None):
         with self._io_lock:
-            return self._transaction_locked(device_id, body, read_count=read_count)
+            # Only function 03 is repeatable here. Never retransmit an uncertain
+            # enable/trigger/position write merely because its ACK was damaged.
+            attempts = 1 + (self.read_crc_retries if read_count is not None else 0)
+            for attempt in range(attempts):
+                try:
+                    return self._transaction_locked(device_id, body, read_count=read_count)
+                except ZXGripperCRCError as exc:
+                    self.crc_error_count += 1
+                    self.last_crc_error = str(exc)
+                    if attempt + 1 == attempts:
+                        raise
+                    self.crc_read_retry_count += 1
+                    now = time.monotonic()
+                    if now - self._last_crc_warning >= 5.:
+                        self._last_crc_warning = now
+                        logging.getLogger(__name__).warning(
+                            'ZX %s: %s; retrying read only (%s/%s)',
+                            self.port, exc, attempt + 1, self.read_crc_retries)
 
     def _transaction_locked(self, device_id, body, *, read_count=None):
         if self._serial is None:
@@ -425,7 +462,7 @@ class ZXGripper:
             if self.trace:
                 self.trace('TX', request)
             if self._serial.write(request) != len(request):
-                raise ZXGripperError('Incomplete serial write')
+                raise ZXGripperCommunicationError('Incomplete serial write')
             # Include wire transmission time, also for user-specified low rates.
             deadline = time.monotonic() + self.timeout + len(request) * 10 / self.baudrate
 
@@ -445,28 +482,28 @@ class ZXGripper:
 
             read_exact(3)
             if response[0] != device_id:
-                raise ZXGripperError(f'Wrong response ID: {response[0]}, expected {device_id}')
+                raise ZXGripperCommunicationError(f'Wrong response ID: {response[0]}, expected {device_id}')
             if response[1] == function | 0x80:
                 read_exact(2)
             elif response[1] != function:
-                raise ZXGripperError(f'Unexpected function: 0x{response[1]:02X}')
+                raise ZXGripperCommunicationError(f'Unexpected function: 0x{response[1]:02X}')
             elif function == 3:
                 if response[2] != read_count * 2:
-                    raise ZXGripperError(f'Unexpected byte count: {response[2]}')
+                    raise ZXGripperCommunicationError(f'Unexpected byte count: {response[2]}')
                 read_exact(response[2] + 2)
             else:
                 read_exact(5)
             if crc16(response[:-2]) != int.from_bytes(response[-2:], 'little'):
-                raise ZXGripperError('Response CRC mismatch')
+                raise ZXGripperCRCError(device_id, function, int.from_bytes(body[2:4], 'big'), request, response)
             if response[1] == function | 0x80:
                 raise ZXGripperDeviceError(device_id, response[2])
             if function in (6, 16) and response[:-2] != body[:6]:
-                raise ZXGripperError('Write acknowledgement mismatch')
+                raise ZXGripperCommunicationError('Write acknowledgement mismatch')
             return response
         except ZXGripperError:
             raise
         except OSError as exc:
-            raise ZXGripperError(f'Serial I/O failed: {exc}') from exc
+            raise ZXGripperCommunicationError(f'Serial I/O failed: {exc}') from exc
         finally:
             self._last_activity = time.monotonic()
             if self.trace:

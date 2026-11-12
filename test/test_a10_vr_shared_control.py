@@ -100,6 +100,8 @@ class DualSharedIntegrationTest(unittest.TestCase):
     def runtime(self, **overrides):
         cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
         cfg.vr_only = False
+        cfg.record_controller = False
+        cfg.zx_grippers.enabled = False
         cfg.controller_speed_percent = None
         cfg.diagnostics_path = None
         cfg.operator.update(self.options)

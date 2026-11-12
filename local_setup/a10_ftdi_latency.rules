@@ -1,0 +1,2 @@
+# A10 left gripper FTDI: keep short Modbus replies responsive after USB reconnect.
+ACTION=="add", SUBSYSTEM=="usb-serial", ATTRS{serial}=="DU0EMMMM", ATTR{latency_timer}="2"

@@ -56,7 +56,13 @@ class FakeSerial:
                 self.enabled = count
         elif self.only_id is None or device_id == self.only_id:
             if address == zx.STATUS_REGISTER:
-                values = (self.status,) if count == 1 else (self.status, *self.alarms)
+                if count == 27:
+                    block = [0] * 27
+                    block[:3] = [self.status, *self.alarms]
+                    block[23:27] = [self.position >> 16, self.position & 0xFFFF, 10, 12]
+                    values = tuple(block)
+                else:
+                    values = (self.status,) if count == 1 else (self.status, *self.alarms)
             elif address == 0x0418:
                 values = (self.position >> 16, self.position & 0xFFFF)
                 if count == 4:
@@ -273,6 +279,15 @@ class ZXGripperTests(unittest.TestCase):
         self.assertEqual(struct.unpack('>6H', writes[1][7:-2]), (0, 4720, 10, 60, 1000, 1000))
         self.assertEqual(writes[-1][2:6], bytes.fromhex('01 08 00 01'))
 
+    def test_feedback_fields_are_batched_into_two_read_only_exchanges(self):
+        self.client.connect()
+        state = self.client.read_state(1)
+        self.assertEqual([(p[1], int.from_bytes(p[2:4], 'big'), int.from_bytes(p[4:6], 'big'))
+                          for p in self.fake.writes], [(3, 0x0401, 27), (3, 0x0100, 1)])
+        self.assertEqual((state.status, state.alarm_a, state.alarm_b), (0x8011, 0x30, 1000))
+        self.assertEqual((state.position_raw, state.speed_raw, state.current_raw), (4820, 10, 12))
+        self.assertTrue(state.enabled)
+
     def test_live_feedback_avoids_duplicate_alarm_read_and_redundant_enable(self):
         self.fake.alarms = (0, 0)
         self.client.connect()
@@ -328,7 +343,7 @@ class ZXGripperTests(unittest.TestCase):
         original_read = self.client.read_registers
 
         def read(device_id, address, count=1):
-            if address == zx.STATUS_REGISTER and count == 3:
+            if address == zx.STATUS_REGISTER and count == 27:
                 self.fake.alarms = (0, 0x1000)
             return original_read(device_id, address, count)
 

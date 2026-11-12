@@ -286,8 +286,11 @@ class ZXGripper:
     def read_state(self, device_id=1):
         """Poll actual position, status, alarms, speed/current and enable register."""
         with self._io_lock:
-            status, alarm_a, alarm_b = self.read_registers(device_id, STATUS_REGISTER, 3)
-            high, low, speed, current = self.read_registers(device_id, 0x0418, 4)
+            # Both onsite units support this contiguous feedback block. Fetch
+            # status, alarms, position, speed and current in one RTU exchange.
+            feedback = self.read_registers(device_id, STATUS_REGISTER, 27)
+            status, alarm_a, alarm_b = feedback[:3]
+            high, low, speed, current = feedback[23:27]
             enabled, = self.read_registers(device_id, 0x0100)
             raw = (high << 16) | low
             command = self._commands.get(device_id)

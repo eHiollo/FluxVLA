@@ -93,6 +93,8 @@ python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py
 # 默认：实机双臂 + 两只知行夹爪 + 控制器高频记录。
 
+
+#参数调整
 python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
   --record-controller \

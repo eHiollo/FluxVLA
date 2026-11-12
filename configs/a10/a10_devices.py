@@ -20,7 +20,7 @@ left/right 按手柄和物理机械臂命名，不是 A10Operator 的内部字�
 cameras = dict(
     base_0_rgb=dict(
         identity=dict(model='D435i', serial='262923065199', usb_interface='03', video_index=0),
-        device='/dev/v4l/by-path/platform-a80aa10000.usb-usb-0:3.2.2:1.3-video-index0',
+        device='/dev/v4l/by-path/platform-a80aa10000.usb-usb-0:2.4:1.3-video-index0',
         width=640, height=480, fps=30, rotate_180=False,
     ),
     left_wrist_0_rgb=dict(

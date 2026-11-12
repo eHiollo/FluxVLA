@@ -1414,3 +1414,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 已按USB序列号DU0EMMMM核对左ttyUSB0，将sysfs latency_timer由16改为2ms，并安装/etc/udev/rules.d/99-fluxvla-a10-ftdi.rules后重载规则；源码保存local_setup/a10_ftdi_latency.rules。只匹配这只FTDI，未对当前设备触发重连；实际USB拔插持久化验收未执行。
 - 新读法每侧10次只读复核、每次2个03请求，字段与旧读法一致，CRC均0；完整状态耗时中位左21.99ms、右25.99ms。该结果是反馈读取耗时，不等于运动周期或真实手感改善率。
 - 验证：ZX驱动/VR夹爪64项通过（4.362秒）；模拟器按真实连续寄存器布局返回，运动中报警注入同步到新的读取长度，报警仍能正确上报。udevadm verify验证规则成功。日志/只读结果保存work_dirs/a10/shared_control/offline_gripper_batch_tests.log及gripper_batch_readonly.json。没有执行实机开合动作，未提交用户CLI/相机路径修改。
+
+### 2026-11-12：final版遥操作，现场确认正常并保存
+
+- 用户确认当前遥操作和夹爪使用正常，要求提交“final版遥操作”。本次以当前kaanh_follower状态保存现场验收节点。
+- 默认入口：python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py，启用双臂实机、两只知行夹爪、控制器高频记录；控制台与VR共享连接，左右手独立控制。
+- 保留已确认的运动参数、夹爪通信异常局部恢复、正常周期2读3写、左FTDI 2ms及重插规则。10:30:14右夹爪一次CRC错误经1次只读重试恢复，后续日志无通信错误或设备报警，未因此退出VR。
+- 将当前CLI参数调整注释和已更新的外部D435i现场路径platform-a80aa10000.usb-usb-0:2.4:1.3-video-index0一并保存。此前250项相关回归与后续64项批量反馈/夹爪回归结果已记录；本次为现场验收后的文档/配置归档，不重新执行设备动作。
+- a10_dual_record.zip为本地数据文件，保留但不纳入代码提交。

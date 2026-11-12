@@ -27,6 +27,10 @@ from .vr_events import RecordingButtons
 LOG = logging.getLogger(__name__)
 
 
+class _SampleNotReady(ValueError):
+    """A missing/late measurement; distinct from malformed data or device alarms."""
+
+
 def plain(value):
     if isinstance(value, np.ndarray): return value.tolist()
     if isinstance(value, np.generic): return value.item()
@@ -37,15 +41,24 @@ def plain(value):
 
 def fresh(stamp, now, limit, label):
     if not isinstance(stamp, (int, float)) or not math.isfinite(stamp) or not 0 <= now-stamp <= limit:
-        raise ValueError(f'{label}: feedback missing/stale')
+        raise _SampleNotReady(f'{label}: feedback missing/stale')
 
 
 class RecordingSession:
     def __init__(self, runtime, config, *, button_check=False):
         self.runtime = runtime
         self.record = copy.deepcopy(dict(config['record']))
+        self.backend = self.record.pop('backend', 'legacy')
+        if self.backend not in ('legacy', 'lerobot'):
+            raise ValueError('record.backend must be legacy or lerobot')
         self.cameras_config = copy.deepcopy(dict(config['cameras']))
         self.options = dict(config['capture'])
+        self.sampling_mode = self.options.get('sampling_mode', 'background_30hz')
+        if self.sampling_mode not in ('control_loop', 'background_30hz'):
+            raise ValueError('capture.sampling_mode must be control_loop or background_30hz')
+        self._missing_since = None
+        self.skipped_samples = 0
+        self.sample_gaps = 0
         self.task = self.options['task']
         if not isinstance(self.task, str) or not self.task.strip():
             raise ValueError('capture.task must be nonempty text')
@@ -54,6 +67,11 @@ class RecordingSession:
             value = self.options[key]
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f'capture.{key} must be finite and positive')
+        self.max_missing_feedback_s = self.options.get('max_missing_feedback_s', 1.)
+        if (isinstance(self.max_missing_feedback_s, bool)
+                or not isinstance(self.max_missing_feedback_s, (float, int))
+                or not math.isfinite(self.max_missing_feedback_s) or self.max_missing_feedback_s <= 0):
+            raise ValueError('capture.max_missing_feedback_s must be finite and positive')
         if self.options['hud_hz'] > 10:
             raise ValueError('HUD rate must be <= 10Hz')
         self.buttons = RecordingButtons(**dict(self.options['buttons']))
@@ -117,12 +135,17 @@ class RecordingSession:
             from scripts.a10_devices import scan_devices, match_devices, require_matched
             rows = match_devices({'cameras': self.cameras_config}, scan_devices())
             require_matched(rows, 'cameras')
-            self.writer = EpisodeWriter(**self.record)
+            writer_class = EpisodeWriter
+            if self.backend == 'lerobot':
+                from fluxvla.datasets.lerobot_episode_writer import LeRobotEpisodeWriter
+                writer_class = LeRobotEpisodeWriter
+            self.writer = writer_class(**self.record)
             self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='episode-finalize')
             self.cameras = BufferedCameraOperator(self.cameras_config)
             self.cameras.start()
             self._feedback_reader = self.runtime.robot.open_feedback_reader()
-            self._start_sampling()
+            if self.sampling_mode == 'background_30hz':
+                self._start_sampling()
         if self.options.get('terminal', True):
             threading.Thread(target=self._terminal, name='record-input', daemon=True).start()
         LOG.info('录制入口：右手功能键 %s + 左摇杆；start/save/discard/status/reset/stop/quit/help。'
@@ -180,7 +203,8 @@ class RecordingSession:
         if getattr(self.runtime, 'input_pause_status', None) is not None:
             raise ValueError('VR input paused; release controls and re-engage first')
         if raw is None:
-            if not self.input_fresh: raise ValueError('Waiting for fresh paired VR input')
+            if not self.input_fresh and self.backend != 'lerobot':
+                raise ValueError('Waiting for fresh paired VR input')
             raw = self.raw
         else:
             if set(raw) != {'left', 'right'}:
@@ -221,7 +245,7 @@ class RecordingSession:
             if sample['image'].shape != (settings['height'], settings['width'], 3):
                 raise ValueError(f'{name}: camera resolution mismatch')
         if max(times)-min(times) > self.options['max_skew_s']:
-            raise ValueError('Camera/robot/gripper receive-time skew exceeded')
+            raise _SampleNotReady('Camera/robot/gripper receive-time skew exceeded')
         state = pack_dual_state(joints, grippers)
         detail = dict(robot_received_monotonic_s=stamp,
                       controller_feedback_sequence=frame.get('controller_feedback_sequence'),
@@ -239,9 +263,20 @@ class RecordingSession:
             try:
                 self.ready_sample = self._assemble(now, frame=frame, raw=raw)
                 self.health = 'Cameras 3/3 | Arms OK | Grippers OK'
+                self._missing_since = None
             except Exception as exc:
                 self.health = str(exc)
-                if self.state == 'recording': self.fail(str(exc))
+                if self.state == 'recording':
+                    if self.backend == 'lerobot' and isinstance(exc, _SampleNotReady):
+                        # Like the old recorder, do not invent a frame or reject
+                        # an entire episode for one slow acquisition. The true
+                        # gap remains in diagnostics; persistent loss is fatal.
+                        self.skipped_samples += 1
+                        if self._missing_since is None: self._missing_since = now
+                        if now-self._missing_since >= self.max_missing_feedback_s:
+                            self.fail(f'Measurements unavailable for >={self.max_missing_feedback_s:g}s: {exc}')
+                    else:
+                        self.fail(str(exc))
 
     def _append_sample(self, now):
         if self.state == 'recording' and self.ready_sample is not None:
@@ -249,15 +284,19 @@ class RecordingSession:
             try:
                 if self._last_sample is not None:
                     if now-self._last_sample > self.options['max_sample_gap_s']:
-                        raise ValueError('Recording sample gap exceeded; refusing fake continuous 30Hz')
+                        if self.backend != 'lerobot':
+                            raise ValueError('Recording sample gap exceeded; refusing fake continuous 30Hz')
+                        self.sample_gaps += 1
                     drift = now-self._first_sample-self.frames/30
-                    if abs(drift) > self.options['max_clock_drift_s']:
+                    if self.backend != 'lerobot' and abs(drift) > self.options['max_clock_drift_s']:
                         raise ValueError('Recording cadence drift exceeded nominal 30Hz')
                 if self._first_sample is None: self._first_sample = now
                 for name, c in cameras.items():
                     if c['sequence'] == self._camera_sequences.get(name): self.repeated_images += 1
                 self._camera_sequences = {n:c['sequence'] for n,c in cameras.items()}
                 detail['repeated_image_count'] = self.repeated_images
+                detail.update(capture_gap_s=None if self._last_sample is None else now-self._last_sample,
+                              skipped_samples=self.skipped_samples, sample_gaps=self.sample_gaps)
                 self.writer.append(state, state.copy(), images, capture_monotonic_s=now, diagnostics=detail)
                 self.frames += 1; self._last_sample = now; self.elapsed = now-self._first_sample
                 if self.frames >= self.record.get('max_episode_frames',18000):
@@ -307,7 +346,12 @@ class RecordingSession:
             self._poll_future()
             self._poll_reset()
             if not self._background_sampling:
-                self._prepare_sample(time.monotonic())
+                frame = None
+                if self.backend == 'lerobot' and not self.button_check and not self.blocks_motion:
+                    # The stop path receives real feedback internally. Read its
+                    # cache, rather than the pre-stop frame or another GET.
+                    frame = self.runtime.robot.get_feedback_snapshot(self._feedback_reader)
+                self._prepare_sample(time.monotonic(), frame=frame)
             for _ in range(16):
                 try: command = self.commands.get_nowait()
                 except queue.Empty: break
@@ -349,6 +393,8 @@ class RecordingSession:
                 self.state = 'recording'; self.frames = 0; self.elapsed = 0.
                 self._first_sample = self._last_sample = None
                 self._camera_sequences = {}; self.repeated_images = 0
+                self.skipped_samples = self.sample_gaps = 0
+                self._missing_since = None
                 if self._input_pause_invalid:
                     self.state = 'failed'
             else:
@@ -479,6 +525,8 @@ class RecordingSession:
                         episode=(self.writer.info['total_episodes']+1 if self.writer else 0),
                         pending=self.pending, health=self.health, error=self.error, hint=self.notice,
                         task=self.task, repeated_images=self.repeated_images,
+                        writer_backend=self.backend, skipped_samples=self.skipped_samples,
+                        sample_gaps=self.sample_gaps,
                         input_pause=getattr(self.runtime, 'input_pause_status', None),
                         effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
 

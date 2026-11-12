@@ -1,6 +1,6 @@
 # 双臂 VR 数据采集：手柄、头显与终端
 
-2026-11-06：软件接入已完成，离线/本机回环测试通过。右手A及方向按键已由操作者现场确认；新版头显可读性、三相机时间差和实机复位仍待现场验证。 本轮未连接设备、未启动训练，也未修改OpenPI。旧普通遥操作命令不启用录制时仍按原方式工作。
+2026-11-12，分支 `kaanh_lerobot_recording`：默认改用原 LeRobot 工具链的 **LeRobotDataset**，每轮遥操作后添加一帧；图片后台写入、保存时编码视频。保留当前双臂、夹爪、右A+左摇杆、头显和m_init入口。已完成离线验证，真机录制仍需操作者验收。下方第8节起为历史记录，与当前默认不一致时以第2、6、13节为准。
 
 ## 1. 先确认右手 A 键（不接机器人）
 
@@ -31,6 +31,7 @@ python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --cfg-options \
+    teleop.record_controller=False \
     teleop.vr_only=False \
     teleop.observe_only=False \
     teleop.operator.allow_motion=True \
@@ -39,7 +40,7 @@ python scripts/teleoperate.py \
 
 这使用双臂配置当前默认运动参数；如需原来CLI中验证过的速度参数，可继续加在 `--cfg-options` 后面。本轮没有替换你的CLI或改变运动速度默认值。
 
-- 任务文字默认 `Pick up the water bottle`，输出目录默认 `datasets/a10_dual_record`。
+- 任务文字默认 `Pick up the water bottle`，输出目录默认 `datasets/a10_dual_lerobot_record`。不要覆盖成旧 `datasets/a10_dual_record`，两个写入后端不混写。
 - 首次目录必须为空。再次向同一数据集录制，在上述命令最后添加：
 
 ```bash
@@ -54,7 +55,7 @@ python scripts/teleoperate.py \
     'capture.task=Pick up the water bottle'
 ```
 
-- 意外退出留下未完成集时，先检查文件，再显式添加 `record.resume=True record.recover=True`。恢复会归档未开始提交的集，或校验并完成已开始的提交；不会把半集自动当成功样本。
+- 意外退出留下未保存集时，先检查文件，再显式添加 `record.resume=True record.recover=True`，归档该集的图像和诊断后开始新集，不自动发布半集。原生保存阶段中断时保留现场、拒绝自动修复；改用新目录继续采集，原目录另行检查。
 - `--preview` 检查配置，不连接设备或写数据。`--observe`、标定和数据录制互斥；`--record-controller` 可以额外记录控制器诊断，但不是训练数据。
 - 相机路径发生变化时先单独运行 `python scripts/a10_devices.py --update`。启动时复用设备匹配工具核对序列号、彩色接口及稳定路径，不自动改配置。运行中掉线不重新绑定另一台设备。
 
@@ -125,18 +126,22 @@ python scripts/teleoperate.py \
 
 ## 6. 采样与错误处理
 
-三路图像后台连续读取，独立采样线程按30Hz读取真实机器人/夹爪缓存并打包，按物理左ID1、右ID0保存。数据格式见[双臂数据交接说明](a10_dual_dataset_handoff.md)。不再次打开串口或创建第二个机器人连接。共享服务通过单独的本机只读缓存通道提供状态；原生停止查询期间也发布实际收到的反馈。
+当前默认与旧 LeRobot 采集循环对齐：**执行本轮遥操作 → 获取实际机器人/夹爪反馈及后台相机图像 → `add_frame()` → 下一轮**。`save_episode()` 完成原生统计、视频和元数据保存；`clear_episode_buffer()` 废弃本集。复用已安装的库，不从旁边的lerobot仓库导入代码。
+
+按物理左ID1、右ID0打包14维数据，三路相机字段不变。`action`继续使用本帧实测关节和夹爪状态的副本，保持已定的双臂训练约定，不能换成UDP末端控制包。数据格式见[双臂数据交接说明](a10_dual_dataset_handoff.md)。机器人和夹爪仍独占设备；录制仅读取真实缓存，不新增控制器WebSocket或串口连接。
 
 默认配置集中在 `capture`：
 
 - 相机/机器人接收年龄不超过0.15秒，夹爪不超过0.20秒。
 - 各设备接收时间差不超过0.15秒。
-- 连续录制采样间隔不超过0.15秒；实际时间与30Hz名义时间累计偏差不超过0.30秒。
+- 原生模式下150ms采样间隔、名义30Hz累计漂移只记录，不因一次慢循环废弃整集。短暂设备反馈过期跳过该次采样，持续超过 `capture.max_missing_feedback_s=1.0` 秒仍失效。畸形数据、真实报警、相机异常和磁盘错误仍失效。
 - 上述为初始阈值，**未做现场时间分布验收**。不要为了消除错误盲目放宽；先查看具体数据。
 
-每台相机有独立帧编号和短缓存；允许在有效期内复用最近画面/反馈，并记录重复画面次数及原始接收时间。卡住后时间过期会使本集失效。主机接收时刻不是相机曝光时间，不宣称硬同步。正常停止等待期间，只要实际反馈和画面仍在更新，独立采样继续；真实设备断流、采样线程长期延误仍按异常处理，不补零、不改旧时间戳或事后伪造连续帧。
+每台相机有独立帧编号和短缓存；允许在有效期内复用最近画面/反馈，并记录重复画面次数及原始接收时间。主机接收时刻不是相机曝光时间，不宣称硬同步。正常停止等待期间不添加帧，确认结束后从最新真实缓存继续采样；不将停止前的旧反馈冒充最新值。
 
-机器人/夹爪故障仍执行原运动保护流程；单独的相机、编码或磁盘错误只使录制失效，不主动发新的运动指令。后台保存期间不接受新一集，防止保存任务堆积。
+每个真实采样只添加一次，不补帧、不补零、不刷新旧反馈时间戳。与原工具链一样，Parquet/视频时间轴为 `frame_index/30`；实际采样耗时、跳过次数、采样空窗保留在 `meta/xlevr_diagnostics/episode_*.jsonl`。**名义30Hz不代表严格实时采样**，训练前应检查空窗和实际帧率；不能把这次调整称为解决了底层延迟。
+
+机器人/夹爪故障仍执行原运动保护流程；单独的相机、编码或磁盘错误只使录制失效，不主动发新的运动指令。输入过期停止并锁定接管，保留VR界面；本集标记中断，可以A+左拨二次确认废弃，恢复输入并重新接管后再开始新集。后台保存期间不接受新一集。保存后等待下一次开始指令，不自动开始；这是保留现有双臂入口的交互约定。
 
 日志位置：现有 `work_dirs/a10/vr/dual_teleop_diagnostics.jsonl` 增加 `dataset_recording`，含阶段、帧数、实际采样频率、异常、确认状态。每集 `meta/xlevr_diagnostics/` 保存机器人/夹爪/相机接收时间、相机帧号、VR输入及下发目标等关联信息。原图像不会塞进JSONL。
 
@@ -256,3 +261,31 @@ P95表示95%的样本不超过该值。每项最多保留最近100000个样本�
 可先关闭控制器高频诊断：从启动命令中删除`--record-controller`，同时在`--cfg-options`后加入`teleop.record_controller=False`。双臂配置当前默认开启该功能，因此只删除命令行标志不够；保留标志则会再次强制开启，覆盖False。`--record-config`和`--record-options`照常保留，三相机、双臂与夹爪训练数据继续采集，本地VR诊断JSONL也继续保存。
 
 这只是绕过可选诊断记录的容量限制，不清理或扩大远端额度。已有控制器日志保持原样；需要再次开启高频诊断时，应另行核对控制器额度配置并归档日志后恢复。此修改只需重开录制程序，不需要重启控制器或清除数据集。
+
+## 13. 原生 LeRobot 采集分支（2026-11-12）
+
+本轮按用户要求在 `kaanh_lerobot_recording` 分支接入，不修改 `kaanh_follower` 的提交。采集核心来自本机旧仓库已提交版本 `674ec05` 的 `lerobot.datasets.lerobot_dataset.LeRobotDataset`，版本0.4.3；构建成非editable wheel安装到fluxvla环境。运行时不使用旧仓库的PYTHONPATH，也不调用旧TCP follower。
+
+本机已装好依赖。重建环境时，在已完成base和A10依赖的环境中安装：
+
+```bash
+python -m pip install --no-deps -r requirements-a10-recording.txt
+```
+
+`--no-deps`用于保留Thor专用PyTorch/torchvision/CUDA构建，不让LeRobot的通用依赖约束替换它们。只调用数据集模块，不导入LeRobot训练、策略或硬件驱动。本次实测使用从上述旧工程提交构建的wheel，SHA256为 `7ded7f2bcc2f1b450673f64af3cd740fbc9bd3ea26955356e15d3919fa4c3c17`；公开同版本安装包仍需做下述离线回归，不以版本号相同代替验证。
+
+首次使用第2节命令，或直接复制本分支 `CLI.txt` 的“数据录制”段。启动应打印 `backend=lerobot`、`sampling=control_loop`，路径为 `datasets/a10_dual_lerobot_record`。成功保存后会有原生 `data/`、`videos/`、`meta/`；图片先写入 `images/` 临时目录，再在保存时编码为原生默认AV1视频。保存可能需要等待，头显保持SAVING，运动控制和m_init不由编码线程执行。
+
+再次启动向该目录续录时添加 `--record-options record.resume=True`；已有 `--record-options` 时把该键放在同一组即可。普通录制中断可再加 `record.recover=True`，保留未保存图片和诊断到 `.recording/recovered-*`。原生保存中断不承诺自动恢复：保留目录供检查，换新目录继续；不能把旧写入器的恢复机制套到原生文件上。
+
+本分支还修复了 `11:53:19 Dual VR left: input_stale` 的遗漏路径：输入读取时尚未过期，但重复序号在后续控制器积分中累计超过250ms，过去直接抛异常退出；现在进入与前置检查相同的停止确认、松手/回中、稳定0.5秒、新按侧键恢复流程。没有放宽输入年龄、停止确认或关节故障保护，也没有修复电机加速度过大报警。
+
+离线验证命令：
+
+```bash
+PYTHONPATH=test python -m unittest test_lerobot_recording test_vr_recording \
+  test_vr_dual_runtime test_vr_dual_hold_session test_vr_reference_speed_limits
+python scripts/validate_a10_dataset.py datasets/a10_dual_lerobot_record
+```
+
+第二条在现场保存并退出采集后运行。离线用例使用合成图像、模拟状态和本机回环，覆盖原生保存/废弃/退出续录、数据字段、视频、原生读取与OpenPI导出，不代表已经完成真实相机/夹爪/机械臂联合录制验收。原有数据、控制器程序、运动默认参数及OpenPI仓库均未修改。

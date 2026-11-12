@@ -125,7 +125,8 @@ def main(argv=None):
         record_cfg = record_config.to_dict()
         runtime.recording = RecordingSession(runtime, record_cfg, button_check=args.check_record_buttons)
         runtime.vr.recording_enabled = True
-        print(f'数据入口：schema={record_cfg["record"]["schema"]}，task={record_cfg["capture"]["task"]}，'
+        print(f'数据入口：backend={runtime.recording.backend}，sampling={runtime.recording.sampling_mode}，'
+              f'schema={record_cfg["record"]["schema"]}，task={record_cfg["capture"]["task"]}，'
               f'目录={record_cfg["record"]["root"]}，右手功能键={runtime.recording.buttons.button}；'
               f'只读按键检查={args.check_record_buttons}')
     if args.preview:

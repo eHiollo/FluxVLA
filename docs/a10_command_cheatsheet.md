@@ -902,6 +902,8 @@ python scripts/export_a10_openpi_dataset.py \
 
 ### 双臂VR采集：右手A功能键（2026-11-06）
 
+2026-11-12：`kaanh_lerobot_recording`分支默认用原生LeRobotDataset；新目录为`datasets/a10_dual_lerobot_record`，不与旧后端数据混写。依赖已装好；初始化新环境时执行`python -m pip install --no-deps -r requirements-a10-recording.txt`，保留Thor的PyTorch构建。
+
 先检查按钮，不连接机器人/夹爪/相机：
 
 ```bash
@@ -918,6 +920,7 @@ python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --cfg-options \
+    teleop.record_controller=False \
     teleop.vr_only=False \
     teleop.observe_only=False \
     teleop.operator.allow_motion=True \
@@ -926,7 +929,7 @@ python scripts/teleoperate.py \
 
 按住右A，左摇杆回中后：右=开始/保存；左=丢弃确认；下=停止采样待处理；上=复位确认。模式内屏蔽左夹爪新输入，松A后回中恢复。复位需先处理本集、释放两手侧键/扳机。备用终端：start/save/discard/reset/stop/status/quit。
 
-首次使用空输出目录；续录在命令末尾追加 `--record-options record.resume=True`，任务和输出目录也可通过 `capture.task` / `record.root` 覆盖。中断恢复、HUD及日志见[采集指南](a10_vr_recording.md)。
+首次使用空输出目录；续录在命令末尾追加 `--record-options record.resume=True`，任务和输出目录也可通过 `capture.task` / `record.root` 覆盖。未保存中断可加`record.recover=True`归档片段；原生保存中断须保留目录检查、改用新目录，不自动修复。输入过期确认停止后保留界面，松手回中、稳定、新按侧键后重新接管；中断集需废弃再开始。中断恢复、HUD及日志见[采集指南](a10_vr_recording.md#13-原生-lerobot-采集分支2026-11-12)。
 
 ### 测VR输入延迟（2026-11-09）
 

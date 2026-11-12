@@ -1458,3 +1458,15 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 11:35:29启动日志确认机器人GET已两次成功，record_start被控制器以ret_code=-1、runtime log capacity limit reached拒绝；高频诊断模块启动失败导致程序退出，不是机器人端口连接失败。没有据此推断磁盘实际已满，也未清理、移动或扩大控制器日志额度。
 - 当前数据录制命令移除--record-controller，并显式加teleop.record_controller=False，覆盖双臂配置中的默认True；仅删标志仍会启用诊断、保留标志又会覆盖False，故两项必须同时调整。训练采集--record-config、三相机/双臂/夹爪与本地VR JSONL保留，运动参数不变。采集指南新增额度满时的处理说明。
 - 只预览修正命令，确认record_controller=False、zx_grippers=True且真实录制配置有效，未打开设备或发运动/使能指令。未访问远端或删除数据；本轮解决可选诊断记录阻挡采集的问题，远端日志归档和额度管理另行处理。CLI只提交本轮两行开关调整，原有个人修改继续保留未提交。
+
+### 2026-11-12：新分支复用原生LeRobot录制核心并补齐输入过期恢复
+
+- 用户授权从当前kaanh_follower建立`kaanh_lerobot_recording`，迁入旧工具链已验证的录制核心。旧lerobot仓库另有未提交工作，本轮只从其已提交HEAD `674ec05`提取源代码构建非editable LeRobot 0.4.3 wheel并以`--no-deps`安装；未修改旧仓库的源文件、未替换Thor PyTorch/torchvision/CUDA。运行代码从site-packages加载，不把相邻仓库加入PYTHONPATH。依赖声明新增requirements-a10-recording.txt，安装与源码来源见采集指南第13节。
+- 新增datasets/lerobot_episode_writer.py薄适配器，直接调用LeRobotDataset.create/add_frame/save_episode/clear_episode_buffer和本地续录；原生负责PNG异步写入、AV1视频、统计、Parquet及v3元数据。适配器仅处理14维字段/身份合同、独占文件锁及真实时间诊断。保存后finalize并在下集原生重开，避免关闭的Parquet再次被覆盖；保存/编码仍在磁盘工作线程，终端/HUD保持可用。原EpisodeWriter保留供历史路径和数据使用。
+- 双臂录制配置默认backend=lerobot、sampling_mode=control_loop，使用独立目录datasets/a10_dual_lerobot_record。每轮遥操作后从真实机器人/夹爪缓存与相机取样并add_frame；正常停止等待期间不补帧，结束后继续。单次测量过期/设备时间差过大跳过并记录，持续缺少数据达到默认1秒则本集失效；原150ms采样间隔与30Hz累计漂移从整集否决改为诊断。名义时间轴仍为frame_index/30，真实capture_monotonic_s、gap、skip、重复图像和有效fps供训练前检查；不宣称严格实时采样，也未消除底层网络/调度延迟。
+- 保持物理左ID1+夹爪、右ID0+夹爪的14维顺序、关节rad、夹爪raw/9000以及action=同帧实测state副本。此处是既定双臂训练约定，不盲目复制旧单臂EE增量action。三相机字段、现有UDP follower、夹爪驱动、右A+左摇杆、HUD、保存后等待下一集和m_init约定保留；未修改OpenPI或控制器。旧数据和recovered片段不动；两个后端不混写。
+- 原生普通录制中断保留图片/诊断，显式recover归档后可重开；保存阶段中断保留现场并拒绝自动修复，不沿用旧自写提交日志的roll-forward承诺。合同不匹配、双写、保存中断、非法数据均有明确拒绝路径。
+- 对照11:53:19日志：已录约86帧、近30Hz，随后重复手柄包年龄从169ms涨到200ms，前置检查后在VRPoseController内部累计过期；该分支过去直接RuntimeError退出。现将后置input_stale/control_gap也转入已存在的确认停止、锁定接管、松手回中、稳定0.5秒、新侧键恢复流程。停止失败、控制器故障仍不能恢复；中断集标记失效，废弃后再录。没有放宽250ms输入年龄或电机故障保护，没有处理此前电机4加速度过大问题。
+- 验证：117项录制/双臂/HUD/复位/速度及恢复回归通过（11.165秒），包含真实原生三集保存与退出续录、清空缓冲、未完成归档、拒绝旧后端混写/第二写者/非法action、原生读取、视频校验与OpenPI导出，及控制器内部重复输入超时的停止/重新接管。所有设备均为模拟或本机回环。
+- 三路640×480随机合成RGB以30Hz录150帧，采样4.967秒、原生保存4.657秒，append耗时99分位1.17ms，最大采样间隔33.53ms，视频和数据校验通过。日志为/tmp/a10_lerobot_throughput.log与对应report.json；这是约5秒合成吞吐，不代表真实USB、长录或机器人运动验收。新配置和只读按钮入口preview有效；未访问远端、未使能或发运动指令。
+- CLI与命令速查、采集指南同步为新目录并关闭可选控制器高频记录。只提交本轮CLI片段；原有CLI个人改动保留未提交。本轮工作一次中文commit，不合并回kaanh_follower。

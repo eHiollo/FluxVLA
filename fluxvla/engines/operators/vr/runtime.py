@@ -1574,6 +1574,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             result.update(hand=context['hand'], reengage_requires_release=False)
             self.last_reference_result = dict(state='running', arms=results, transmitted=False)
             if result['stop_requested']:
+                # The controller also ages duplicate input internally. It may
+                # cross its input budget AFTER the pre-GET freshness check.
+                # Apply the same release/rearm path as an early stale check.
+                if result['fault_reason'] in ('input_stale', 'control_gap'):
+                    raise _VRInputPause(name, result['fault_reason'])
                 raise RuntimeError(f"Dual VR {name}: {result['fault_reason']}")
             target = np.asarray(result['command_pose'])
             self._check_tracking(poses[name], target)

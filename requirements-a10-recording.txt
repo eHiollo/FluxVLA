@@ -1,0 +1,5 @@
+# Install in the existing Thor environment WITHOUT dependency resolution:
+# python -m pip install --no-deps -r requirements-a10-recording.txt
+# requirements-base.txt and requirements-a10.txt supply the recording dependencies.
+# --no-deps preserves the Thor-specific PyTorch/torchvision/CUDA builds.
+lerobot==0.4.3

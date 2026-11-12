@@ -119,6 +119,11 @@ class SessionTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory(); self.root=Path(self.temp.name)/'data'
         cfg=Config.fromfile(str(ROOT/'configs/a10/a10_dual_arm_record.py')).to_dict()
         cfg['record']['root']=str(self.root)
+        # These cases exercise the historical strict writer. Native LeRobot
+        # lifecycle/quality behavior has its own integration tests.
+        cfg['record'].update(backend='legacy')
+        cfg['record'].pop('image_writer_threads', None)
+        cfg['capture']['sampling_mode']='background_30hz'
         cfg['capture'].update(terminal=False, max_clock_drift_s=10., max_sample_gap_s=10.)
         for group in ('record',''):
             cams=cfg['record']['cameras'] if group else cfg['cameras']

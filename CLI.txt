@@ -116,13 +116,13 @@ python scripts/teleoperate.py \
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 
+# 新分支：原生LeRobot采集；首次用新目录。后续同目录续录加 record.resume=True。
+# 意外退出后归档未保存片段再续录：同时加 record.recover=True；保存中断须检查，不能自动修复。
 python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --record-options \
-    record.root=/home/robot/VLA/FluxVLA/datasets/a10_dual_record \
-    record.resume=True \
-    record.recover=True \
+    record.root=/home/robot/VLA/FluxVLA/datasets/a10_dual_lerobot_record \
   --cfg-options \
     teleop.record_controller=False \
     teleop.vr_only=False \

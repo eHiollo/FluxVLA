@@ -21,7 +21,7 @@ import threading
 import time
 import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Mapping
 
@@ -972,11 +972,10 @@ class A10Operator(BaseOperator):
                                           and state.raw['ret_context'].get('robot_msg', {}).get('activate') == 'Enabled'
                                           and not state.has_error
                                           and self._has_model_feedback(state, self._follower_mode))
-                if self.status_poll_interval_s is not None:
-                    with self._status_lock:
-                        if (self._latest_state is None or state.received_monotonic_s
-                                >= self._latest_state.received_monotonic_s):
-                            self._latest_state = state
+                with self._status_lock:
+                    if (self._latest_state is None or state.received_monotonic_s
+                            >= self._latest_state.received_monotonic_s):
+                        self._latest_state = state
                 return state
             except Exception:
                 self._confirmed_active = False
@@ -1029,6 +1028,62 @@ class A10Operator(BaseOperator):
                 self._started_here = True
             return reply
 
+    def open_feedback_reader(self):
+        """Optional local cache channel; never opens another robot socket."""
+        from ..communication.a10_shared_connection import SharedFollowerConnection
+        if not isinstance(self._connection, SharedFollowerConnection):
+            return None  # Direct transport publishes every GET in _latest_state.
+        reader = SharedFollowerConnection(
+            self._connection.host, self.status_ws_port, self._connection.udp_port,
+            self.timeout_s, self._connection.joint_udp_port,
+            shared=self.shared_control, session_id=self._connection.session_id, status_channel=True)
+        reader.connect()
+        try:
+            reader.call('feedback_snapshot')  # Fail clearly if an old relay is still running.
+        except BaseException:
+            reader.close()
+            raise RuntimeError('共享服务尚不支持录制反馈快照；请退出旧控制台和VR窗口，'
+                               '等待5秒，再按原命令启动控制台和录制') from None
+        return reader
+
+    @staticmethod
+    def _feedback_frame(state):
+        return dict(joints=state.actual_joints_rad, tcp_pq_m=state.tcp_pq_m,
+                    follower_active=state.follower_active, follower_mode=state.follower_mode,
+                    has_error=state.has_error, received_monotonic_s=state.received_monotonic_s,
+                    arms={name: dict(ee_id=arm.ee_id, joints=arm.actual_joints_rad,
+                                     target_joints=arm.target_joints_rad, tcp_pq_m=arm.tcp_pq_m,
+                                     received_monotonic_s=arm.received_monotonic_s)
+                          for name, arm in state.arms.items()})
+
+    def get_feedback_snapshot(self, reader=None):
+        """Read measured controller feedback without the motion/transaction lock.
+
+        No USB/camera reads, new robot GET or invented receive timestamp.
+        Callers must check freshness against their own acquisition limits.
+        """
+        if reader is not None:
+            snapshot = reader.call('feedback_snapshot')
+            if not isinstance(snapshot, dict):
+                raise RuntimeError('Waiting for measured robot feedback')
+            stamp = snapshot.get('received_monotonic_s')
+            if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                    or not math.isfinite(stamp) or not 0 <= stamp <= time.monotonic()):
+                raise A10ProtocolError('Invalid measured feedback timestamp')
+            state = self._parse_feedback(snapshot['reply'])
+            state = replace(state, received_monotonic_s=stamp,
+                            arms={name: replace(arm, received_monotonic_s=stamp)
+                                  for name, arm in state.arms.items()})
+        else:
+            with self._status_lock:
+                state = self._latest_state
+            if state is None:
+                raise RuntimeError('Waiting for measured robot feedback')
+        frame = self._feedback_frame(state)
+        if reader is not None:
+            frame['controller_feedback_sequence'] = snapshot['sequence']
+        return frame
+
     def get_frame(self, slop=0.7):
         """Actual robot + optional USB gripper + RGB frames, with receive times.
 
@@ -1044,14 +1099,7 @@ class A10Operator(BaseOperator):
                 state = (self._recent_state() if self.status_poll_interval_s is not None
                          else self.get_state())
                 width = state.gripper_mm
-                frame = dict(joints=state.actual_joints_rad, tcp_pq_m=state.tcp_pq_m,
-                             follower_active=state.follower_active,
-                             follower_mode=state.follower_mode, has_error=state.has_error,
-                             received_monotonic_s=state.received_monotonic_s)
-                frame['arms'] = {name: dict(ee_id=arm.ee_id, joints=arm.actual_joints_rad,
-                                            target_joints=arm.target_joints_rad, tcp_pq_m=arm.tcp_pq_m,
-                                            received_monotonic_s=arm.received_monotonic_s)
-                                 for name, arm in state.arms.items()}
+                frame = self._feedback_frame(state)
                 if self.gripper_operator is not None:
                     grip = self._read_gripper_state()
                     frame['gripper_feedback_stale'] = self._gripper_timed_out

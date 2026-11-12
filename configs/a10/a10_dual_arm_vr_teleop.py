@@ -37,6 +37,8 @@ teleop = dict(
             left=dict(_base_.grippers.left, speed=15),
             right=dict(_base_.grippers.right, speed=15)),
         target_rate_raw_s=3000., deadzone=.1, direction=dict(left=1, right=1),
+        # A missing serial reply must not consume the whole 200ms capture budget.
+        serial_timeout_s=.05,
         max_lead_raw=600., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5),
     pose_calibration_path=None,
     # Onsite .150: physical left arm is ee 1 (operator key 'right'), right is ee 0.

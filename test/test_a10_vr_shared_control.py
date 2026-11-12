@@ -16,7 +16,7 @@ from fluxvla.engines.communication.a10_shared_server import SharedControl, Share
 from fluxvla.engines.operators.a10_operator import A10Operator
 from fluxvla.engines.operators.vr.runtime import build_runtime
 from scripts.a10_control import A10Console, main, parse_command
-from test_a10_operator import FakeController, DUAL_ARMS, dual_motion
+from test_a10_operator import FakeController, DUAL_ARMS, dual_motion, status_reply
 from test_vr_dual_runtime import HandInput, hand
 from test_vr_controller_recording import reply as recording_reply
 
@@ -51,6 +51,45 @@ class SingleClientController(FakeController):
 
 
 class DualSharedIntegrationTest(unittest.TestCase):
+    def test_snapshot_reader_is_fresh_during_stop_and_cannot_own_motion(self):
+        robot = self.client('teleop')
+        reader = robot.open_feedback_reader()
+        self.addCleanup(reader.close)
+        robot.start_follower('cartesian')
+        stopped_after = time.monotonic()+.35
+        def slow_stop_feedback():
+            reply = status_reply(active=self.controller.active, mode=self.controller.mode)
+            reply['ret_context']['motion_msg'] = dual_motion()
+            reply['ret_context']['robot_msg']['motion'] = ('Running' if time.monotonic()<stopped_after else 'Stopped')
+            return reply
+        self.controller.command_replies['get'] = slow_stop_feedback
+        errors = []
+        def stop():
+            try: robot.stop_follower()
+            except Exception as exc: errors.append(exc)
+        worker = threading.Thread(target=stop)
+        worker.start()
+        try:
+            stamps = []
+            for _ in range(7):
+                time.sleep(.03)
+                frame = robot.get_feedback_snapshot(reader)
+                stamps.append(frame['received_monotonic_s'])
+                self.assertEqual(set(frame['arms']), {'left', 'right'})
+                self.assertLess(time.monotonic()-frame['received_monotonic_s'], .15)
+            self.assertTrue(worker.is_alive())  # Reads did not wait for the stop transaction.
+            self.assertGreater(len(set(stamps)), 3)
+            with self.assertRaises(PermissionError): reader.send_command('follower_cart')
+        finally:
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.controller.max_connections, 1)
+        old = robot.get_feedback_snapshot(reader)['received_monotonic_s']
+        time.sleep(.04)
+        self.assertEqual(robot.get_feedback_snapshot(reader)['received_monotonic_s'], old)
+        self.assertFalse(robot.follower_stop_pending)
+
     def setUp(self):
         # Fail immediately if a test accidentally inherits a real controller IP.
         connect = socket.socket.connect

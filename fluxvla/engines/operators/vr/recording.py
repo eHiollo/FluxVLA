@@ -30,7 +30,7 @@ LOG = logging.getLogger(__name__)
 def plain(value):
     if isinstance(value, np.ndarray): return value.tolist()
     if isinstance(value, np.generic): return value.item()
-    if isinstance(value, dict): return {str(k): plain(v) for k, v in value.items()}
+    if isinstance(value, dict): return {str(k): plain(v) for k, v in list(value.items())}
     if isinstance(value, (list, tuple)): return [plain(v) for v in value]
     return value
 
@@ -101,6 +101,11 @@ class RecordingSession:
         self.reset_failed = False; self._closed = False
         self.input_fresh = False
         self._input_pause_invalid = None
+        self._sample_lock = threading.RLock()
+        self._sample_stop = threading.Event()
+        self._sample_thread = None
+        self._background_sampling = False
+        self._feedback_reader = None
 
     @property
     def blocks_motion(self):
@@ -116,6 +121,8 @@ class RecordingSession:
             self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='episode-finalize')
             self.cameras = BufferedCameraOperator(self.cameras_config)
             self.cameras.start()
+            self._feedback_reader = self.runtime.robot.open_feedback_reader()
+            self._start_sampling()
         if self.options.get('terminal', True):
             threading.Thread(target=self._terminal, name='record-input', daemon=True).start()
         LOG.info('录制入口：右手功能键 %s + 左摇杆；start/save/discard/status/reset/stop/quit/help。'
@@ -138,6 +145,10 @@ class RecordingSession:
                 return
 
     def before_step(self, raw, action):
+        with self._sample_lock:
+            return self._before_step(raw, action)
+
+    def _before_step(self, raw, action):
         self.raw = raw
         event = self.buttons.update(raw)
         self.input_fresh = event['fresh'] and not event.get('restarted', False)
@@ -165,11 +176,21 @@ class RecordingSession:
                 channel.submit(0., time.monotonic()+.1)
         return self.blocks_motion or self.button_check
 
-    def _assemble(self, now):
+    def _assemble(self, now, *, frame=None, raw=None):
         if getattr(self.runtime, 'input_pause_status', None) is not None:
             raise ValueError('VR input paused; release controls and re-engage first')
-        if not self.input_fresh: raise ValueError('Waiting for fresh paired VR input')
-        frame = self.runtime.last_frame
+        if raw is None:
+            if not self.input_fresh: raise ValueError('Waiting for fresh paired VR input')
+            raw = self.raw
+        else:
+            if set(raw) != {'left', 'right'}:
+                raise ValueError('Waiting for fresh paired VR input')
+            for hand in raw.values():
+                fresh(hand.get('xlevr.sample_receive_time_s'), now,
+                      self.buttons.max_age_s, 'VR input')
+                if hand.get('xlevr.enabled') and hand.get('xlevr.verification_tracking') is not True:
+                    raise ValueError('VR control requested without tracking')
+        if frame is None: frame = self.runtime.last_frame
         if not frame or frame.get('has_error') is not False:
             raise ValueError('Robot feedback missing/faulted')
         stamp = frame.get('received_monotonic_s')
@@ -185,7 +206,10 @@ class RecordingSession:
         for side, channel in self.runtime._zx_channels.items():
             grip = channel.snapshot(); t = grip.get('feedback_monotonic_s')
             fresh(t, time.monotonic(), self.options['max_gripper_age_s'], side+' gripper')
-            if (grip.get('error') or grip.get('communication_error') or grip.get('alarm_a')
+            # A single missed reply pauses this gripper's writes, but the last
+            # measured position remains usable within the SAME age/skew bounds.
+            # Preserve its timestamp and communication_error in diagnostics.
+            if (grip.get('error') or grip.get('alarm_a')
                     or grip.get('alarm_b') or grip.get('enabled') is not True):
                 raise ValueError(f'{side} gripper not healthy/enabled')
             times.append(t); grippers[side] = grip.get('actual_raw'); grip_details[side] = grip
@@ -200,31 +224,26 @@ class RecordingSession:
             raise ValueError('Camera/robot/gripper receive-time skew exceeded')
         state = pack_dual_state(joints, grippers)
         detail = dict(robot_received_monotonic_s=stamp,
+                      controller_feedback_sequence=frame.get('controller_feedback_sequence'),
                       arm_received_monotonic_s={a['ee_id']:a['received_monotonic_s'] for a in arms.values()},
                       grippers=grip_details,
                       cameras={n:{k:v for k,v in c.items() if k!='image'} for n,c in cameras.items()},
                       control_frame_index=self.runtime._frame_index,
-                      raw_input=self.raw, sdk_tool_command=self.runtime.last_sdk_command,
+                      raw_input=raw, sdk_tool_command=self.runtime.last_sdk_command,
                       reference_control=self.runtime.last_reference_result)
         return state, {n:c['image'] for n,c in cameras.items()}, plain(detail), cameras
 
-    def after_step(self):
-        now = time.monotonic()
-        self._poll_future()
-        self._poll_reset()
+    def _prepare_sample(self, now, *, frame=None, raw=None):
         self.ready_sample = None
         if not self.button_check and not self.blocks_motion:
             try:
-                self.ready_sample = self._assemble(now)
+                self.ready_sample = self._assemble(now, frame=frame, raw=raw)
                 self.health = 'Cameras 3/3 | Arms OK | Grippers OK'
             except Exception as exc:
                 self.health = str(exc)
                 if self.state == 'recording': self.fail(str(exc))
-        for _ in range(16):
-            try: command = self.commands.get_nowait()
-            except queue.Empty: break
-            self.command(command)
-        now = time.monotonic()
+
+    def _append_sample(self, now):
         if self.state == 'recording' and self.ready_sample is not None:
             state, images, detail, cameras = self.ready_sample
             try:
@@ -241,29 +260,87 @@ class RecordingSession:
                 detail['repeated_image_count'] = self.repeated_images
                 self.writer.append(state, state.copy(), images, capture_monotonic_s=now, diagnostics=detail)
                 self.frames += 1; self._last_sample = now; self.elapsed = now-self._first_sample
-                if self.frames >= self.record.get('max_episode_frames',18000): self.command('save')
+                if self.frames >= self.record.get('max_episode_frames',18000):
+                    self.state = 'review'  # One save request; never enqueue it every sampler tick.
+                    self.commands.put_nowait('save')
             except Exception as exc:
                 self.fail(str(exc))
+
+    def _start_sampling(self):
+        self._background_sampling = True
+        self._sample_thread = threading.Thread(target=self._sample_loop,
+                                               name='a10-record-sampler', daemon=True)
+        self._sample_thread.start()
+
+    def _sample_loop(self):
+        next_tick = time.monotonic()
+        while not self._sample_stop.wait(max(0., next_tick-time.monotonic())):
+            try:
+                # Independent cache read: never waits for the motion owner or
+                # issues a second robot GET. Raw VR read has no mapper effects.
+                frame = self.runtime.robot.get_feedback_snapshot(self._feedback_reader)
+                raw = self.runtime.teleoperator.input.get_hand_actions()
+                with self._sample_lock:
+                    if self._sample_stop.is_set(): break
+                    self._prepare_sample(time.monotonic(), frame=frame, raw=raw)
+                    self._append_sample(time.monotonic())
+            except Exception as exc:
+                with self._sample_lock:
+                    self.ready_sample = None; self.health = str(exc)
+                    if self.state == 'recording': self.fail(str(exc))
+            # Never manufacture catch-up frames after a delayed acquisition.
+            next_tick = max(next_tick + 1./self.record['fps'], time.monotonic())
+
+    def _stop_sampling(self):
+        self._sample_stop.set()
+        if self._sample_thread is not None:
+            self._sample_thread.join(2.)
+            if self._sample_thread.is_alive() and self._feedback_reader is not None:
+                self._feedback_reader.interrupt()
+                self._sample_thread.join(2.)
+            if self._sample_thread.is_alive():
+                raise RuntimeError('Recording sampler did not stop')
+            self._sample_thread = None
+
+    def after_step(self):
+        with self._sample_lock:
+            self._poll_future()
+            self._poll_reset()
+            if not self._background_sampling:
+                self._prepare_sample(time.monotonic())
+            for _ in range(16):
+                try: command = self.commands.get_nowait()
+                except queue.Empty: break
+                self.command(command)
+            if not self._background_sampling:
+                self._append_sample(time.monotonic())
+        now = time.monotonic()
         self._hud(now)
 
     def input_paused(self, message):
-        self.pending = None
-        self.ready_sample = None
-        if self.state == 'recording' or (self.future is not None and self.future_operation == 'starting'):
-            self._input_pause_invalid = message
-            self.fail(message)
+        with self._sample_lock:
+            self.pending = None
+            self.ready_sample = None
+            if self.state == 'recording' or (self.future is not None and self.future_operation == 'starting'):
+                self._input_pause_invalid = message
+                self.fail(message)
 
     def fail(self, message):
-        self.error = message
-        if self.state == 'recording': self.state = 'failed'
+        with self._sample_lock:
+            self.error = message
+            if self.state == 'recording': self.state = 'failed'
         LOG.error('录制本集失效（未发布）：%s', message)
 
     def _work(self, operation, fn, *args):
         self.future_operation = operation
-        self.future = self.pool.submit(fn, *args)
         self.state = operation
+        self.future = self.pool.submit(fn, *args)
 
     def _poll_future(self):
+        with self._sample_lock:
+            self._poll_future_locked()
+
+    def _poll_future_locked(self):
         if self.future is None or not self.future.done(): return
         operation = self.future_operation
         try:
@@ -299,6 +376,10 @@ class RecordingSession:
         return True
 
     def command(self, command):
+        with self._sample_lock:
+            return self._command(command)
+
+    def _command(self, command):
         if command == 'quit':
             self.quit_requested = True; self.reset_cancel.set(); return
         if command == 'status':
@@ -392,12 +473,14 @@ class RecordingSession:
         LOG.info('复位结果：%s %s', self.state, self.error)
 
     def status(self):
-        return dict(state=self.state, frames=self.frames, elapsed_s=round(self.elapsed,2),
-                    episode=(self.writer.info['total_episodes']+1 if self.writer else 0),
-                    pending=self.pending, health=self.health, error=self.error, hint=self.notice,
-                    task=self.task, repeated_images=self.repeated_images,
-                    input_pause=getattr(self.runtime, 'input_pause_status', None),
-                    effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
+        with self._sample_lock:
+            return dict(state=self.state, frames=self.frames, elapsed_s=round(self.elapsed,2),
+                        sampling_mode='background_30hz' if self._background_sampling else 'control_loop',
+                        episode=(self.writer.info['total_episodes']+1 if self.writer else 0),
+                        pending=self.pending, health=self.health, error=self.error, hint=self.notice,
+                        task=self.task, repeated_images=self.repeated_images,
+                        input_pause=getattr(self.runtime, 'input_pause_status', None),
+                        effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
 
     def _hud_controls(self):
         """Presentation of the existing command state machine, never executes commands."""
@@ -474,6 +557,7 @@ class RecordingSession:
 
     def before_close(self):
         self._closing.set(); self.reset_cancel.set()
+        self._stop_sampling()
         if self.reset_thread is not None:
             # Cancel without waiting for the robot IO lock; worker performs stop.
             self.runtime.robot.cancel_current_command()
@@ -488,6 +572,7 @@ class RecordingSession:
     def close(self):
         if self._closed: return
         self._closed = True; self._closing.set()
+        self._stop_sampling()
         # Invoked AFTER robot cleanup. Closing never silently saves/discards a
         # partial episode. An already requested save is allowed to finish.
         try:
@@ -499,3 +584,4 @@ class RecordingSession:
                     LOG.warning('本集尚未发布，保留于 %s/.recording/active；下次需检查并显式恢复。', self.record['root'])
         finally:
             if self.cameras: self.cameras.close()
+            if self._feedback_reader: self._feedback_reader.close()

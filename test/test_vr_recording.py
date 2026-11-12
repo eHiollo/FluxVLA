@@ -278,6 +278,130 @@ class SessionTests(unittest.TestCase):
         self.session.command('right'); self.settle(); self.assertEqual(self.session.state,'idle')
         self.robot.stop_follower.assert_not_called()
 
+    def _background_inputs(self, *, frozen_robot=False, untracked_idle=False):
+        stamp = time.monotonic()
+        def measured(_reader):
+            now = stamp if frozen_robot else time.monotonic()
+            return dict(has_error=False, received_monotonic_s=now, arms={
+                'left': dict(ee_id=0, joints=[.2]*6, received_monotonic_s=now),
+                'right': dict(ee_id=1, joints=[.1]*6, received_monotonic_s=now)})
+        self.robot.get_feedback_snapshot.side_effect = measured
+        def controllers():
+            self.seq += 1
+            raw = hands(self.seq)
+            for value in raw.values():
+                value.update({'xlevr.sample_receive_time_s': time.monotonic(),
+                              'xlevr.verification_tracking': not untracked_idle})
+            return raw
+        self.runtime.teleoperator.input.get_hand_actions.side_effect = controllers
+        self.session.options.update(max_sample_gap_s=.15, max_robot_age_s=.15,
+                                    max_gripper_age_s=.20, max_clock_drift_s=.30)
+        self.session._start_sampling()
+        deadline = time.monotonic()+1
+        while self.session.ready_sample is None and time.monotonic() < deadline: time.sleep(.005)
+        self.assertIsNotNone(self.session.ready_sample)
+
+    def test_background_sampler_keeps_real_frames_during_300ms_main_thread_stop(self):
+        self._background_inputs()
+        self.session.command('start'); self.settle()
+        time.sleep(.1)
+        first = self.session.frames
+        # Simulate native stop/query waiting on the control thread. The cached
+        # measured feedback source keeps updating, as it does during relay stop polls.
+        with patch.object(self.robot, 'get_frame', side_effect=AssertionError('New robot GET')):
+            time.sleep(.3)
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreaterEqual(self.session.frames-first, 7)
+        self.session.command('save'); self.settle()
+        self.session._stop_sampling()
+        self.session.close()
+        report = validate_dataset(self.root)
+        self.assertEqual(report['episodes'], 1)
+        self.assertGreater(report['frames'], 8)
+
+    def test_background_sampler_never_refreshes_a_frozen_robot_timestamp(self):
+        self._background_inputs(frozen_robot=True)
+        self.session.command('start'); self.settle()
+        deadline = time.monotonic()+1
+        while self.session.state != 'failed' and time.monotonic() < deadline: time.sleep(.005)
+        self.assertEqual(self.session.state, 'failed')
+        self.assertIn('feedback missing/stale', self.session.error)
+        count = self.session.frames
+        time.sleep(.08)
+        self.assertEqual(self.session.frames, count)
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+
+    def test_resting_untracked_hands_do_not_invalidate_actual_robot_recording(self):
+        self._background_inputs(untracked_idle=True)
+        self.session.command('start'); self.settle()
+        time.sleep(.25)
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreaterEqual(self.session.frames, 6)
+
+    def test_short_gripper_reply_gap_preserves_original_timestamp_and_recovers(self):
+        self._background_inputs()
+        source = self.channels['left'].snapshot.side_effect
+        stamp = time.monotonic()
+        last = source()
+        def delayed_reply():
+            if time.monotonic()-stamp < .1:
+                return dict(last, communication_error='temporary missing reply')
+            return source()
+        self.channels['left'].snapshot.side_effect = delayed_reply
+        self.session.command('start'); self.settle()
+        time.sleep(.18)
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreaterEqual(self.session.frames, 4)
+        self.session.command('save'); self.settle(); self.session.close()
+        files = list((self.root/'meta/xlevr_diagnostics').rglob('*.jsonl'))
+        self.assertEqual(len(files), 1)
+        rows = [json.loads(line) for line in files[0].read_text().splitlines()]
+        stamps = [row['details']['grippers']['left']['feedback_monotonic_s'] for row in rows]
+        self.assertIn(last['feedback_monotonic_s'], stamps)
+        self.assertTrue(any(value > last['feedback_monotonic_s'] for value in stamps))
+
+    def test_shared_native_stop_350ms_records_continuously_and_saves_valid_episode(self):
+        from test_a10_vr_shared_control import DualSharedIntegrationTest
+        from test_a10_operator import status_reply, dual_motion
+        relay = DualSharedIntegrationTest()
+        relay.setUp()
+        self.addCleanup(relay.doCleanups)
+        robot = relay.client('teleop')
+        self.runtime.robot = robot
+        self.session._feedback_reader = robot.open_feedback_reader()
+        robot.start_follower('cartesian')
+        def controllers():
+            self.seq += 1
+            raw = hands(self.seq)
+            for value in raw.values():
+                value.update({'xlevr.sample_receive_time_s': time.monotonic(),
+                              'xlevr.verification_tracking': True})
+            return raw
+        self.runtime.teleoperator.input.get_hand_actions.side_effect = controllers
+        self.session.options.update(max_sample_gap_s=.15, max_robot_age_s=.15,
+                                    max_gripper_age_s=.20, max_clock_drift_s=.30)
+        self.session._start_sampling()
+        deadline = time.monotonic()+1
+        while self.session.ready_sample is None and time.monotonic()<deadline: time.sleep(.005)
+        self.assertIsNotNone(self.session.ready_sample)
+        self.session.command('start'); self.settle()
+        stopped_after = time.monotonic()+.35
+        def feedback():
+            reply = status_reply(active=relay.controller.active, mode=relay.controller.mode)
+            reply['ret_context']['motion_msg'] = dual_motion()
+            reply['ret_context']['robot_msg']['motion'] = 'Running' if time.monotonic()<stopped_after else 'Stopped'
+            return reply
+        relay.controller.command_replies['get'] = feedback
+        robot.stop_follower()  # Real RPC, one robot socket, many in-stop GET replies.
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreaterEqual(self.session.frames, 8)
+        self.assertEqual(relay.controller.max_connections, 1)
+        self.session.command('save'); self.settle()
+        self.session.close()
+        self.assertEqual(validate_dataset(self.root)['episodes'], 1)
+
     def test_input_pause_invalidates_recording_blocks_start_reset_and_keeps_discard_available(self):
         self.start()
         count = self.session.frames

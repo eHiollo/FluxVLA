@@ -34,6 +34,17 @@ def device(side='left'):
     return Config.fromfile(str(ROOT / 'configs/a10/a10_devices.py')).grippers[side].to_dict()
 
 
+class SerialTimeoutConfigTest(unittest.TestCase):
+    def test_capture_timeout_is_configurable_without_changing_motion_settings(self):
+        channel = _ZXGripperChannel('left', device(), dict(options(), serial_timeout_s=.05))
+        self.assertEqual(channel.client.timeout, .05)
+        self.assertEqual(channel.speed, device()['speed'])
+        self.assertEqual(channel.torque, device()['torque'])
+        for bad in (False, 0, .001, .21, float('nan')):
+            with self.subTest(timeout=bad), self.assertRaises(ValueError):
+                _ZXGripperChannel('left', device(), dict(options(), serial_timeout_s=bad))
+
+
 class FakeZX:
     def __init__(self, position=4500):
         self.position = position

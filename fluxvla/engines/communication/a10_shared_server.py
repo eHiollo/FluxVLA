@@ -1,5 +1,6 @@
 """Shared robot transport, serialized commands and exclusive target ownership."""
 import base64
+import copy
 import errno
 import json
 import logging
@@ -50,6 +51,23 @@ class SharedControl:
         self.stopped = set()
         self._speed_restore_allowed = set()
         self.recorder = None
+        self._snapshot_lock = threading.Lock()
+        self._snapshot = None
+        self._snapshot_sequence = 0
+
+    def _remember_state(self, reply):
+        # This is the actual robot receive time. Reading the cache must never
+        # refresh it, including while a native stop holds the transaction lock.
+        stamp = time.monotonic()
+        with self._snapshot_lock:
+            self._snapshot_sequence += 1
+            self._snapshot = dict(reply=copy.deepcopy(reply), received_monotonic_s=stamp,
+                                  sequence=self._snapshot_sequence)
+        return reply
+
+    def feedback_snapshot(self):
+        with self._snapshot_lock:
+            return copy.deepcopy(self._snapshot)
 
     def connect(self):
         try:
@@ -82,7 +100,7 @@ class SharedControl:
                 self.note('target_stream_revoked', session_id=self.owner, reason='transport_reconnect')
             self.control.connect()
         try:
-            return self.control.request('get', status=True)
+            return self._remember_state(self.control.request('get', status=True))
         except (OSError, ConnectionClosed) as exc:
             if self.owner is not None:
                 self.revoked.add(self.owner)
@@ -90,7 +108,7 @@ class SharedControl:
             self.note('idle_transport_reconnect', reason=str(exc))
             self.control.close()  # Isolate old or delayed replies before the GET retry.
             self.control.connect()
-            return self.control.request('get', status=True)
+            return self._remember_state(self.control.request('get', status=True))
 
     def read_state(self):
         with self._status_lock:
@@ -98,7 +116,7 @@ class SharedControl:
                 return self._probe_control()
             if self.status.ws is None:
                 self.status.connect()  # Read-only recovery; never repeats control commands.
-            return self.status.request('get', status=True)
+            return self._remember_state(self.status.request('get', status=True))
 
     def mode_command(self, command, active, *, stop_motion=False):
         if self.control.ws is None:
@@ -112,6 +130,7 @@ class SharedControl:
         while time.monotonic() < deadline:
             reply = self.control.request('get', status=True,
                                          timeout_s=max(.001, deadline - time.monotonic()))
+            self._remember_state(reply)
             state = _controller_state(reply)
             mode = 'Axis' if command.split(maxsplit=1)[0] in ('follower_aj', 'follower_aj_tg') else 'Cart'
             if (state.follower_active is active and (not active or state.follower_mode == mode)
@@ -176,6 +195,9 @@ class SharedControl:
         if role not in ('console', 'inference', 'teleop'):
             raise ValueError('Shared client role must be console, inference or teleop')
         op = request['op']
+        if op == 'feedback_snapshot':
+            # Cache-only read: no robot request, target ownership or control lock.
+            return self.feedback_snapshot()
         if op == 'hello':
             expected = dict(robot_host=self.host, ws_port=(self.status_ws_port if request.get('status_channel') else self.ws_port),
                             udp_port=self.udp_port, joint_udp_port=self.joint_udp_port)
@@ -375,8 +397,8 @@ class _Handler(socketserver.StreamRequestHandler):
                         role = request['role']
                     elif request.get('session_id') != session_id or request.get('role') != role:
                         raise ValueError('Shared session identity cannot change')
-                    if status_channel and request.get('op') != 'hello' and not (request.get('op') == 'request' and request.get('command', '').strip() == 'get'):
-                        raise PermissionError('Status channel only accepts get queries')
+                    if status_channel and request.get('op') not in ('hello', 'feedback_snapshot') and not (request.get('op') == 'request' and request.get('command', '').strip() == 'get'):
+                        raise PermissionError('Status channel only accepts get/feedback_snapshot queries')
                     result = self.server.robot.handle(request)
                     response = dict(result=result)
                 except Exception as exc:

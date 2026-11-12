@@ -34,6 +34,10 @@ class _ZXGripperChannel:
         if not identity.get('serial') or not identity.get('usb_interface'):
             raise ValueError('ZX grippers require USB serial and interface identity')
         self.serial = identity['serial']
+        serial_timeout = options.get('serial_timeout_s', .2)
+        if (isinstance(serial_timeout, bool) or not isinstance(serial_timeout, (int, float))
+                or not math.isfinite(serial_timeout) or not .02 <= serial_timeout <= .2):
+            raise ValueError('ZX serial_timeout_s must be within .02..0.2 seconds')
         self.tolerance = check.get('tolerance_raw', 5)
         if type(self.tolerance) is not int or not 0 <= self.tolerance <= self.high - self.low:
             raise ValueError('Invalid ZX raw position tolerance')
@@ -44,7 +48,7 @@ class _ZXGripperChannel:
         self.direction = options['direction'][side]
         if self.direction not in (-1, 1) or isinstance(self.direction, bool):
             raise ValueError('ZX direction must be 1 or -1 for each hand')
-        self.client = ZXGripper(device['port'], baudrate=device['baudrate'],
+        self.client = ZXGripper(device['port'], baudrate=device['baudrate'], timeout=serial_timeout,
                                 max_position_raw=self.high, expected_usb_serial=self.serial,
                                 expected_usb_interface=identity['usb_interface'])
         self._lock = threading.Lock()
@@ -1147,7 +1151,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             raise ValueError('zx_grippers.enabled must be bool')
         if enabled:
             defaults = dict(target_rate_raw_s=1800., deadzone=.1, direction=dict(left=1, right=1),
-                            max_lead_raw=300., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5)
+                            max_lead_raw=300., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5,
+                            serial_timeout_s=.2)
             if set(config) - set(defaults):
                 raise ValueError('Unknown ZX teleop settings')
             options = dict(defaults, **config)

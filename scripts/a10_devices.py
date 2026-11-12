@@ -268,8 +268,11 @@ def take_snapshots(config, rows, output_dir=None):
         raise FileExistsError('拍照目录已存在，请选择新目录，避免覆盖之前的检查图片')
     # Read all cameras before writing images: failure cannot masquerade as a full capture.
     camera_module = load_operator('camera')
+    # Auto exposure/white balance can still be visibly settling at frame 5.
+    # At the configured 30 fps, 90 frames allow roughly three seconds of settling.
+    warmup_frames = 90
     with camera_module.CameraOperator(config['cameras']) as cameras:
-        for _ in range(5):
+        for _ in range(warmup_frames):
             frames = cameras.get_frame()
     images = {row['name']: Image.fromarray(frames[row['name']], 'RGB') for row in selected}
     folder = (output_dir if output_dir is not None else
@@ -283,7 +286,7 @@ def take_snapshots(config, rows, output_dir=None):
     draw = ImageDraw.Draw(overview)
     manifest = dict(created=datetime.now().astimezone().isoformat(),
                     camera_received_monotonic_s=frames['camera_received_monotonic_s'],
-                    hardware_synchronized=False, cameras={})
+                    hardware_synchronized=False, warmup_frames=warmup_frames, cameras={})
     for i, row in enumerate(selected):
         name = row['name']
         image_path = folder / (name + '.jpg')

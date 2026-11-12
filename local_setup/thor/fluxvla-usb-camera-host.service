@@ -1,0 +1,14 @@
+[Unit]
+Description=Set Thor USB-C camera hub port to USB host mode
+Wants=nv-l4t-usb-device-mode.service
+After=nv-l4t-usb-device-mode.service
+ConditionPathExists=/sys/class/usb_role/usb2-0-role-switch/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fluxvla-usb-camera-host
+RemainAfterExit=yes
+TimeoutStartSec=10
+
+[Install]
+WantedBy=multi-user.target

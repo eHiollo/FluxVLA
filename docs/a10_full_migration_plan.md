@@ -1390,3 +1390,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 显式VR-only、按键检查及观察模式不继承现场默认录制；观察时仍可显式使用--record-controller。配置构造与--preview不建立连接。合成测试显式关闭现场设备默认，避免测试误开USB/实机。
 - CLI/速查/VR文档同步短命令与恢复方式。保留用户CLI中已加入的参数调整注释，提交时只包含本次修改。
 - 验证：ZX驱动/夹爪通道/双臂VR/共享服务/控制台/录制相关9模块共250项通过（51.544秒）；包含默认短命令preview无网络/USB/子进程、CRC读重试上限、写触发ACK丢失不重发、单侧持续坏包不停止机械臂/另一夹爪、有效反馈恢复后回中再控制。日志保存work_dirs/a10/shared_control/offline_gripper_tests.log。未连接或驱动实机。
+
+### 2026-11-12：修复 Thor Type-C 扩展坞相机无法识别
+
+- 现场系统为 Jetson AGX Thor 开发套件、L4T R39.2.1；USB-C 角色节点 `usb2-0-role-switch/role` 原为 `device`，设备模式 USB 网络未连接。左腕 D405（255323070485）和外部 D435i（262923065199）在 USB 列表中缺失，右腕 D405 仍在原 Type-A 扩展坞上正常。
+- 按用户授权临时执行 `none -> host`；GenesysLogic Type-C 扩展坞及上述两台相机立即枚举，均为 5000M。故障确认发生在 USB 主机角色，未通过改相机 ID、帧率或驱动绕过。
+- 使用既有 `scripts/a10_devices.py --update` 备份并仅更新外部相机 by-path 至 `platform-a80aa10000.usb-usb-0:2.4:1.3-video-index0`；序列号、画面旋转、夹爪参数保持现场设置。设备路径文件原已有未提交修改，继续保留为现场未提交配置；用户 CLI 与本地数据压缩包不纳入此次提交。
+- 在 `local_setup/thor` 保存主机角色脚本及 systemd 服务，部署到 `/usr/local/sbin/fluxvla-usb-camera-host`、`/etc/systemd/system/fluxvla-usb-camera-host.service` 并启用。服务在 NVIDIA 原设备模式配置完成后运行，已为 host 时不重新切换；原厂脚本保留，回退步骤写入本机 README。固定该口为 host 后，如需使用该口的 USB 设备模式，须先禁用本服务并切回 device。
+- 验证：脚本语法、systemd 单元检查通过，服务 active/exited 且 enabled，部署内容与仓库文件一致；两夹爪、三相机均匹配。三路 640x480 真实彩色画面读取成功并人工查看拼图，结果位于 `work_dirs/a10/hardware_checks/device_check_20261112_101537_420324/`。本轮只操作 USB-C 数据角色和相机，不发送机器人或夹爪运动指令；未重启，未将短拍照验证扩大为长时间录制验收。

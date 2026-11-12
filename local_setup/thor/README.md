@@ -63,3 +63,33 @@ A10 原生 PI0.5 已用真实数据完成 1 步短训、完整恢复至第 2 步
 
 这是工程流程验证，只有两步训练，预测仍可能超出物理范围，不能用于实机效果验收。Thor 单卡使用已有 `DDPTrainRunner`，EMA 默认关闭；完整恢复使用按需映射 checkpoint 以减少统一内存占用。阶段状态和详细日志见 [A10 迁移开发文档](../../docs/a10_full_migration_plan.md)。本阶段已按用户要求暂停。
 后续更新依赖时，应保留已验证的 PyTorch、FlashAttention 版本，并重新检查实际 GPU 运算。
+
+### Type-C 扩展坞相机识别修复（2026-11-12）
+
+本机 USB-C 角色原为 `device`，插在该口扩展坞上的左腕 D405 和外部 D435i 不会枚举。
+临时按 `none -> host` 切换后，两台均以 USB 3 / 5Gbps 被识别；相机序列号保持不变，
+外部相机的 by-path 连接位置需要运行设备工具更新。
+
+本目录保存开机服务和脚本，部署命令如下；脚本只处理 Thor 的这个角色节点，已是 host 时不重复切换。
+它在 NVIDIA 原设备模式服务之后运行，不修改原厂脚本，不重置整个 USB 控制器。
+
+```bash
+cd /home/robot/VLA/FluxVLA
+sudo install -m 0755 local_setup/thor/usb-camera-host.sh /usr/local/sbin/fluxvla-usb-camera-host
+sudo install -m 0644 local_setup/thor/fluxvla-usb-camera-host.service /etc/systemd/system/fluxvla-usb-camera-host.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now fluxvla-usb-camera-host.service
+python scripts/a10_devices.py --update
+python scripts/a10_devices.py --snapshot
+```
+
+查看：`systemctl status fluxvla-usb-camera-host.service`；角色应为
+`cat /sys/class/usb_role/usb2-0-role-switch/role` 输出 `host`。
+这是固定相机接线的本机设置；若以后需要该口作为 USB 设备连接另一台电脑（如 USB 虚拟网卡），
+先退出相机采集，禁用本服务，再恢复设备角色：
+
+```bash
+sudo systemctl disable --now fluxvla-usb-camera-host.service
+printf '%s\n' none | sudo tee /sys/class/usb_role/usb2-0-role-switch/role
+printf '%s\n' device | sudo tee /sys/class/usb_role/usb2-0-role-switch/role
+```

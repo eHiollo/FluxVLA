@@ -1264,10 +1264,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             health = {side: channel.check_health() for side, channel in self._zx_channels.items()}
         try:
             faults = self._gripper_faults()
-            if faults and self._input_pause is None:
-                side = next(iter(faults))
-                raise _VRInputPause(self.teleoperator.hand_to_arm[side], 'gripper_alarm',
-                                    details=dict(gripper_faults=faults))
+            recording = getattr(self, 'recording', None)
+            if recording is not None:
+                recording.gripper_faulted(faults)
             result = self._step_arms(raw, action)
         except _VRInputPause as exc:
             if not self.execute:
@@ -1293,6 +1292,16 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 faults[side] = state['error']
         return faults
 
+    def prepare_gripper_maintenance(self):
+        """Explicit maintenance only: stop arms, confirm, retain VR input state."""
+        if not self.execute:
+            raise RuntimeError('Gripper maintenance requires a live robot connection')
+        self._stop_reference()
+        self.robot.wait_stopped()  # Fresh confirmation, including before any follower has started.
+        self._dual_time = None
+        self._dual_require_release = True
+        self.teleoperator.reset_reference()
+
 
     @property
     def input_pause_status(self):
@@ -1305,12 +1314,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         ready = status['state'] == 'ready'
         prompt = ('PRESS A SIDE GRIP TO RESUME' if ready else
                   'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING')
-        faults = self._gripper_faults()
-        if faults:
-            prompt = 'GRIPPER ALARM - CHECK DEVICE; TERMINAL: gripper-reset left/right'
         return dict(type='hud', phase='input_ready' if ready else 'input_paused',
-                    hint=(('; '.join(f'GRIPPER {side.upper()}: {error}' for side, error in faults.items())) if faults else
-                          'CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
+                    hint=('CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
                           'VR INPUT STREAM LOST' if status['reason'] == 'vr_stream_stale' else
                           f"{status['hand'].upper()} HAND: {status['reason']}"), error='',
                     pending=None, input_pause=status,
@@ -1408,12 +1413,6 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._checked_frame(require_active=False)  # Controller/transport failures remain fatal.
         if self.execute and self.last_frame.get('follower_active') is not False:
             raise RuntimeError('Follower restarted while VR input is paused')
-        faults = self._gripper_faults()
-        if faults:
-            self._input_pause.update(state='release_required', stable_s=0., gripper_faults=faults)
-            self._pause_stable_since = None
-            self._pause_result()
-            return
         valid, updated = self._pause_input_stable(raw, now)
         grips, neutral = [], True
         for sample in raw.values():

@@ -929,7 +929,7 @@ python scripts/teleoperate.py \
 
 按住右A，左摇杆回中后沿用旧LeRobot阶段：准备时右=开始；录制中右=结束采样并整理场景；整理好再右=保存并自动下一集。左=标记重录，整理好右=废弃并重录本集；下=停止录制，保存有效当前集后退出；上=复位确认。复位须释放两手接管键，过程中不录数据；成功后保持A、回中再向右即可。备用终端：start/save/discard/reset/stop/status/quit。
 
-夹爪故障不直接关闭VR/录制界面；故障夹爪禁发目标，当前集标记中断。现场排除碰擦、两手释放且停止确认后，可在当前VR终端输入`gripper-reset left`或`gripper-reset right`。需要掉使能时先放稳物体，再输入`gripper-disable left/right`（会释放夹持力）。不另开进程争用串口、不自动清报警；持续故障不会自动恢复运动。见[夹爪故障与旧流程说明](a10_vr_recording.md#14-夹爪故障不退出阶段顺序对齐旧工具链)。
+夹爪故障只锁故障夹爪，机械臂、健康夹爪和菜单继续；清除报警后才能录训练数据，录制中发生报警则本集标记中断。排除碰擦、释放两手接管键后，在当前VR终端输入`gripper-reset left/right`；程序为这次人工维护单独停止机械臂并确认。空载时可先`gripper-disable left`，再`gripper-reset left`，这是本次实机验证成功的恢复顺序；disable会释放夹持力，不自动执行。不另开进程争用串口、不屏蔽报警。见[夹爪独立隔离与恢复](a10_vr_recording.md#15-夹爪独立隔离与本次实机报警恢复)。
 
 首次使用空输出目录；续录在命令末尾追加 `--record-options record.resume=True`，任务和输出目录也可通过 `capture.task` / `record.root` 覆盖。未保存中断可加`record.recover=True`归档片段；原生保存中断须保留目录检查、改用新目录，不自动修复。输入过期确认停止后保留界面，松手回中、稳定、新按侧键后重新接管；中断集需废弃再开始。中断恢复、HUD及日志见[采集指南](a10_vr_recording.md#13-原生-lerobot-采集分支2026-11-12)。
 

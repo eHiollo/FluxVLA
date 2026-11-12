@@ -449,7 +449,7 @@ class DualZXRuntimeTest(unittest.TestCase):
         cfg.vr_only = False; cfg.operator.allow_motion = True
         cfg.diagnostics_path = str(Path(self.logs.name) / 'teleop.jsonl')
         cfg.controller_speed_percent = None
-        rt = build_runtime(cfg); rt.robot = DualRobot()
+        rt = build_runtime(cfg); rt.robot = DualRobot(); rt.cartesian_adapter = 'legacy_anchor'
         rt.teleoperator.input = HandInput(); rt.vr = rt.teleoperator.input
         for channel in rt._zx_channels.values(): channel.client = FakeZX()
         rt._zx_channels['right'].client.alarm = True
@@ -458,14 +458,18 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.assertTrue(rt._connected)
         rt.vr.rows = {side: hand(1) for side in ('left', 'right')}
         rt.step()
-        self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
+        self.assertIsNone(rt.input_pause_status)
         self.assertNotIn('start', rt.robot.events)
         self.assertTrue(all(not c.client.targets for c in rt._zx_channels.values()))
+        for seq in range(2, 7):
+            rt.vr.rows = {side: hand(seq, pressed=True) for side in ('left', 'right')}
+            rt.step()
+        self.assertIn('start', rt.robot.events)  # An explicit arm request is independent of the accessory alarm.
         rt.close()
         self.assertTrue(all(not c.client.connected for c in rt._zx_channels.values()))
         self.assertIn('close', rt.robot.events)
 
-    def test_active_follower_is_stopped_when_a_gripper_fails(self):
+    def test_gripper_alarm_only_locks_bad_gripper_arms_and_other_gripper_continue(self):
         rt = self.live()
         rt.vr.rows = {side: hand(1) for side in ('left', 'right')}
         rt.step()
@@ -478,10 +482,8 @@ class DualZXRuntimeTest(unittest.TestCase):
         rt._zx_channels['left'].client.alarm = True
         wait_for(lambda: rt._zx_channels['left'].snapshot()['error'] is not None)
         rt.step()
-        self.assertIn('stop', rt.robot.events)
-        self.assertIn('wait_stopped', rt.robot.events)
-        self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
-        self.assertTrue(rt.input_pause_status['stopped'])
+        self.assertNotIn('stop', rt.robot.events)
+        self.assertIsNone(rt.input_pause_status)
         self.assertTrue(all(c._thread.is_alive() for c in rt._zx_channels.values()))
         starts = rt.robot.events.count('start')
         seq = 20
@@ -489,18 +491,28 @@ class DualZXRuntimeTest(unittest.TestCase):
             nonlocal seq
             seq += 1
             rt.vr.rows = {side: hand(seq, pressed=pressed) for side in ('left', 'right')}
+            if pressed:
+                rt.vr.rows['right']['xlevr.thumbstick'] = {'x': -1.}
             rt.step()
-        for _ in range(3): tick(True)
+        count = len(rt.robot.targets)
+        healthy_targets = len(rt._zx_channels['right'].client.targets)
+        failed_targets = len(rt._zx_channels['left'].client.targets)
+        for _ in range(3): tick(True); time.sleep(.06)
+        self.assertGreater(len(rt.robot.targets), count)
+        self.assertGreater(len(rt._zx_channels['right'].client.targets), healthy_targets)
+        self.assertEqual(len(rt._zx_channels['left'].client.targets), failed_targets)
+        self.assertTrue(rt.robot.follower_stop_pending)
         self.assertEqual(rt.robot.events.count('start'), starts)
         channel = rt._zx_channels['left']
+        old_targets = len(channel.client.targets)
+        tick(False)
+        rt.prepare_gripper_maintenance()
+        self.assertIn('wait_stopped', rt.robot.events)
         channel.request_alarm_action('reset')  # Explicit test operator action, same USB owner.
         wait_for(lambda: channel.snapshot().get('alarm_latched') is False)
-        for _ in range(3): tick(True)
-        self.assertEqual(rt.robot.events.count('start'), starts)
-        for _ in range(24):
-            tick(False); time.sleep(.025)
-        self.assertEqual(rt.input_pause_status['state'], 'ready')
-        for _ in range(3): tick(True)
+        self.assertEqual(len(channel.client.targets), old_targets)
+        tick(False)  # Explicit maintenance stop requires release, without a global fault latch.
+        for _ in range(4): tick(True)
         self.assertEqual(rt.robot.events.count('start'), starts+1)
 
     def test_unexpected_gripper_worker_failure_locks_targets_but_keeps_ui_alive(self):
@@ -511,8 +523,7 @@ class DualZXRuntimeTest(unittest.TestCase):
         rt.vr.rows = {side: hand(1) for side in ('left', 'right')}
         rt.step()
         self.assertTrue(rt._connected)
-        self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
-        self.assertTrue(rt.input_pause_status['stopped'])
+        self.assertIsNone(rt.input_pause_status)
         with self.assertRaisesRegex(RuntimeError, 'worker is not running'):
             channel.request_alarm_action('reset')
 
@@ -561,7 +572,7 @@ class DualZXRuntimeTest(unittest.TestCase):
                 rt.robot.frame_fault = True
             if origin == 'gripper':
                 rt.step()
-                self.assertEqual(rt.input_pause_status['reason'], 'gripper_alarm')
+                self.assertIsNone(rt.input_pause_status)
                 self.assertTrue(all(not c._stop.is_set() for c in rt._zx_channels.values()))
             else:
                 with self.assertRaises(RuntimeError): rt.step()

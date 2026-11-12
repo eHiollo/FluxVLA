@@ -2,7 +2,7 @@
 import time
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_vr_recording import SessionTests
 
@@ -13,6 +13,7 @@ class LeRobotWorkflowTests(SessionTests):
         self.session.workflow = 'lerobot'
         self.session.backend = 'lerobot'
         self.runtime.robot.get_feedback_snapshot.side_effect = lambda _: self.runtime.last_frame
+        self.runtime.prepare_gripper_maintenance = Mock()
         self.runtime.input_pause_hud = lambda: dict(type='hud', phase='input_paused',
             hint='CHECK GRIPPER', controls=dict(prompt='CHECK GRIPPER'))
 
@@ -106,15 +107,39 @@ class LeRobotWorkflowTests(SessionTests):
         self.assertEqual(self.writer.info['total_episodes'], 1)
 
     def test_manual_gripper_reset_requires_release_and_verified_stop(self):
+        self.runtime.prepare_gripper_maintenance.side_effect = TimeoutError('stop unconfirmed')
         self.session.command('gripper-reset left')
         self.channels['left'].request_alarm_action.assert_not_called()
-        self.runtime.input_pause_status = dict(stopped=True, reason='gripper_alarm')
+        self.runtime.prepare_gripper_maintenance.side_effect = None
         self.session.command('gripper-reset left')
         self.channels['left'].request_alarm_action.assert_called_once_with('reset')
         self.channels['left'].request_alarm_action.reset_mock()
         self.update(grip=True)
         self.session.command('gripper-reset left')
         self.channels['left'].request_alarm_action.assert_not_called()
+
+    def test_gripper_alarm_blocks_training_only_and_starts_after_clearing_without_VR_rearm(self):
+        read = self.channels['left'].snapshot.side_effect
+        self.channels['left'].snapshot.side_effect = lambda: dict(read(), error='alarm 0x1000', alarm_b=4096)
+        self.session.gripper_faulted({'left': 'alarm 0x1000'})
+        self.update(); self.session.command('start')
+        self.assertEqual(self.session.state, 'idle')
+        self.assertIsNone(self.session.future)
+        self.assertFalse(self.session.blocks_motion)
+        self.assertEqual(self.writer.info['total_frames'], 0)
+        self.assertIsNone(getattr(self.runtime, 'input_pause_status', None))
+        self.session._hud(time.monotonic())
+        self.assertIn('ARMS AVAILABLE', self.runtime.teleoperator.send_feedback.call_args.args[0]['hint'])
+        self.channels['left'].snapshot.side_effect = read
+        self.session.gripper_faulted({})
+        self.update(); self.start()
+        self.assertEqual(self.session.state, 'recording')
+        self.session.gripper_faulted({'left': 'alarm 0x1000'})
+        self.assertEqual(self.session.state, 'failed')
+        self.assertFalse(self.session.blocks_motion)
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
 
     def test_interrupted_episode_cannot_be_saved_but_can_follow_old_rerecord_flow(self):
         self.start()

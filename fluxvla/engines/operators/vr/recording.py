@@ -60,6 +60,7 @@ class RecordingSession:
         self.events = dict(exit_early=False, rerecord_episode=False, stop_recording=False)
         self._auto_start = False
         self._reset_return_state = 'idle'
+        self.gripper_faults = {}
         self.sampling_mode = self.options.get('sampling_mode', 'background_30hz')
         if self.sampling_mode not in ('control_loop', 'background_30hz'):
             raise ValueError('capture.sampling_mode must be control_loop or background_30hz')
@@ -203,8 +204,6 @@ class RecordingSession:
         if self.blocks_motion:
             for channel in self.runtime._zx_channels.values():
                 channel.check_health()
-                if channel.snapshot().get('error'):
-                    self.reset_cancel.set()
                 channel.submit(0., time.monotonic()+.1)
         return self.blocks_motion or self.button_check
 
@@ -244,7 +243,8 @@ class RecordingSession:
             # Preserve its timestamp and communication_error in diagnostics.
             if (grip.get('error') or grip.get('alarm_a') or grip.get('alarm_b')
                     or (self.backend != 'lerobot' and grip.get('enabled') is not True)):
-                raise ValueError(f'{side} gripper not healthy/enabled')
+                raise ValueError(f'{side} gripper not healthy/enabled: '
+                                 f'{grip.get("error") or "check alarms/enable"}; clear before recording')
             times.append(t); grippers[side] = grip.get('actual_raw'); grip_details[side] = grip
         cameras = self.cameras.snapshot(stamp)
         for name, sample in cameras.items():
@@ -388,6 +388,19 @@ class RecordingSession:
                 self._input_pause_invalid = message
                 self.fail(message)
 
+    def gripper_faulted(self, faults):
+        """Accessories gate training samples, never arm/VR control ownership."""
+        with self._sample_lock:
+            self.gripper_faults = dict(faults)
+            if not faults:
+                return
+            message = '; '.join(f'{side} gripper: {error}' for side, error in faults.items())
+            if self.state == 'recording' or (
+                    self.future is not None and self.future_operation == 'starting'
+                    and not self._input_pause_invalid):
+                self._input_pause_invalid = message
+                self.fail('Training episode interrupted: ' + message)
+
     def fail(self, message):
         with self._sample_lock:
             self.error = message
@@ -484,20 +497,20 @@ class RecordingSession:
             self.notice = 'Disk operation in progress; wait'; return
         if command.split()[0] in ('gripper-reset', 'gripper-disable'):
             parts = command.split()
-            pause = getattr(self.runtime, 'input_pause_status', None)
             if (len(parts) != 2 or parts[1] not in ('left', 'right')
-                    or not self._released() or not pause or not pause.get('stopped')):
-                self.notice = 'Release both grips; confirmed stop required. Use gripper-reset left/right'; return
+                    or not self._released()):
+                self.notice = 'Release BOTH grips/triggers. Use gripper-reset left/right'; return
             action = 'reset' if parts[0] == 'gripper-reset' else 'disable'
             if action == 'disable':
                 LOG.warning('人工掉使能将释放%s夹爪夹持力；此指令不用于自动故障恢复。', parts[1])
             try:
+                self.runtime.prepare_gripper_maintenance()
                 self.runtime._zx_channels[parts[1]].request_alarm_action(action)
             except Exception as exc:
                 self.notice = f'Gripper action unavailable: {exc}; check device or restart session'
                 LOG.warning('%s', self.notice)
                 return
-            self.notice = f'{parts[1]} gripper {action} requested; check feedback, then rearm'
+            self.notice = f'{parts[1]} gripper {action} requested; check feedback and center stick'
             LOG.info('人工夹爪操作：%s', self.notice)
             return
         if self.workflow == 'lerobot':
@@ -670,6 +683,7 @@ class RecordingSession:
                         task=self.task, repeated_images=self.repeated_images,
                         writer_backend=self.backend, skipped_samples=self.skipped_samples,
                         workflow=self.workflow, recording_events=dict(self.events),
+                        gripper_faults=dict(self.gripper_faults),
                         sample_gaps=self.sample_gaps,
                         input_pause=getattr(self.runtime, 'input_pause_status', None),
                         effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)
@@ -753,6 +767,10 @@ class RecordingSession:
                 status['hint'] += '\nWAIT FOR DEVICES: ' + self.health
         if self.button_check:
             status['hint'] = self.notice or 'Button check only - no device motion'
+        elif self.gripper_faults:
+            warning = '; '.join(f'{side.upper()} GRIPPER LOCKED: {error}'
+                                for side, error in self.gripper_faults.items())
+            status['hint'] = warning + '\nARMS AVAILABLE; CLEAR ALARM BEFORE RECORDING\n' + status['hint']
         if getattr(self.runtime, 'input_pause_status', None) is not None:
             pause = self.runtime.input_pause_hud()
             status.update({key: value for key, value in pause.items() if key != 'controls'})

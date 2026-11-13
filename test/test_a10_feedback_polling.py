@@ -2,6 +2,7 @@
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from test_a10_operator import FakeController, status_reply
 from fluxvla.engines.operators.a10_operator import A10Operator, A10ControllerError
@@ -88,7 +89,7 @@ class FeedbackPollingTest(unittest.TestCase):
             return reply
         self.fake.command_replies['get'] = fault
         deadline = time.monotonic() + .4
-        while self.service._poll_error is None and time.monotonic() < deadline:
+        while self.client._feedback_cache[1] is None and time.monotonic() < deadline:
             time.sleep(.005)
         with self.assertRaises(A10ControllerError):
             self.client.get_cached_frame()
@@ -138,6 +139,134 @@ class FeedbackPollingTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.client.start_feedback_polling(rate)
         self.assertIsNone(self.service._poll_thread)
+
+    def test_memory_read_does_not_wait_for_local_rpc_or_parse_and_is_isolated(self):
+        self.client.start_feedback_polling(30)
+        reader = self.client._feedback_reader
+        first = self.client.get_cached_frame()
+        entered, release = threading.Event(), threading.Event()
+        original = reader.call
+        def delayed(*args, **kwargs):
+            entered.set()
+            release.wait(.5)
+            return original(*args, **kwargs)
+        try:
+            with patch.object(reader, 'call', delayed):
+                self.assertTrue(entered.wait(.2))
+                first = self.client.get_cached_frame()
+                with patch.object(self.client, '_parse_feedback', side_effect=AssertionError('foreground parse')):
+                    started = time.monotonic()
+                    rows = [self.client.get_cached_frame() for _ in range(90)]
+                    self.assertLess(time.monotonic()-started, .1)
+                    self.assertEqual({r['received_monotonic_s'] for r in rows}, {first['received_monotonic_s']})
+                    self.assertEqual(rows[-1]['motion'], 'Stopped')
+                    self.assertEqual(rows[-1]['activation'], 'Enabled')
+                    rows[-1]['joints'][0] = 999.
+                    self.assertNotEqual(self.client.get_cached_frame()['joints'][0], 999.)
+        finally:
+            release.set()
+
+    def test_duplicate_sequence_parses_once_and_cannot_refresh_time(self):
+        snapshot = self.service.feedback_snapshot()
+        with patch.object(self.client, '_parse_feedback', wraps=self.client._parse_feedback) as parse:
+            first = self.client._frame_from_feedback_snapshot(snapshot)
+            for _ in range(10):
+                second = self.client._frame_from_feedback_snapshot(snapshot, previous_frame=first)
+            self.assertEqual(parse.call_count, 1)
+        self.assertEqual(first['received_monotonic_s'], second['received_monotonic_s'])
+        altered = dict(snapshot, received_monotonic_s=snapshot['received_monotonic_s']-.01)
+        with self.assertRaisesRegex(ValueError, 'different timestamp'):
+            self.client._frame_from_feedback_snapshot(altered, previous_frame=first)
+
+    def test_stop_interrupts_local_snapshot_wait_and_repeated_start_reuses_worker(self):
+        self.client.start_feedback_polling(30)
+        worker = self.client._feedback_worker
+        self.client.start_feedback_polling(60)
+        self.assertIs(self.client._feedback_worker, worker)
+        entered, release = threading.Event(), threading.Event()
+        original = self.service.feedback_snapshot
+        def delayed():
+            entered.set()
+            release.wait(1.)
+            return original()
+        try:
+            with patch.object(self.service, 'feedback_snapshot', delayed):
+                self.assertTrue(entered.wait(.2))
+                started = time.monotonic()
+                self.client.stop_feedback_polling()
+                self.assertLess(time.monotonic()-started, .25)
+                self.assertFalse(worker.is_alive())
+                self.assertIsNone(self.client._feedback_reader)
+                self.assertFalse(self.service._poll_rates)
+        finally:
+            release.set()
+        self.client.start_feedback_polling(30)
+        self.assertIsNot(self.client._feedback_worker, worker)
+        self.assertIsNone(self.client._feedback_cache[1])
+
+    def test_worker_error_is_reported_when_consumed_and_never_auto_reconnects(self):
+        self.client.start_feedback_polling(30)
+        reader = self.client._feedback_reader
+        failure = dict(command='feedback_snapshot', failed_wall_ns=time.time_ns(), error='test timeout')
+        def fail(*args, **kwargs):
+            reader.last_request_failure = failure
+            raise TimeoutError('test timeout')
+        with patch.object(reader, 'call', side_effect=fail) as call:
+            self.client._feedback_worker.join(.01)  # Worker is normally still polling.
+            deadline = time.monotonic()+.25
+            while self.client._feedback_cache[1] is None and time.monotonic()<deadline:
+                time.sleep(.005)
+            consumed = time.time_ns()
+            with self.assertRaisesRegex(TimeoutError, 'test timeout'):
+                self.client.get_cached_frame()
+            self.assertGreaterEqual(self.client.last_communication_failure['failed_wall_ns'], consumed)
+            self.assertEqual(self.client.last_communication_failure['background_failed_wall_ns'],
+                             failure['failed_wall_ns'])
+            self.client._feedback_worker.join(.2)
+            self.assertFalse(self.client._feedback_worker.is_alive())
+            self.assertEqual(call.call_count, 1)
+
+    def test_sync_start_and_stop_confirmations_supersede_old_background_reply(self):
+        self.client.start_feedback_polling(30)
+        entered, release = threading.Event(), threading.Event()
+        reader = self.client._feedback_reader
+        original = reader.call
+        old_snapshot = self.service.feedback_snapshot()
+        def delayed(*args, **kwargs):
+            entered.set()
+            release.wait(.8)
+            return old_snapshot
+        try:
+            with patch.object(reader, 'call', delayed):
+                self.assertTrue(entered.wait(.2))
+                self.client.start_follower()
+                active = self.client.get_cached_frame()
+                self.assertTrue(active['follower_active'])
+                self.assertEqual(active['follower_mode'], 'Axis')
+                self.assertIsNone(active['controller_feedback_sequence'])
+                self.assertEqual(active['feedback_source'], 'synchronous_confirmation')
+                release.set()
+                time.sleep(.05)  # Old inactive replies arrive after start confirmation.
+                self.assertTrue(self.client.get_cached_frame()['follower_active'])
+                self.assertGreaterEqual(self.client.get_cached_frame()['received_monotonic_s'],
+                                        active['received_monotonic_s'])
+                self.client.stop_follower()
+                stopped = self.client.get_cached_frame()
+                self.assertFalse(stopped['follower_active'])
+                self.assertEqual(stopped['motion'], 'Stopped')
+        finally:
+            release.set()
+
+    def test_sync_confirmation_does_not_hide_a_known_worker_error(self):
+        self.client.start_feedback_polling(30)
+        old = self.client.get_cached_frame()
+        self.client._feedback_worker_stop.set()
+        self.client._feedback_worker.join(.2)
+        error = TimeoutError('known background failure')
+        self.client._feedback_cache = (old, error, None)
+        self.client.get_state()
+        with self.assertRaisesRegex(TimeoutError, 'known background failure'):
+            self.client.get_cached_frame()
 
 
 if __name__ == '__main__':

@@ -544,8 +544,10 @@ class DualRuntimeTest(unittest.TestCase):
         self.move()
         count = len(self.robot.targets)
         self.robot.stale_arm = True
-        with self.assertRaisesRegex(RuntimeError, 'stale for right'):
-            self.tick()
+        self.tick()
+        self.assertEqual(self.runtime.input_pause_status['reason'], 'feedback_stale')
+        self.assertIn('stale for right', self.runtime.input_pause_status['feedback_error'])
+        self.assertTrue(self.runtime._connected)
         self.assertEqual(len(self.robot.targets), count)
         self.assertEqual(self.robot.events.count('stop'), 1)
 

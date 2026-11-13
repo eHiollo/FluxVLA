@@ -273,6 +273,10 @@ class _ZXGripperChannel:
             self._ready.set()
 
 
+class _VRFeedbackStale(RuntimeError):
+    """Measured robot feedback aged out; not a controller fault or bad packet."""
+
+
 class _VRInputPause(RuntimeError):
     """Only known input/timing guards may enter recoverable pause."""
     def __init__(self, arm, reason, *, details=None):
@@ -1200,6 +1204,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self.input_recovery_stable_s = input_recovery_stable_s
         self._input_pause = None
         self._pause_samples = {}
+        self._pause_feedback_stamp = None
+        self._feedback_resume_after_s = None
         self._pause_stable_since = None
         self._pause_hud_signature = None
         self._zx_channels = {}
@@ -1288,6 +1294,12 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             if recording is not None:
                 recording.gripper_faulted(faults)
             result = self._step_arms(raw, action)
+        except _VRFeedbackStale as exc:
+            if not self.execute:
+                raise
+            self._enter_input_pause(_VRInputPause(self.arm_names[0], 'feedback_stale',
+                details=dict(feedback_error=str(exc))))
+            result = action
         except _VRInputPause as exc:
             if not self.execute:
                 raise  # Read-only observation cannot promise a confirmed physical stop.
@@ -1332,10 +1344,18 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if status is None:
             return None
         ready = status['state'] == 'ready'
+        feedback_wait = status['state'] == 'feedback_wait'
+        stop_failed = status['state'] == 'stop_unconfirmed'
         prompt = ('PRESS A SIDE GRIP TO RESUME' if ready else
                   'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING')
+        if stop_failed:
+            prompt = 'check controller; restart session'
         return dict(type='hud', phase='input_ready' if ready else 'input_paused',
-                    hint=('CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
+                    hint=('stop unconfirmed' if stop_failed else
+                          'robot feedback delayed' if feedback_wait else
+                          'robot feedback restored; release grips' if status['reason'] == 'feedback_stale' and not ready else
+                          'robot ready; press side grip' if status['reason'] == 'feedback_stale' else
+                          'CONTROL LOOP DELAY - RELEASE GRIPS AND REARM' if status['reason'] == 'control_gap' else
                           'VR INPUT STREAM LOST' if status['reason'] == 'vr_stream_stale' else
                           f"{status['hand'].upper()} HAND: {status['reason']}"), error='',
                     pending=None, input_pause=status,
@@ -1363,6 +1383,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._input_pause = None
         self._pause_stable_since = None
         self._pause_samples.clear()
+        self._pause_feedback_stamp = None
+        self._feedback_resume_after_s = None
         self._dual_time = None
         self._dual_require_release = True
         self.teleoperator.reset_reference()
@@ -1393,6 +1415,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._input_pause.update(error.details)
         self._pause_samples.clear()
         self._pause_stable_since = None
+        self._pause_feedback_stamp = None
+        self._feedback_resume_after_s = None
         self._pause_hud_signature = None
         recording = getattr(self, 'recording', None)
         if recording is not None:
@@ -1403,14 +1427,26 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 # Also confirm an idle/pre-start fault; no session-owned follower may exist yet.
                 if not self.last_stop_status or self.last_stop_status.get('reported_stopped') is not True:
                     self.robot.wait_stopped()
-                self._checked_frame(require_active=False)
-                if self.last_frame.get('follower_active') is not False:
-                    raise RuntimeError('Follower is still active during input pause')
-            except BaseException:
+                # Stop confirmation queries fresh state. The memory cache may
+                # still contain a pre-stop active frame; wait for its next update.
+                self._feedback_resume_after_s = time.monotonic()
+            except Exception as exc:
                 self._dual_stop_failed = True
+                if error.reason == 'feedback_stale':
+                    self._input_pause.update(state='stop_unconfirmed', stopped=False,
+                                             stop_error=str(exc))
+                    self._dual_time = None
+                    self._dual_require_release = True
+                    self.teleoperator.reset_reference()
+                    self._pause_result()
+                    logging.getLogger(__name__).error(
+                        '反馈过期，停止未确认；保留头显并锁定本会话，请现场确认：%s', exc)
+                    return
                 raise
         self._input_pause.update({key: diagnostics.get(key) for key in ('vr_input_speed_m_s', 'sample_dt_s')})
         self._input_pause['stopped'] = True
+        if error.reason == 'feedback_stale':
+            self._input_pause['state'] = 'feedback_wait'
         self._dual_time = None
         self._dual_require_release = True
         self.teleoperator.reset_reference()
@@ -1458,10 +1494,37 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         return valid, updated
 
     def _step_input_pause(self, raw):
+        if self._dual_stop_failed:
+            if self._input_pause['reason'] != 'feedback_stale':
+                raise RuntimeError('Dual follower stop is unconfirmed; do not restart this session')
+            self._input_pause.update(state='stop_unconfirmed', stable_s=0.)
+            self._pause_result()
+            return
+        try:
+            self._checked_frame(require_active=False)  # Real faults retain their existing handling.
+        except _VRFeedbackStale:
+            self._wait_for_feedback()
+            return
         now = time.monotonic()
-        self._checked_frame(require_active=False)  # Controller/transport failures remain fatal.
+        stamp = self.last_frame['received_monotonic_s']
+        if self._feedback_resume_after_s is not None and stamp <= self._feedback_resume_after_s:
+            self._wait_for_feedback()
+            return
+        feedback_recovery = self._input_pause['reason'] == 'feedback_stale'
+        if feedback_recovery and (self.last_frame.get('follower_active') is not False
+                or self.last_frame.get('motion') != 'Stopped'
+                or self.last_frame.get('activation') != 'Enabled'):
+            self._wait_for_feedback()
+            return
         if self.execute and self.last_frame.get('follower_active') is not False:
             raise RuntimeError('Follower restarted while VR input is paused')
+        feedback_updated = self._pause_feedback_stamp is None or stamp > self._pause_feedback_stamp
+        if self._pause_feedback_stamp is not None and (
+                stamp < self._pause_feedback_stamp or stamp-self._pause_feedback_stamp > self.max_feedback_age_s):
+            self._pause_stable_since = None
+            self._input_pause.update(state='stabilizing', stable_s=0.)
+        if feedback_updated:
+            self._pause_feedback_stamp = stamp
         valid, updated = self._pause_input_stable(raw, now)
         grips, neutral = [], True
         for sample in raw.values():
@@ -1475,6 +1538,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             self._input_pause = None
             self._pause_stable_since = None
             self._pause_samples.clear()
+            self._pause_feedback_stamp = None
+            self._feedback_resume_after_s = None
             self._dual_require_release = False
             self.teleoperator.reset_reference()  # Next sample uses current hand + actual robot anchors.
             self.last_reference_result = dict(state='input_resumed', arms={}, transmitted=False)
@@ -1488,7 +1553,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if not valid or not neutral or any(grips):
             self._pause_stable_since = None
             self._input_pause.update(state='release_required', stable_s=0.)
-        elif updated:
+        elif updated and (not feedback_recovery or feedback_updated):
             if self._pause_stable_since is None:
                 self._pause_stable_since = now
             elapsed = now-self._pause_stable_since
@@ -1496,6 +1561,12 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                                      stable_s=round(elapsed, 3))
         self._pause_result()
 
+    def _wait_for_feedback(self):
+        """No GET/stop retries or target replay while a stopped session is locked."""
+        self._pause_stable_since = None
+        self._pause_feedback_stamp = None
+        self._input_pause.update(state='feedback_wait', stable_s=0.)
+        self._pause_result()
 
     def _checked_frame(self, *, require_active, force_refresh=False):
         from .control import pose
@@ -1507,9 +1578,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if not isinstance(frame, dict) or frame.get('has_error') is not False:
             raise RuntimeError('Dual A10 feedback is missing or reports a fault')
         stamp = frame.get('received_monotonic_s')
-        if (not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
-                or not 0 <= now - stamp <= self.max_feedback_age_s):
-            raise RuntimeError('Dual A10 feedback is stale')
+        if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                or not math.isfinite(stamp) or not 0 <= stamp <= now):
+            raise RuntimeError('Dual A10 feedback timestamp is invalid')
+        if now - stamp > self.max_feedback_age_s:
+            raise _VRFeedbackStale('Dual A10 feedback is stale')
         if require_active and (frame.get('follower_active') is not True
                                or frame.get('follower_mode') != 'Cart'):
             raise RuntimeError('Dual Cartesian follower is not confirmed active')
@@ -1519,9 +1592,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         poses = {}
         for name in self.arm_names:
             arm_stamp = arms[name].get('received_monotonic_s')
-            if (not isinstance(arm_stamp, (int, float)) or not math.isfinite(arm_stamp)
-                    or not 0 <= now - arm_stamp <= self.max_feedback_age_s):
-                raise RuntimeError(f'Dual A10 feedback is stale for {name}')
+            if (isinstance(arm_stamp, bool) or not isinstance(arm_stamp, (int, float))
+                    or not math.isfinite(arm_stamp) or not 0 <= arm_stamp <= now):
+                raise RuntimeError(f'Dual A10 feedback timestamp is invalid for {name}')
+            if now - arm_stamp > self.max_feedback_age_s:
+                raise _VRFeedbackStale(f'Dual A10 feedback is stale for {name}')
             poses[name] = pose(arms[name].get('tcp_pq_m'))
         return poses
 
@@ -1586,13 +1661,13 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     def _step_arms(self, raw, action):
         if not self.execute and not self.observe_only:
             return action  # VR-only maps both hands, never fabricates feedback.
+        if self._input_pause is not None:
+            self._step_input_pause(raw)
+            return action
         if self._dual_stop_failed:
             raise RuntimeError('Dual follower stop is unconfirmed; do not restart this session')
         if set(raw) != {'left', 'right'} or set(action) != set(self.arm_names):
             raise ValueError('Dual VR requires complete hand input and arm actions')
-        if self._input_pause is not None:
-            self._step_input_pause(raw)
-            return action
         if self._dual_require_release:
             # Latched after a shared stop/fault: no automatic restart with held keys.
             released = all(not raw[c['hand']].get('xlevr.enabled') and
@@ -1698,6 +1773,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 # Apply the same release/rearm path as an early stale check.
                 if result['fault_reason'] in ('input_stale', 'control_gap'):
                     raise _VRInputPause(name, result['fault_reason'])
+                if result['fault_reason'] == 'feedback_stale':
+                    raise _VRFeedbackStale(f'Dual A10 feedback is stale for {name}')
                 raise RuntimeError(f"Dual VR {name}: {result['fault_reason']}")
             target = np.asarray(result['command_pose'])
             self._check_tracking(poses[name], target)

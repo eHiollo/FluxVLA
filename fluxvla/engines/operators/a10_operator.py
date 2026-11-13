@@ -11,6 +11,7 @@ use the opt-in SDK tool adapter for base-frame planned pose trajectories.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -709,6 +710,13 @@ class A10Operator(BaseOperator):
         self._status_stop = threading.Event()
         self._feedback_reader = None
         self._feedback_failure = None
+        self._feedback_worker = None
+        self._feedback_worker_stop = threading.Event()
+        self._feedback_cache_hz = 30.
+        self._feedback_publish_lock = threading.Lock()
+        # Published atomically after all RPC/JSON/state work is complete. The
+        # worker never mutates a published frame; readers need no IO/worker lock.
+        self._feedback_cache = (None, None, None)  # frame, error, failure details
         self._latest_state = None
         self._status_error = None
         self._status_lock = threading.Lock()
@@ -987,6 +995,15 @@ class A10Operator(BaseOperator):
                     if (self._latest_state is None or state.received_monotonic_s
                             >= self._latest_state.received_monotonic_s):
                         self._latest_state = state
+                if self._feedback_reader is not None:
+                    # A command's fresh confirmation must take effect immediately,
+                    # before the next background cache tick (e.g. inactive -> Cart).
+                    frame = copy.deepcopy(self._feedback_frame(state))
+                    frame['controller_feedback_sequence'] = None
+                    frame['feedback_source'] = 'synchronous_confirmation'
+                    previous = self._feedback_cache[0]
+                    frame['feedback_polling'] = {} if previous is None else previous.get('feedback_polling', {})
+                    self._publish_feedback_frame(frame)
                 return state
             except Exception:
                 self._confirmed_active = False
@@ -1042,7 +1059,8 @@ class A10Operator(BaseOperator):
     def start_feedback_polling(self, hz=30.):
         """Subscribe to the shared service's single controller GET worker.
 
-        The independent local cache reader never sends GET or takes _io_lock.
+        A separate local worker reads/parses shared snapshots at this rate.
+        get_cached_frame() is memory-only, even while the local RPC is delayed.
         Explicit command confirmations continue to use fresh synchronous GET.
         """
         if (isinstance(hz, bool) or not isinstance(hz, (int, float))
@@ -1055,33 +1073,105 @@ class A10Operator(BaseOperator):
             raise ValueError('Do not combine independent feedback polling with status_poll_interval_s')
         if not self.is_connected:
             raise ConnectionError("A10 operator is not connected")
+        if self._feedback_reader is not None and (
+                self._feedback_worker is None or not self._feedback_worker.is_alive()):
+            raise RuntimeError('Feedback worker stopped; stop polling and reconnect explicitly')
         metrics = self._connection.call('feedback_poll', hz=hz)
+        self._feedback_cache_hz = float(hz)
         if self._feedback_reader is None:
             try:
                 self._feedback_reader = self.open_feedback_reader()
                 self._feedback_failure = None
+                # Setup may block. No 90 Hz control loop is running yet.
+                frame = self.get_feedback_snapshot(self._feedback_reader)
+                self._feedback_cache = (frame, None, None)
+                self._feedback_worker_stop.clear()
+                self._feedback_worker = threading.Thread(target=self._poll_feedback_cache,
+                    name='a10-local-feedback-cache', daemon=True)
+                self._feedback_worker.start()
             except BaseException:
-                self._connection.call('feedback_poll', hz=None)
+                if self._feedback_reader is None:
+                    self._connection.call('feedback_poll', hz=None)
+                else:
+                    self.stop_feedback_polling()
                 raise
         return metrics
 
+    def _poll_feedback_cache(self):
+        reader = self._feedback_reader
+        while not self._feedback_worker_stop.is_set():
+            started = time.monotonic()
+            try:
+                snapshot = reader.call('feedback_snapshot')
+                previous = self._feedback_cache[0]
+                frame = self._frame_from_feedback_snapshot(snapshot, previous_frame=previous)
+                if self._feedback_worker_stop.is_set():
+                    break
+                self._publish_feedback_frame(frame)
+            except Exception as exc:
+                if not self._feedback_worker_stop.is_set():
+                    failure = getattr(reader, 'last_request_failure', None)
+                    with self._feedback_publish_lock:
+                        self._feedback_cache = (self._feedback_cache[0], exc, failure)
+                return  # No automatic reconnect, command retry or error hiding.
+            self._feedback_worker_stop.wait(max(
+                0., 1. / self._feedback_cache_hz - (time.monotonic() - started)))
+
+    def _publish_feedback_frame(self, frame):
+        # Tiny publication-only critical section: no parsing, copying or IO.
+        # An old in-flight RPC cannot undo a newer synchronous mode confirmation.
+        with self._feedback_publish_lock:
+            previous, error, _ = self._feedback_cache
+            if error is None and (previous is None or
+                    frame['received_monotonic_s'] >= previous['received_monotonic_s']):
+                self._feedback_cache = (frame, None, None)
+
     def stop_feedback_polling(self):
-        reader, self._feedback_reader = self._feedback_reader, None
+        reader = self._feedback_reader
         if reader is None:
             return
-        self._feedback_failure = getattr(reader, 'last_request_failure', None)
+        failure = self._feedback_cache[2] or getattr(reader, 'last_request_failure', None)
+        if failure is not None:
+            current = self._feedback_failure
+            if current is None or failure.get('failed_wall_ns', 0) > current.get('failed_wall_ns', 0):
+                self._feedback_failure = failure
+        self._feedback_worker_stop.set()
+        worker = self._feedback_worker
+        if worker is not None and worker is not threading.current_thread():
+            reader.interrupt()  # Interrupt only this read-only local RPC socket.
+            worker.join(self.timeout_s + 1.5)
+            if worker.is_alive():
+                raise RuntimeError('Local feedback cache worker did not stop')
+        self._feedback_worker = None
+        self._feedback_reader = None
         try:
             if self.is_connected:
                 self._connection.call('feedback_poll', hz=None)
         finally:
             reader.close()
+            self._feedback_cache = (None, None, None)
 
     def get_cached_frame(self):
-        """Measured controller cache with original time/sequence; caller checks age."""
-        reader = self._feedback_reader
-        if reader is None:
+        """Copy the small parsed memory snapshot; never RPC, JSON or parse state.
+
+        Original controller receive time/sequence are preserved. Repeated reads
+        cannot make stale state fresh. A known background error replaces data.
+        """
+        if self._feedback_reader is None:
             raise RuntimeError('Call start_feedback_polling before reading cached frames')
-        return self.get_feedback_snapshot(reader)
+        frame, error, failure = self._feedback_cache
+        if error is not None:
+            if failure is not None:
+                # The foreground observes this already-known failure now. Keep
+                # its original time too, so runtime can retain the VR interface
+                # without mistaking it for an unrelated historical request.
+                self._feedback_failure = dict(failure,
+                    background_failed_wall_ns=failure.get('failed_wall_ns'),
+                    failed_wall_ns=time.time_ns())
+            raise error
+        if frame is None:
+            raise RuntimeError('Waiting for measured robot feedback')
+        return copy.deepcopy(frame)
 
     def open_feedback_reader(self):
         """Optional local cache channel; never opens another robot socket."""
@@ -1103,13 +1193,38 @@ class A10Operator(BaseOperator):
 
     @staticmethod
     def _feedback_frame(state):
+        robot = state.raw['ret_context'].get('robot_msg', {})
         return dict(joints=state.actual_joints_rad, tcp_pq_m=state.tcp_pq_m,
                     follower_active=state.follower_active, follower_mode=state.follower_mode,
+                    motion=robot.get('motion'), activation=robot.get('activate'),
                     has_error=state.has_error, received_monotonic_s=state.received_monotonic_s,
                     arms={name: dict(ee_id=arm.ee_id, joints=arm.actual_joints_rad,
                                      target_joints=arm.target_joints_rad, tcp_pq_m=arm.tcp_pq_m,
                                      received_monotonic_s=arm.received_monotonic_s)
                           for name, arm in state.arms.items()})
+
+    def _frame_from_feedback_snapshot(self, snapshot, *, previous_frame=None):
+        if not isinstance(snapshot, dict):
+            raise RuntimeError('Waiting for measured robot feedback')
+        stamp = snapshot.get('received_monotonic_s')
+        if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                or not math.isfinite(stamp) or not 0 <= stamp <= time.monotonic()):
+            raise A10ProtocolError('Invalid measured feedback timestamp')
+        sequence = snapshot['sequence']
+        if (previous_frame is not None
+                and previous_frame.get('controller_feedback_sequence') == sequence):
+            if previous_frame['received_monotonic_s'] != stamp:
+                raise A10ProtocolError('Unchanged feedback sequence has a different timestamp')
+            frame = dict(previous_frame)  # Reuse immutable parsed arrays for this sequence.
+        else:
+            state = self._parse_feedback(snapshot['reply'])
+            state = replace(state, received_monotonic_s=stamp,
+                            arms={name: replace(arm, received_monotonic_s=stamp)
+                                  for name, arm in state.arms.items()})
+            frame = self._feedback_frame(state)
+        frame['controller_feedback_sequence'] = sequence
+        frame['feedback_polling'] = snapshot.get('polling', {})
+        return frame
 
     def get_feedback_snapshot(self, reader=None):
         """Read measured controller feedback without the motion/transaction lock.
@@ -1119,25 +1234,13 @@ class A10Operator(BaseOperator):
         """
         if reader is not None:
             snapshot = reader.call('feedback_snapshot')
-            if not isinstance(snapshot, dict):
-                raise RuntimeError('Waiting for measured robot feedback')
-            stamp = snapshot.get('received_monotonic_s')
-            if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
-                    or not math.isfinite(stamp) or not 0 <= stamp <= time.monotonic()):
-                raise A10ProtocolError('Invalid measured feedback timestamp')
-            state = self._parse_feedback(snapshot['reply'])
-            state = replace(state, received_monotonic_s=stamp,
-                            arms={name: replace(arm, received_monotonic_s=stamp)
-                                  for name, arm in state.arms.items()})
+            return self._frame_from_feedback_snapshot(snapshot)
         else:
             with self._status_lock:
                 state = self._latest_state
             if state is None:
                 raise RuntimeError('Waiting for measured robot feedback')
         frame = self._feedback_frame(state)
-        if reader is not None:
-            frame['controller_feedback_sequence'] = snapshot['sequence']
-            frame['feedback_polling'] = snapshot.get('polling', {})
         return frame
 
     def get_frame(self, slop=0.7):

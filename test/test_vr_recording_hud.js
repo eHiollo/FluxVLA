@@ -86,3 +86,18 @@ assert.equal(attrs('recordHud').color, '#FFD54F');
 assert.equal(attrs('recordHudPrompt').value, 'release grips; center sticks');
 context.applyHud({phase: 'input_paused', capture_active: false, input_pause: {reason: 'spike_pending'}});
 assert.notEqual(attrs('recordHudNotice').value, 'input paused; recording');
+
+context.applyHud({phase:'input_paused', input_pause:{reason:'feedback_stale',state:'feedback_wait'},
+  controls:{prompt:'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS; WAIT FOR TRACKING'}});
+assert.equal(attrs('recordHud').value, 'robot paused');
+assert.equal(attrs('recordHudNotice').value, 'waiting for robot feedback');
+assert.equal(attrs('recordHudPrompt').value, 'release grips; center sticks');
+context.applyHud({phase:'input_ready', input_pause:{reason:'feedback_stale',state:'ready'},
+  controls:{prompt:'PRESS A SIDE GRIP TO RESUME'}});
+assert.equal(attrs('recordHud').value, 'robot ready');
+assert.equal(attrs('recordHudNotice').value, 'feedback stable');
+assert.equal(attrs('recordHudPrompt').value, 'press side grip to resume');
+context.applyHud({phase:'input_paused', input_pause:{reason:'feedback_stale',state:'stop_unconfirmed'},
+  controls:{prompt:'check controller; restart session'}});
+assert.equal(attrs('recordHudNotice').value, 'stop unconfirmed; check controller');
+console.log('Robot feedback pause / rearm / unconfirmed stop HUD checks passed.');

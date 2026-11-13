@@ -407,6 +407,9 @@ class DualSharedIntegrationTest(unittest.TestCase):
                 while self.relay._poll_error is None and time.monotonic() < deadline:
                     time.sleep(.005)
                 self.assertIsNotNone(self.relay._poll_error)
+                while runtime.robot._feedback_cache[1] is None and time.monotonic() < deadline:
+                    time.sleep(.005)
+                self.assertIsNotNone(runtime.robot._feedback_cache[1])
             self.tick(runtime)
         self.assertIsNotNone(runtime.communication_pause)
         self.assertTrue(runtime._connected)

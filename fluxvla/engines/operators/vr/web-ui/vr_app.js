@@ -106,6 +106,10 @@ AFRAME.registerComponent('controller-updater', {
       };
       el.setAttribute('value', data.pending ? `confirm ${shortText(data.pending, 20)}` : (titles[phase] || shortText(phase, 28)));
       el.setAttribute('color', data.pending ? '#FFD54F' : (colors[phase] || '#FFFFFF'));
+      const feedbackPaused = data.input_pause?.reason === 'feedback_stale';
+      if (feedbackPaused && !data.pending) {
+        el.setAttribute('value', phase === 'input_ready' ? 'robot ready' : 'robot paused');
+      }
       const spikeRecording = data.capture_active && !data.error &&
         ['spike_pending', 'spike_reanchor'].includes(data.input_pause?.reason);
       if (spikeRecording) el.setAttribute('color', '#FFD54F');
@@ -118,7 +122,12 @@ AFRAME.registerComponent('controller-updater', {
       const diagnostic = String(data.error || data.hint || '').toLowerCase();
       let notice = shortText(diagnostic);
       // Full diagnostics stay in the terminal/JSONL, not across the headset.
-      if (spikeRecording) notice = 'input paused; recording';
+      if (feedbackPaused) {
+        notice = data.input_pause.state === 'stop_unconfirmed' ? 'stop unconfirmed; check controller' :
+          data.input_pause.state === 'feedback_wait' ? 'waiting for robot feedback' :
+          phase === 'input_ready' ? 'feedback stable' : 'release grips; wait for feedback';
+      }
+      else if (spikeRecording) notice = 'input paused; recording';
       else if (diagnostic.includes('retry pending') || diagnostic.includes('retry queued')) notice = 'retry queued; center sticks';
       else if (diagnostic.includes('gripper locked')) notice = 'gripper fault; arms available';
       else if (diagnostic.includes('vr input stale') || diagnostic.includes('vr input stream lost')) notice = 'vr signal delayed';

@@ -72,3 +72,9 @@ for (const id of ['recordHud', 'recordHudNotice', 'recordHudPrompt', 'recordHudL
 console.log('Short lowercase retry menu checks passed.');
 context.applyHud({phase:'idle', controls:{prompt:'HOLD RIGHT B FOR LEFT STICK MENU'}});
 assert.equal(attrs('recordHudPrompt').value, 'hold right b for menu');
+
+context.applyHud({phase: 'recording', gripper_warnings: {right: 'drop detected'}});
+assert.equal(attrs('recordHudNotice').value, 'right drop warning; recording');
+assert.equal(attrs('recordHud').color, '#66BB6A');
+context.applyHud({phase: 'failed', error: 'camera disconnected', gripper_warnings: {right: 'drop detected'}});
+assert.equal(attrs('recordHudNotice').value, 'camera disconnected');

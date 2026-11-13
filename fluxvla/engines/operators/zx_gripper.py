@@ -136,6 +136,14 @@ class ZXGripperState:
         return bool(self.alarm_a or self.alarm_b)
 
 
+def has_blocking_alarm(alarm_a, alarm_b, *, drop_alarm_policy='stop'):
+    """Only the documented B/0x1000 drop bit may be downgraded; retain raw alarms."""
+    if drop_alarm_policy not in ('stop', 'warn'):
+        raise ValueError('drop_alarm_policy must be stop or warn')
+    blocking_b = (alarm_b or 0) & ~0x1000 if drop_alarm_policy == 'warn' else alarm_b
+    return bool(alarm_a or blocking_b)
+
+
 def _wait_timeout(value):
     if (isinstance(value, bool) or not isinstance(value, Real)
             or not math.isfinite(value) or not 0 < value <= 60):
@@ -166,9 +174,12 @@ class ZXGripper:
 
     def __init__(self, port=DEFAULT_PORT, *, baudrate=115200, timeout=0.2,
                  trace=None, max_position_raw=8900,
-                 expected_usb_serial=None, expected_usb_interface=None, read_crc_retries=2):
+                 expected_usb_serial=None, expected_usb_interface=None, read_crc_retries=2,
+                 drop_alarm_policy='stop'):
         if not isinstance(port, str) or not port:
             raise ValueError('port must be a nonempty device path')
+        has_blocking_alarm(0, 0, drop_alarm_policy=drop_alarm_policy)
+        self.drop_alarm_policy = drop_alarm_policy
         self.port = port
         self.expected_usb_serial = expected_usb_serial
         self.expected_usb_interface = expected_usb_interface
@@ -295,7 +306,7 @@ class ZXGripper:
             raw = (high << 16) | low
             command = self._commands.get(device_id)
             target = command[0] if command else None
-            if alarm_a or alarm_b:
+            if has_blocking_alarm(alarm_a, alarm_b, drop_alarm_policy=self.drop_alarm_policy):
                 completion = 'fault'
             elif not enabled:
                 completion = 'disabled'
@@ -362,7 +373,7 @@ class ZXGripper:
                 if not isinstance(feedback, ZXGripperState) or feedback.device_id != device_id:
                     raise ValueError('feedback must be the current device state')
                 alarm_a, alarm_b = feedback.alarm_a, feedback.alarm_b
-            if alarm_a or alarm_b:
+            if has_blocking_alarm(alarm_a, alarm_b, drop_alarm_policy=self.drop_alarm_policy):
                 raise ZXGripperError(f'Motion blocked by alarms: {alarm_a:#06x}, {alarm_b:#06x}')
             check_deadline()
             signature = (position, speed, torque)
@@ -409,7 +420,7 @@ class ZXGripper:
                 if command is None or command[3] != expected:
                     raise ZXGripperError('Motion wait superseded by a newer command or disable')
                 last = self.read_state(device_id)
-                if last.has_error:
+                if has_blocking_alarm(last.alarm_a, last.alarm_b, drop_alarm_policy=self.drop_alarm_policy):
                     raise ZXGripperError(
                         f'Alarm during motion at raw {last.position_raw}: '
                         f'A=0x{last.alarm_a:04X}, B=0x{last.alarm_b:04X}; target={last.target_raw}')

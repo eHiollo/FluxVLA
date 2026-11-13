@@ -115,6 +115,10 @@ class NativeWriterTests(unittest.TestCase):
 
 
 class NativeSessionTests(SessionTests):
+    def test_native_drop_warning_records_and_preserves_alarm(self):
+        self.use_native_writer()
+        SessionTests.test_drop_warning_records_actual_samples_and_preserves_alarm_in_saved_sidecar(self)
+
     # Inherit the existing UI, m_init and lifecycle regressions below only via
     # targeted load_tests. New cases use its synthetic device setup.
     def use_native_writer(self):

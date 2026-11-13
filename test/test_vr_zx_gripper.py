@@ -99,6 +99,31 @@ class ChannelTest(unittest.TestCase):
         self.addCleanup(channel.close)
         return channel
 
+    def test_drop_warning_worker_moves_both_directions_without_reset_and_latches_other_fault(self):
+        c = self.channel(opts=dict(options(), drop_alarm_policy='warn'))
+        fake = FakeZX(); fake.alarm_b = 0x1000; c.client = fake
+        c.connect()
+        self.assertTrue(c.check_health())
+        self.assertEqual(c.snapshot()['warning'], 'drop detected')
+        self.assertEqual(c.snapshot()['alarm_b'], 0x1000)
+        c.submit(0., time.monotonic()+1.)
+        wait_for(lambda: c.snapshot()['phase'] == 'centered')
+        c.submit(-1., time.monotonic()+1.)
+        wait_for(lambda: len(fake.targets) >= 2)
+        closed = fake.position
+        c.submit(0., time.monotonic()+1.)
+        wait_for(lambda: c.snapshot()['phase'] == 'centered')
+        c.submit(1., time.monotonic()+1.)
+        wait_for(lambda: fake.position < closed)
+        fake.alarm_b = 0x1001
+        wait_for(lambda: c.snapshot().get('alarm_latched'))
+        count = len(fake.targets)
+        c.submit(-1., time.monotonic()+1.)
+        time.sleep(.12)
+        self.assertEqual(len(fake.targets), count)
+        self.assertFalse(c.check_health())
+        self.assertEqual((fake.reset_count, fake.disable_count), (0, 0))
+
     def test_motor_speed_accepts_1_to_15_without_opening_usb(self):
         with patch('serial.Serial') as serial:
             for speed in (1, 5, 10, 15):

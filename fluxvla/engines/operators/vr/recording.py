@@ -22,6 +22,7 @@ import numpy as np
 from fluxvla.datasets.a10_recording_schema import get_schema, pack_dual_state
 from fluxvla.datasets.episode_writer import EpisodeWriter
 from ..camera_operator import BufferedCameraOperator
+from ..zx_gripper import has_blocking_alarm
 from .vr_events import RecordingButtons
 
 LOG = logging.getLogger(__name__)
@@ -253,7 +254,8 @@ class RecordingSession:
             # A single missed reply pauses this gripper's writes, but the last
             # measured position remains usable within the SAME age/skew bounds.
             # Preserve its timestamp and communication_error in diagnostics.
-            if (grip.get('error') or grip.get('alarm_a') or grip.get('alarm_b')
+            if (grip.get('error') or has_blocking_alarm(grip.get('alarm_a'), grip.get('alarm_b'),
+                    drop_alarm_policy=grip.get('drop_alarm_policy', 'stop'))
                     or (self.backend != 'lerobot' and grip.get('enabled') is not True)):
                 raise ValueError(f'{side} gripper not healthy/enabled: '
                                  f'{grip.get("error") or "check alarms/enable"}; clear before recording')
@@ -722,6 +724,9 @@ class RecordingSession:
                         writer_backend=self.backend, skipped_samples=self.skipped_samples,
                         workflow=self.workflow, recording_events=dict(self.events),
                         gripper_faults=dict(self.gripper_faults),
+                        gripper_warnings={side: snap['warning']
+                            for side, channel in getattr(self.runtime, '_zx_channels', {}).items()
+                            if (snap := channel.snapshot()).get('warning')},
                         sample_gaps=self.sample_gaps,
                         input_pause=getattr(self.runtime, 'input_pause_status', None),
                         effective_fps=round((self.frames-1)/self.elapsed,2) if self.frames>1 and self.elapsed>0 else None)

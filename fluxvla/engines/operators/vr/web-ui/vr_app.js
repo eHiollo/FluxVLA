@@ -120,6 +120,10 @@ AFRAME.registerComponent('controller-updater', {
       else if (diagnostic.includes('vr input stale') || diagnostic.includes('vr input stream lost')) notice = 'vr signal delayed';
       else if (diagnostic.includes('rerecord:')) notice = 'reset scene; right to restart';
       else if (diagnostic.includes('reset scene; right')) notice = 'reset scene; right to save';
+      else if (!data.error && Object.keys(data.gripper_warnings || {}).length) {
+        const sides = Object.keys(data.gripper_warnings).join('/');
+        notice = `${sides} drop warning${phase === 'recording' ? '; recording' : ''}`;
+      }
       else if (phase === 'recording' && !data.error) notice = 'capture active';
       setText('#recordHudNotice', notice, data.error ? '#FF7070' : '#FFD54F');
       const controls = data.controls || {};

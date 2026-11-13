@@ -92,6 +92,31 @@ class ZXGripperTests(unittest.TestCase):
         self.client = zx.ZXGripper()
         self.addCleanup(self.client.disconnect)
 
+    def test_drop_warning_allows_commands_and_wait_but_keeps_raw_alarm(self):
+        self.client.drop_alarm_policy = 'warn'
+        self.fake.alarms = (0, 0x1000)
+        self.client.connect()
+        state = self.client.set_position_raw(1, 5000, wait=True, move_timeout=1)
+        self.assertEqual(state.position_raw, 5000)
+        self.assertEqual(state.alarm_b, 0x1000)
+        self.assertTrue(state.has_error)  # Raw diagnostic remains truthful.
+        self.assertEqual(state.completion, 'position_reached')
+        self.assertFalse(any(p[1] == 6 and p[2:4] == b'\x01\x10' for p in self.fake.writes))
+
+    def test_drop_policy_never_masks_other_bits_and_default_still_blocks(self):
+        self.client.connect()
+        for policy, alarms in [('stop', (0, 0x1000)), ('warn', (1, 0x1000)),
+                               ('warn', (0, 0x1001)), ('warn', (0, 0x2000))]:
+            with self.subTest(policy=policy, alarms=alarms):
+                self.client.drop_alarm_policy = policy
+                self.fake.alarms = alarms
+                self.fake.writes.clear()
+                with self.assertRaisesRegex(zx.ZXGripperError, 'Motion blocked'):
+                    self.client.set_position_raw(1, 5000)
+                self.assertTrue(all(p[1] == 3 for p in self.fake.writes))
+        with self.assertRaises(ValueError):
+            zx.ZXGripper(drop_alarm_policy='ignore_all')
+
     def test_manual_request_and_fragmented_response(self):
         with self.client as client:
             self.assertEqual(client.read_registers(1, 0x0401), (0x8011,))

@@ -172,6 +172,27 @@ class SessionTests(unittest.TestCase):
     def start(self):
         self.session.command('start'); self.settle(); self.update(); self.update()
 
+    def test_drop_warning_records_actual_samples_and_preserves_alarm_in_saved_sidecar(self):
+        source = self.channels['right'].snapshot.side_effect
+        self.channels['right'].snapshot.side_effect = lambda: dict(
+            source(), alarm_b=0x1000, drop_alarm_policy='warn', warning='drop detected')
+        self.update(); self.start()
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertEqual(self.session.status()['gripper_warnings'], {'right': 'drop detected'})
+        self.session._hud(time.monotonic())
+        self.assertEqual(self.runtime.teleoperator.send_feedback.call_args.args[0]['gripper_warnings'],
+                         {'right': 'drop detected'})
+        self.session.command('save'); self.settle(); self.session.close()
+        files = list((self.root/'meta/xlevr_diagnostics').rglob('*.jsonl'))
+        self.assertTrue(files)
+        records = [json.loads(line) for line in files[0].read_text().splitlines()]
+        self.assertTrue(records)
+        for row in records:
+            grip = row['details']['grippers']['right']
+            self.assertEqual(grip['alarm_b'], 0x1000)
+            self.assertEqual(grip['warning'], 'drop detected')
+            self.assertEqual(grip['actual_raw'], 4500)
+
     def test_hud_modifier_and_recenter_update_without_waiting_for_timer(self):
         session = self.session
         send = self.runtime.teleoperator.send_feedback

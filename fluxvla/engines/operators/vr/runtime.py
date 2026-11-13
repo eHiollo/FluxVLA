@@ -17,7 +17,7 @@ class _ZXGripperChannel:
     """One USB owner, bounded target lead, latest input only; no foreground I/O."""
 
     def __init__(self, side, device, options):
-        from ..zx_gripper import ZXGripper
+        from ..zx_gripper import ZXGripper, has_blocking_alarm
         self.side = side
         self.options = dict(options)
         self.device_id = device['device_id']
@@ -48,8 +48,10 @@ class _ZXGripperChannel:
         self.direction = options['direction'][side]
         if self.direction not in (-1, 1) or isinstance(self.direction, bool):
             raise ValueError('ZX direction must be 1 or -1 for each hand')
+        self.drop_alarm_policy = options.get('drop_alarm_policy', 'stop')
+        has_blocking_alarm(0, 0, drop_alarm_policy=self.drop_alarm_policy)
         self.client = ZXGripper(device['port'], baudrate=device['baudrate'], timeout=serial_timeout,
-                                max_position_raw=self.high, expected_usb_serial=self.serial,
+                                max_position_raw=self.high, drop_alarm_policy=self.drop_alarm_policy, expected_usb_serial=self.serial,
                                 expected_usb_interface=identity['usb_interface'])
         self._lock = threading.Lock()
         self._stop, self._ready = threading.Event(), threading.Event()
@@ -181,8 +183,12 @@ class _ZXGripperChannel:
             raise ZXGripperTimeout('serial feedback read took too long')
         if not max(0, self.low - self.tolerance) <= state.position_raw <= self.high + self.tolerance:
             raise RuntimeError('actual position exceeds the configured raw range')
+        warning = ('drop detected' if self.drop_alarm_policy == 'warn' and state.alarm_b & 0x1000 else None)
+        previous_warning = self.snapshot().get('warning')
+        if warning and not previous_warning:
+            logging.getLogger(__name__).warning('ZX %s 掉落报警仅提示，继续接受摇杆目标；原始报警仍记录。', self.side)
         with self._lock:
-            self._state.update(actual_raw=state.position_raw, feedback_monotonic_s=now,
+            self._state.update(drop_alarm_policy=self.drop_alarm_policy, warning=warning, actual_raw=state.position_raw, feedback_monotonic_s=now,
                                enabled=state.enabled, alarm_a=state.alarm_a, alarm_b=state.alarm_b, communication_error=None,
                                status=state.status, speed_raw=state.speed_raw, current_raw=state.current_raw,
                                completion=state.completion,
@@ -192,7 +198,7 @@ class _ZXGripperChannel:
         return state, now
 
     def _run(self):
-        from ..zx_gripper import ZXGripperInputExpired, ZXGripperCommunicationError
+        from ..zx_gripper import ZXGripperInputExpired, ZXGripperCommunicationError, has_blocking_alarm
         try:
             with self.client:
                 next_tick = time.monotonic()
@@ -222,13 +228,15 @@ class _ZXGripperChannel:
                         self._communication_failed(exc)
                         self._ready.set()
                         continue  # Poll feedback only; no uncertain write is retried.
-                    if state.has_error or self.snapshot().get('alarm_latched'):
+                    blocking_alarm = has_blocking_alarm(state.alarm_a, state.alarm_b,
+                                                        drop_alarm_policy=self.drop_alarm_policy)
+                    if blocking_alarm or self.snapshot().get('alarm_latched'):
                         first = not self.snapshot().get('alarm_latched')
                         self.pause()
                         with self._lock:
                             self._state.update(phase='alarm_latched', alarm_latched=True,
                                 error=(f'gripper alarm 0x{state.alarm_a:04X}/0x{state.alarm_b:04X}'
-                                       if state.has_error else self._state['error']))
+                                       if blocking_alarm else self._state['error']))
                         self._ready.set()
                         if first:
                             logging.getLogger(__name__).error('ZX %s 硬件报警，停止新目标并保持只读查询：%s',
@@ -1194,7 +1202,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if enabled:
             defaults = dict(target_rate_raw_s=1800., deadzone=.1, direction=dict(left=1, right=1),
                             max_lead_raw=300., io_hz=20., input_timeout_s=.25, feedback_timeout_s=.5,
-                            serial_timeout_s=.2)
+                            serial_timeout_s=.2, drop_alarm_policy='stop')
             if set(config) - set(defaults):
                 raise ValueError('Unknown ZX teleop settings')
             options = dict(defaults, **config)

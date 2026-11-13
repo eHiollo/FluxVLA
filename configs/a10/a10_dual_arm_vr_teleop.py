@@ -33,6 +33,9 @@ teleop = dict(
     ),
     zx_grippers=dict(
         # 2026-11-06: user-confirmed live settings; device checks retain 5%.
+        # Only B/0x1000 is advisory; retain raw alarms in recording diagnostics.
+        # Firmware detection remains enabled. Set 'stop' to restore the old latch.
+        drop_alarm_policy='warn',
         enabled=True, devices=dict(
             left=dict(_base_.grippers.left, speed=15),
             right=dict(_base_.grippers.right, speed=15)),

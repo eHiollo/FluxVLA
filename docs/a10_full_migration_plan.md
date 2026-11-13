@@ -1518,3 +1518,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 更新数采指南、命令速查和离线状态机/原生LeRobot保存测试。未连接实机执行运动；用户CLI.txt及未跟踪FluxVLA文件保持原样。
 - 验证：录制状态机、真实原生LeRobot写入、双臂runtime共121项离线测试通过；归位帧与三路视频已在临时合成数据集中读取验证。
 - 扩展m_init历史测试单独复现4项失败、3项错误（含旧plan_init_motion导入、已移除的加速度选项、旧初始角和旧指令序列断言）；已核对相关代码/配置/测试与HEAD一致，本轮未修改，未以改回位速度来迁就旧测试。日志：/tmp/a10_reset_recording_final.log、/tmp/a10_reset_existing_init_tests.log。
+
+### 2026-11-13：双臂VR掉落报警提示策略
+
+- 按用户要求，增加 `zx_grippers.drop_alarm_policy=warn/stop`，当前双臂配置默认warn；驱动其他使用场景默认stop。共享判断仅排除报警B的0x1000，所有其他报警位照常阻止新目标。
+- 串口驱动、VR夹爪线程与录制采样统一策略；掉落位不锁存为夹爪故障，摇杆持续生成范围内目标。未改速度、力矩、目标提前量或厂家寄存器，不自动清报警、掉使能或重试不确定的写入。
+- 头显短句提示掉落warning；原始报警码、策略、warning和实测位置保留在VR快照/录制sidecar，不把提示等同于成功抓取。
+- 115项Python离线测试和JS头显测试通过；覆盖默认拦截、warn开合、混合报警仍拦截、无自动复位、原生LeRobot保存后诊断可读取。测试日志：`/tmp/zx_drop_policy_tests_v2.log`。
+- 本轮未连接硬件；固件报警状态下是否实际接受并执行后续目标仍需现场验证。本变更并未关闭固件掉落检测。未改动用户CLI或同事的OpenPI远程适配文件。

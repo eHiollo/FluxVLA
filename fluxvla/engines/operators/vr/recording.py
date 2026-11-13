@@ -1,7 +1,8 @@
 """Dual VR dataset collection. No second robot/serial owner, no policy dependency.
 
-Control-thread work: bounded snapshots, validation and nonblocking frame enqueue.
-Camera reads, file finalization and m_init run outside that thread. Robot motion
+Control-thread work: button/state transitions and cached health only.
+30 Hz sampling, image enqueue, camera reads, file finalization and m_init run
+outside the 90 Hz motion thread. Robot motion
 and dataset state machines are distinct; a failed episode cannot be published.
 """
 from __future__ import annotations
@@ -113,7 +114,7 @@ class RecordingSession:
                     raise ValueError(f'{side}: gripper identity/range differs from recording contract')
             for name, camera in self.cameras_config.items():
                 contract = self.record['cameras'][name]
-                if any(camera.get(k) != contract.get(k) for k in ('width', 'height', 'identity', 'rotate_180')):
+                if any(camera.get(k) != contract.get(k) for k in ('width', 'height', 'fps', 'identity', 'rotate_180')):
                     raise ValueError(f'{name}: camera identity/rotation differs from recording contract')
         self.writer = None; self.cameras = None; self.pool = None; self.future = None
         self.future_operation = None
@@ -136,6 +137,7 @@ class RecordingSession:
         self._sample_thread = None
         self._background_sampling = False
         self._feedback_reader = None
+        self._append_inflight = False
 
     @property
     def blocks_motion(self):
@@ -327,7 +329,11 @@ class RecordingSession:
                         self.fail(str(exc))
 
     def _append_sample(self, now):
-        if self.capturing and self.ready_sample is not None:
+        # Native add_frame copies images/enqueues PNGs and may stall on IO. Keep
+        # it outside the state lock so 90 Hz control still sees every button.
+        with self._sample_lock:
+            if not self.capturing or self.ready_sample is None or self._append_inflight:
+                return
             state, images, detail, cameras = self.ready_sample
             try:
                 if self._last_sample is not None:
@@ -344,19 +350,33 @@ class RecordingSession:
                 self._camera_sequences = {n:c['sequence'] for n,c in cameras.items()}
                 detail['repeated_image_count'] = self.repeated_images
                 detail.update(capture_gap_s=None if self._last_sample is None else now-self._last_sample,
-                              skipped_samples=self.skipped_samples, sample_gaps=self.sample_gaps)
-                self.writer.append(state, state.copy(), images, capture_monotonic_s=now, diagnostics=detail)
-                self.frames += 1; self._last_sample = now; self.elapsed = now-self._first_sample
-                if self.frames >= self.record.get('max_episode_frames',18000):
-                    self.state = 'review'  # One save request; never enqueue it every sampler tick.
-                    if self.reset_thread is not None: self._reset_return_state = 'review'
-                    if self.workflow == 'lerobot':
-                        self.events['exit_early'] = True
-                        self.notice = 'FRAME LIMIT: RESET SCENE; RIGHT = SAVE + NEXT'
-                    else:
-                        self.commands.put_nowait('save')
+                              skipped_samples=self.skipped_samples, sample_gaps=self.sample_gaps,
+                              sampling_mode=self.sampling_mode, nominal_capture_hz=self.record['fps'])
+                self._append_inflight = True
             except Exception as exc:
                 self.fail(str(exc))
+                return
+        write_error = None
+        try:
+            self.writer.append(state, state.copy(), images, capture_monotonic_s=now, diagnostics=detail)
+        except Exception as exc:
+            write_error = exc
+        with self._sample_lock:
+            self._append_inflight = False
+            if write_error is not None:
+                self.fail(str(write_error))
+                return
+            self.frames += 1; self._last_sample = now; self.elapsed = now-self._first_sample
+            # A fault/quit may have arrived while this actual frame was written.
+            # Never turn that failure into a saveable review state.
+            if self.capturing and self.frames >= self.record.get('max_episode_frames',18000):
+                self.state = 'review'
+                if self.reset_thread is not None: self._reset_return_state = 'review'
+                if self.workflow == 'lerobot':
+                    self.events['exit_early'] = True
+                    self.notice = 'FRAME LIMIT: RESET SCENE; RIGHT = SAVE + NEXT'
+                else:
+                    self.commands.put_nowait('save')
 
     def _start_sampling(self):
         self._background_sampling = True
@@ -375,7 +395,7 @@ class RecordingSession:
                 with self._sample_lock:
                     if self._sample_stop.is_set(): break
                     self._prepare_sample(time.monotonic(), frame=frame, raw=raw)
-                    self._append_sample(time.monotonic())
+                self._append_sample(time.monotonic())
             except Exception as exc:
                 with self._sample_lock:
                     self.ready_sample = None; self.health = str(exc)
@@ -413,7 +433,9 @@ class RecordingSession:
                     # cache, rather than the pre-stop frame or another GET.
                     frame = self.runtime.robot.get_feedback_snapshot(self._feedback_reader)
                 self._prepare_sample(time.monotonic(), frame=frame)
-            for _ in range(16):
+            # Deferred disk transitions are requeued once per tick; quit/reset
+            # cancellation must still be handled during a slow add_frame.
+            for _ in range(min(16, self.commands.qsize())):
                 try: command = self.commands.get_nowait()
                 except queue.Empty: break
                 self.command(command)
@@ -542,6 +564,10 @@ class RecordingSession:
             if command in ('down','stop'):
                 self.reset_cancel.set(); self.notice = 'Cancelling reset; waiting for stop confirmation'
             else: self.notice = 'Reset owns motion; wait or use DOWN/stop to cancel'
+            return
+        if self._append_inflight:
+            try: self.commands.put_nowait(command)
+            except queue.Full: self.notice = 'Command queue full; wait for frame writer'
             return
         if self.future is not None:
             if self.workflow == 'lerobot' and command in ('down', 'stop'):

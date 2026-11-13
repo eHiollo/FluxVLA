@@ -263,5 +263,35 @@ class IncrementalRotationTest(unittest.TestCase):
                 ReferenceConfig(**options)
 
 
+class CachedReleaseFeedbackTest(unittest.TestCase):
+    def make(self):
+        control = VRPoseController(ReferenceConfig())
+        control.start(IDENTITY)
+        return control
+
+    def test_repeated_cached_pose_cannot_confirm_stopped(self):
+        control = self.make()
+        for _ in range(20):
+            result = control.step_released(IDENTITY, 1/90, feedback_time_s=10.)
+        self.assertEqual(result['state'], 'releasing')
+        self.assertEqual(result['release_stable_s'], 0.)
+        self.assertFalse(result['feedback_updated'])
+        for index in range(1, 5):
+            result = control.step_released(IDENTITY, 1/90, feedback_time_s=10.+index/30)
+        self.assertEqual(result['state'], 'holding')
+
+    def test_speed_uses_feedback_interval_not_control_interval(self):
+        control = self.make()
+        control.step_released(IDENTITY, 1/90, feedback_time_s=10.)
+        actual = IDENTITY.copy()
+        actual[0] = .00025  # 7.5 mm/s over 1/30 s, below quietness threshold.
+        result = control.step_released(actual, 1/90, feedback_time_s=10.+1/30)
+        self.assertTrue(result['feedback_quiet'])
+        self.assertAlmostEqual(result['feedback_interval_s'], 1/30)
+        result = control.step_released(actual, 1/90, feedback_time_s=9.)
+        self.assertTrue(result['stop_requested'])
+        self.assertEqual(result['fault_reason'], 'feedback_timestamp_regression')
+
+
 if __name__ == '__main__':
     unittest.main()

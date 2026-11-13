@@ -385,7 +385,13 @@ class DualSharedIntegrationTest(unittest.TestCase):
         self.assertEqual(self.controller.max_connections, 1)
 
     def test_shared_get_timeout_retains_vr_interface_and_never_replays_targets(self):
-        runtime = self.runtime()
+        self.check_shared_get_timeout(feedback_poll_hz=None)
+
+    def test_background_get_timeout_retains_vr_interface_and_never_replays_targets(self):
+        self.check_shared_get_timeout(feedback_poll_hz=30)
+
+    def check_shared_get_timeout(self, *, feedback_poll_hz):
+        runtime = self.runtime(feedback_poll_hz=feedback_poll_hz)
         self.tick(runtime, False)
         for _ in range(5): self.tick(runtime)
         read = self.relay.read_state
@@ -396,10 +402,16 @@ class DualSharedIntegrationTest(unittest.TestCase):
                 raise TimeoutError('synthetic shared GET timeout')
             return read()
         with patch.object(self.relay, 'read_state', once):
+            if feedback_poll_hz is not None:
+                deadline = time.monotonic() + 1.
+                while self.relay._poll_error is None and time.monotonic() < deadline:
+                    time.sleep(.005)
+                self.assertIsNotNone(self.relay._poll_error)
             self.tick(runtime)
         self.assertIsNotNone(runtime.communication_pause)
         self.assertTrue(runtime._connected)
-        self.assertEqual(runtime.robot.last_communication_failure['command'], 'get')
+        self.assertEqual(runtime.robot.last_communication_failure['command'],
+                         'get' if feedback_poll_hz is None else 'feedback_snapshot')
         # Relay disconnect cleanup may still GET/stop asynchronously; what
         # must not continue is the VR client's target/query/start loop.
         with patch.object(runtime.robot, 'get_frame', side_effect=AssertionError('unexpected query')), \

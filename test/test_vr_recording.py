@@ -401,6 +401,124 @@ class SessionTests(unittest.TestCase):
         while self.session.ready_sample is None and time.monotonic() < deadline: time.sleep(.005)
         self.assertIsNotNone(self.session.ready_sample)
 
+    def test_90hz_controls_and_independent_30hz_samples_with_slow_feedback(self):
+        self.session.backend = 'lerobot'
+        self.session.sampling_mode = 'background_30hz'
+        self._background_inputs()
+        stop = threading.Event()
+        cache = [self.robot.get_feedback_snapshot(None)]
+        requests = []
+        def poll_feedback():
+            due = time.monotonic()
+            while not stop.wait(max(0., due-time.monotonic())):
+                time.sleep(.020)  # GET itself exceeds the 11.1ms control budget.
+                now = time.monotonic(); requests.append(now)
+                cache[0] = dict(has_error=False, received_monotonic_s=now,
+                    controller_feedback_sequence=len(requests), arms={
+                        'left': dict(ee_id=0, joints=[.2]*6, received_monotonic_s=now),
+                        'right': dict(ee_id=1, joints=[.1]*6, received_monotonic_s=now)})
+                due = max(due+1/30, time.monotonic())
+        self.robot.get_feedback_snapshot.side_effect = lambda _: cache[0]
+        self.robot.get_frame.side_effect = AssertionError('Control/recording must not issue GET')
+        worker = threading.Thread(target=poll_feedback, daemon=True); worker.start()
+        try:
+            self.session.command('start'); self.settle()
+            begin = next_tick = time.monotonic(); calls = []
+            first_request = len(requests)
+            while time.monotonic()-begin < 2.:
+                self.seq += 1
+                raw = hands(self.seq)
+                self.session.before_step(raw, actions())
+                self.session.after_step()
+                calls.append(time.monotonic())
+                next_tick += 1/90
+                time.sleep(max(0., next_tick-time.monotonic()))
+            controls_duration = time.monotonic()-begin
+            feedback_count = len(requests)-first_request
+            self.assertEqual(self.session.state, 'recording', self.session.error)
+            self.assertGreater(len(calls), 150)
+            self.assertLess(len(calls), 200)
+            self.assertGreater(self.session.frames, 45)
+            self.assertLess(self.session.frames, 75)
+            self.assertGreater(feedback_count, 45)
+            self.assertLess(feedback_count, 75)
+            self.session.command('save')
+            deadline = time.monotonic()+3
+            while self.session.state != 'idle' and time.monotonic()<deadline:
+                self.session.after_step(); time.sleep(.005)
+            self.assertEqual(self.session.state, 'idle', self.session.error)
+            self.session._stop_sampling(); self.session.close()
+        finally:
+            stop.set(); worker.join(1.)
+        rows = [json.loads(line) for line in next((self.root/'meta/xlevr_diagnostics').glob('*.jsonl')).read_text().splitlines()]
+        duration = rows[-1]['capture_monotonic_s']-rows[0]['capture_monotonic_s']
+        measured_hz = (len(rows)-1)/duration
+        self.assertGreater(measured_hz, 25.)
+        self.assertLess(measured_hz, 35.)
+        self.assertTrue(all(row['details']['nominal_capture_hz'] == 30 for row in rows))
+        self.assertTrue(all(row['details']['robot_received_monotonic_s'] <= row['capture_monotonic_s'] for row in rows))
+        self.assertTrue(any(row['details']['controller_feedback_sequence'] for row in rows))
+        print(f'RATE TEST: controls={len(calls)/controls_duration:.2f}Hz capture={measured_hz:.2f}Hz feedback={feedback_count/controls_duration:.2f}Hz')
+
+    def test_slow_add_frame_does_not_block_control_or_lose_finish_button(self):
+        self.session.backend = 'lerobot'; self.session.workflow = 'lerobot'
+        self._background_inputs()
+        entered = threading.Event(); release = threading.Event()
+        append = self.writer.append
+        def slow_append(*args, **kwargs):
+            entered.set(); release.wait(2.)
+            return append(*args, **kwargs)
+        with patch.object(self.writer, 'append', side_effect=slow_append):
+            self.session.command('start'); self.settle()
+            self.assertTrue(entered.wait(1.))
+            worst = 0.
+            # Real modifier/neutral/direction sequence, while append stays blocked.
+            for kw in ({}, {'modifier': True}, {'modifier': True, 'x': 1.}, {}):
+                self.seq += 1; before = time.monotonic()
+                self.session.before_step(hands(self.seq, **kw), actions())
+                self.session.after_step()
+                worst = max(worst, time.monotonic()-before)
+            self.assertLess(worst, .05)
+            self.assertFalse(self.session.commands.empty())
+            self.assertEqual(self.session.state, 'recording')
+            release.set()
+            deadline = time.monotonic()+1
+            while self.session.state != 'review' and time.monotonic()<deadline:
+                self.session.after_step(); time.sleep(.005)
+            self.assertEqual(self.session.state, 'review')
+            self.assertGreaterEqual(self.session.frames, 1)
+        self.session._stop_sampling()
+
+    def test_inflight_append_never_delays_reset_cancel_or_overwrites_fault(self):
+        self.session.backend = 'lerobot'; self.session.workflow = 'lerobot'
+        self._background_inputs()
+        entered = threading.Event(); release = threading.Event()
+        append = self.writer.append
+        def slow_append(*args, **kwargs):
+            entered.set(); release.wait(2.)
+            return append(*args, **kwargs)
+        with patch.object(self.writer, 'append', side_effect=slow_append):
+            self.session.command('start'); self.settle()
+            self.assertTrue(entered.wait(1.))
+            # An existing m_init remains exclusive; cancellation must not wait
+            # for disk IO. Mimic the actual resetting state without motion.
+            self.session.state = 'resetting'
+            self.session._reset_return_state = 'recording'
+            self.session.reset_thread = Mock(is_alive=lambda: True)
+            self.session.commands.put_nowait('down')
+            self.session.after_step()
+            self.assertTrue(self.session.reset_cancel.is_set())
+            self.session.reset_thread = None
+            self.session.state = 'recording'
+            self.session.record['max_episode_frames'] = 1
+            self.session.fail('camera failed during append')
+            release.set()
+            deadline = time.monotonic()+1
+            while self.session._append_inflight and time.monotonic()<deadline: time.sleep(.005)
+            self.assertEqual(self.session.state, 'failed')
+            self.assertIn('camera failed', self.session.error)
+        self.session._stop_sampling()
+
     def test_background_sampler_keeps_real_frames_during_300ms_main_thread_stop(self):
         self._background_inputs()
         self.session.command('start'); self.settle()
@@ -710,6 +828,23 @@ class InitCancelTest(unittest.TestCase):
 
 
 class EntryTest(unittest.TestCase):
+    def test_recording_cadence_is_independent_only_in_background_mode(self):
+        from scripts.teleoperate import main
+        args=['--config', str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),
+              '--record-config', str(ROOT/'configs/a10/a10_dual_arm_record.py'), '--preview']
+        with patch('fluxvla.engines.operators.vr.recording.RecordingSession.connect', side_effect=AssertionError('IO')):
+            self.assertEqual(main(args+['--cfg-options', 'teleop.fps=90']), 0)
+            with self.assertRaises(SystemExit):
+                main(args+['--record-options', 'capture.sampling_mode=control_loop',
+                           '--cfg-options', 'teleop.fps=90'])
+            self.assertEqual(main(args+['--record-options', 'capture.sampling_mode=control_loop',
+                                       '--cfg-options', 'teleop.fps=30']), 0)
+            with self.assertRaises(SystemExit):
+                main(args+['--record-options', 'record.fps=90'])
+        from mmengine import Config
+        config = Config.fromfile(str(ROOT/'configs/a10/a10_dual_arm_record.py'))
+        self.assertTrue(all(c.fps == 30 for c in config.record.cameras.values()))
+
     def test_button_preview_is_robot_free_and_live_requires_grippers(self):
         from scripts.teleoperate import main
         args=['--config',str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),

@@ -10,7 +10,7 @@ record = dict(
     schema='a10_dual_v1',
     root='datasets/a10_dual_lerobot_record',  # 新后端用新目录；不改动旧数据/失败片段。
     fps=30,
-    cameras={name: dict(width=cfg.width, height=cfg.height,
+    cameras={name: dict(width=cfg.width, height=cfg.height, fps=cfg.fps,
                         identity=dict(cfg.identity), rotate_180=cfg.rotate_180)
              for name, cfg in _base_.cameras.items()},
     device_metadata=dict(
@@ -25,7 +25,7 @@ record = dict(
 capture = dict(
     workflow='lerobot',  # 原阶段：准备 -> 录制 -> 整理场景/重录 -> 保存 -> 自动下一集。
     continue_on_spike=True,  # 位姿跳变只锁接管；实测数据有效时保留同一集。
-    sampling_mode='control_loop',  # 与原工具链一致：每轮遥操作后add_frame，不追补帧。
+    sampling_mode='background_30hz',  # 独立30Hz实测采样；不随90Hz控制加速、不追补帧。
     task='Pick up the water bottle',
     terminal=True,  # 备用终端命令；头显/手柄可独立操作。
     buttons=dict(modifier_button='a', threshold=.7, neutral=.2, max_age_s=.25),

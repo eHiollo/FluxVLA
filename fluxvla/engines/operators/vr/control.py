@@ -375,6 +375,7 @@ class VRPoseController:
         self.fault_reason = None
         self._release_elapsed_s = self._release_settled_s = 0.
         self._release_previous_actual = None
+        self._release_previous_feedback_time_s = None
         self._reanchor_translation = np.zeros(3)
         self._reanchor_rotation = Rotation.identity()
         self._rotation_previous_target = None
@@ -507,6 +508,7 @@ class VRPoseController:
                         self.angular_velocity.fill(0.)
                     self._release_elapsed_s = self._release_settled_s = 0.
                     self._release_previous_actual = None
+                    self._release_previous_feedback_time_s = None
                 elif packet == 'inactive':
                     self.governor.release(actual)
                     self.linear_velocity.fill(0.)
@@ -572,7 +574,7 @@ class VRPoseController:
         result.update(command_tracking_error_m=float(error_m), command_tracking_error_rad=float(error_rad))
         return result
 
-    def step_released(self, actual, dt_s, *, feedback_age_s=0., has_error=False):
+    def step_released(self, actual, dt_s, *, feedback_age_s=0., has_error=False, feedback_time_s=None):
         """Bound command deceleration, then hold its endpoint (dual clutch).
 
         Discards the old user/reference target, not the continuous command pose.
@@ -590,6 +592,14 @@ class VRPoseController:
                   'feedback_stale' if feedback_age_s > self.config.max_feedback_age_s else None))
         if reason:
             self.fault_reason = reason
+            return self._result('fault', stop=True)
+        if feedback_time_s is not None and (
+                isinstance(feedback_time_s, bool) or not isinstance(feedback_time_s, (float, int))
+                or not math.isfinite(feedback_time_s) or feedback_time_s < 0):
+            raise ValueError('feedback_time_s must be a finite nonnegative timestamp')
+        previous_time = self._release_previous_feedback_time_s
+        if feedback_time_s is not None and previous_time is not None and feedback_time_s < previous_time:
+            self.fault_reason = 'feedback_timestamp_regression'
             return self._result('fault', stop=True)
         self.anchor.active = False
         self.anchor.target = None
@@ -616,17 +626,28 @@ class VRPoseController:
         stopped_command = (np.linalg.norm(self.linear_velocity) < 1e-10
                            and np.linalg.norm(self.angular_velocity) < 1e-10)
         quiet = False
-        if self._release_previous_actual is not None:
+        new_feedback = (feedback_time_s is None or self._release_previous_feedback_time_s is None
+                        or feedback_time_s > self._release_previous_feedback_time_s)
+        feedback_dt = (dt_s if feedback_time_s is None else
+                       0. if self._release_previous_feedback_time_s is None else
+                       feedback_time_s - self._release_previous_feedback_time_s)
+        if new_feedback and self._release_previous_actual is not None and feedback_dt > 0:
             previous = self._release_previous_actual
-            quiet = (np.linalg.norm(actual[:3] - previous[:3]) <= .01 * dt_s
+            quiet = (np.linalg.norm(actual[:3] - previous[:3]) <= .01 * feedback_dt
                      and (Rotation.from_quat(previous[3:]).inv()
-                          * Rotation.from_quat(actual[3:])).magnitude() <= .05 * dt_s)
-        self._release_previous_actual = actual.copy()
-        # With tracking enforcement disabled, holding confirms only frontend
-        # setpoint deceleration; measured motion/errors remain visible in logs.
-        settled = (stopped_command and (quiet or not self.config.enforce_tracking_error_limits)
-                   and self.fault_reason is None)
-        self._release_settled_s = self._release_settled_s + dt_s if settled else 0.
+                          * Rotation.from_quat(actual[3:])).magnitude() <= .05 * feedback_dt)
+        if new_feedback:
+            self._release_previous_actual = actual.copy()
+            self._release_previous_feedback_time_s = feedback_time_s
+        # No measured stop claim from duplicate cached poses. In the configured
+        # unenforced mode holding still means only frontend command deceleration.
+        if not self.config.enforce_tracking_error_limits:
+            self._release_settled_s = (self._release_settled_s + dt_s
+                                       if stopped_command and self.fault_reason is None else 0.)
+        elif not stopped_command or self.fault_reason:
+            self._release_settled_s = 0.
+        elif new_feedback:
+            self._release_settled_s = self._release_settled_s + feedback_dt if quiet else 0.
         held = self._release_settled_s >= self.config.release_settle_s
         if (self.config.enforce_tracking_error_limits and not held
                 and self._release_elapsed_s > self.config.release_timeout_s):
@@ -639,6 +660,7 @@ class VRPoseController:
         result['relative_target'] = follower_relative(self.startup_anchor, self.command_pose).tolist()
         result.update(release_elapsed_s=self._release_elapsed_s,
                       command_stopped=bool(stopped_command), feedback_quiet=bool(quiet),
+                      feedback_updated=new_feedback, feedback_interval_s=feedback_dt,
                       release_stable_s=self._release_settled_s)
         return result
 

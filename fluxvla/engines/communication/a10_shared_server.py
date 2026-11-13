@@ -4,6 +4,7 @@ import copy
 import errno
 import json
 import logging
+import math
 import socket
 import socketserver
 import threading
@@ -41,6 +42,8 @@ class SharedControl:
         self.status = (self.control if status_ws_port == ws_port else
                        _FollowerConnection(host, status_ws_port, udp_port, timeout_s, joint_udp_port))
         self._control_lock = threading.RLock()
+        # UDP/ownership changes are atomic without waiting for read-only GET.
+        self._target_lock = threading.RLock()
         self._status_lock = self._control_lock if self.status is self.control else threading.RLock()
         self.owner = None
         self.revoked = set()
@@ -54,6 +57,15 @@ class SharedControl:
         self._snapshot_lock = threading.Lock()
         self._snapshot = None
         self._snapshot_sequence = 0
+        self._poll_lock = threading.Lock()
+        self._poll_rates = {}
+        self._poll_stop = threading.Event()
+        self._poll_wakeup = threading.Event()
+        self._poll_thread = None
+        self._poll_error = None
+        self._poll_count = 0
+        self._poll_started = None
+        self._poll_last_duration_s = None
 
     def _remember_state(self, reply):
         # This is the actual robot receive time. Reading the cache must never
@@ -67,7 +79,96 @@ class SharedControl:
 
     def feedback_snapshot(self):
         with self._snapshot_lock:
-            return copy.deepcopy(self._snapshot)
+            snapshot = copy.deepcopy(self._snapshot)
+        with self._poll_lock:
+            error = self._poll_error
+            if snapshot is not None:
+                snapshot['polling'] = self._poll_metrics_locked()
+        if error is not None:
+            raise error  # Known fault is not hidden by a still-young cached pose.
+        return snapshot
+
+    def _poll_metrics_locked(self):
+        elapsed = 0. if self._poll_started is None else time.monotonic() - self._poll_started
+        return dict(requested_hz=max(self._poll_rates.values(), default=0.),
+                    count=self._poll_count, elapsed_s=elapsed,
+                    achieved_hz=self._poll_count / elapsed if elapsed > 0 else 0.,
+                    last_query_s=self._poll_last_duration_s,
+                    error=None if self._poll_error is None else str(self._poll_error))
+
+    def configure_feedback_poll(self, session_id, hz):
+        if hz is not None and (isinstance(hz, bool) or not isinstance(hz, (int, float))
+                               or not math.isfinite(hz) or not 0 < hz <= 100):
+            raise ValueError('feedback poll hz must be within (0, 100] or None')
+        with self._poll_lock:
+            if hz is None:
+                self._poll_rates.pop(session_id, None)
+            else:
+                if self._poll_stop.is_set():
+                    raise RuntimeError('Shared feedback service is closing')
+                if not self._poll_rates:
+                    self._poll_error = None
+                    self._poll_count = 0
+                    self._poll_started = time.monotonic()
+                self._poll_rates[session_id] = float(hz)
+                if self._poll_thread is None:
+                    self._poll_thread = threading.Thread(target=self._poll_feedback,
+                        name='a10-shared-feedback', daemon=True)
+                    self._poll_thread.start()
+            result = self._poll_metrics_locked()
+        self._poll_wakeup.set()
+        return result
+
+    def _poll_feedback(self):
+        while not self._poll_stop.is_set():
+            with self._poll_lock:
+                hz = max(self._poll_rates.values(), default=0.)
+                failed = self._poll_error is not None
+            if not hz or failed:
+                self._poll_wakeup.wait(.1)
+                self._poll_wakeup.clear()
+                continue
+            started = time.monotonic()
+            # Never hold target mutex during GET. Command transactions still
+            # serialize with GET on the same real WebSocket.
+            if not self._status_lock.acquire(timeout=.02):
+                continue
+            failure = None
+            try:
+                reply = self.read_state()
+                state = _controller_state(reply)
+                if state.has_error:
+                    from ..operators.a10_operator import A10ControllerError
+                    raise A10ControllerError('Controller feedback reports a fault')
+                with self._poll_lock:
+                    self._poll_count += 1
+                    self._poll_last_duration_s = time.monotonic() - started
+            except Exception as exc:
+                failure = exc
+                with self._poll_lock:
+                    self._poll_error = exc
+            finally:
+                self._status_lock.release()
+            if failure is not None:
+                # Commands may hold target_lock while querying a separate status
+                # socket. Release status_lock before invalidating ownership.
+                with self._target_lock:
+                    if self.owner is not None:
+                        self.revoked.add(self.owner)
+                self.note('feedback_poll_failed', error=str(failure))
+            # Rate means query start period, not GET latency plus a fixed sleep.
+            # Overruns discard missed ticks; no burst/catch-up requests.
+            self._poll_wakeup.wait(max(0., 1. / hz - (time.monotonic() - started)))
+            self._poll_wakeup.clear()
+
+    def stop_feedback_polling(self):
+        self._poll_stop.set()
+        self._poll_wakeup.set()
+        thread = self._poll_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(self.timeout_s + .5)
+            if thread.is_alive():
+                raise RuntimeError('Shared feedback poller did not stop')
 
     def connect(self):
         try:
@@ -195,6 +296,8 @@ class SharedControl:
         if role not in ('console', 'inference', 'teleop'):
             raise ValueError('Shared client role must be console, inference or teleop')
         op = request['op']
+        if op == 'feedback_poll':
+            return self.configure_feedback_poll(session_id, request.get('hz'))
         if op == 'feedback_snapshot':
             # Cache-only read: no robot request, target ownership or control lock.
             return self.feedback_snapshot()
@@ -226,7 +329,7 @@ class SharedControl:
             # A native command may be holding the control lock while awaiting
             # a long reply. Isolate that socket before obtaining the lock.
             self.control.interrupt()
-            with self._control_lock:
+            with self._control_lock, self._target_lock:
                 self._speed_restore_allowed.clear()
                 reply = self.mode_command('stop_follower', False, stop_motion=True)
                 if owner is not None:
@@ -235,10 +338,14 @@ class SharedControl:
                 self.note('console_stop', session_id=session_id, confirmed=True)
                 return reply
         if op == 'target':
-            while not self._control_lock.acquire(timeout=.02):
+            while not self._target_lock.acquire(timeout=.02):
                 if self.owner != session_id or session_id in self.revoked:
                     raise ControlTransferredError('Control was transferred to the console; no target sent')
             try:
+                with self._poll_lock:
+                    feedback_error = self._poll_error
+                if feedback_error is not None:
+                    raise feedback_error
                 if self.owner != session_id or session_id in self.revoked:
                     raise ControlTransferredError('Control was transferred to the console; no target sent')
                 packet = base64.b64decode(request['packet'], validate=True)
@@ -252,8 +359,8 @@ class SharedControl:
                     raise ConnectionError('Robot control connection unavailable; reconnect explicitly')
                 return udp.send(packet)
             finally:
-                self._control_lock.release()
-        with self._control_lock:
+                self._target_lock.release()
+        with self._control_lock, self._target_lock:
             if op == 'speed_override':
                 if self.owner is not None or (session_id in self.revoked
                         and session_id not in self._speed_restore_allowed):
@@ -341,7 +448,8 @@ class SharedControl:
                                         timeout_s=request.get('timeout_s', self.timeout_s))
 
     def disconnected(self, session_id):
-        with self._control_lock:
+        self.configure_feedback_poll(session_id, None)
+        with self._control_lock, self._target_lock:
             if self.console_operation == session_id:
                 self.console_operation = None
                 self.console_operation_depth = 0
@@ -354,7 +462,8 @@ class SharedControl:
                     self.note('owner_stop_unconfirmed', session_id=session_id, error=repr(exc))
 
     def close(self):
-        with self._control_lock:
+        self.stop_feedback_polling()
+        with self._control_lock, self._target_lock:
             try:
                 self.stop_owner('service_shutdown')
             finally:

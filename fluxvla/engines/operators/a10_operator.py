@@ -707,6 +707,8 @@ class A10Operator(BaseOperator):
         self._status_connection = None
         self._status_thread = None
         self._status_stop = threading.Event()
+        self._feedback_reader = None
+        self._feedback_failure = None
         self._latest_state = None
         self._status_error = None
         self._status_lock = threading.Lock()
@@ -729,8 +731,12 @@ class A10Operator(BaseOperator):
 
     @property
     def last_communication_failure(self):
-        """Direct WS history or shared RPC failure captured before connection cleanup."""
-        return getattr(self._connection, 'last_request_failure', None)
+        """Latest command/cache transport failure, retained through cleanup."""
+        failures = [getattr(connection, 'last_request_failure', None)
+                    for connection in (self._connection, self._feedback_reader)]
+        failures.append(self._feedback_failure)
+        return max((failure for failure in failures if failure is not None),
+                   key=lambda failure: failure.get('failed_wall_ns', 0), default=None)
 
     def _parse_feedback(self, reply):
         return _parse_state(reply, joint_unit=self.feedback_joint_unit,
@@ -827,6 +833,11 @@ class A10Operator(BaseOperator):
                 previous.host, previous.ws_port)
 
     def close(self):
+        feedback_errors = []
+        try:
+            self.stop_feedback_polling()
+        except Exception as exc:
+            feedback_errors.append(exc)
         self._traj_stop_event.set()
         self._status_stop.set()
         if self._status_connection is not None:
@@ -839,7 +850,7 @@ class A10Operator(BaseOperator):
             self._start_confirmed = False
             self._follower_mode = None
             self._reset_cartesian_encoding()
-            errors = []
+            errors = feedback_errors
             closers = [self._connection.close]
             if self.camera_operator is not None:
                 closers.append(self.camera_operator.close)
@@ -1028,6 +1039,50 @@ class A10Operator(BaseOperator):
                 self._started_here = True
             return reply
 
+    def start_feedback_polling(self, hz=30.):
+        """Subscribe to the shared service's single controller GET worker.
+
+        The independent local cache reader never sends GET or takes _io_lock.
+        Explicit command confirmations continue to use fresh synchronous GET.
+        """
+        if (isinstance(hz, bool) or not isinstance(hz, (int, float))
+                or not math.isfinite(hz) or not 0 < hz <= 100):
+            raise ValueError('feedback poll hz must be within (0, 100]')
+        from ..communication.a10_shared_connection import SharedFollowerConnection
+        if not isinstance(self._connection, SharedFollowerConnection):
+            raise ValueError('Independent feedback polling requires shared_control')
+        if self.status_poll_interval_s is not None:
+            raise ValueError('Do not combine independent feedback polling with status_poll_interval_s')
+        if not self.is_connected:
+            raise ConnectionError("A10 operator is not connected")
+        metrics = self._connection.call('feedback_poll', hz=hz)
+        if self._feedback_reader is None:
+            try:
+                self._feedback_reader = self.open_feedback_reader()
+                self._feedback_failure = None
+            except BaseException:
+                self._connection.call('feedback_poll', hz=None)
+                raise
+        return metrics
+
+    def stop_feedback_polling(self):
+        reader, self._feedback_reader = self._feedback_reader, None
+        if reader is None:
+            return
+        self._feedback_failure = getattr(reader, 'last_request_failure', None)
+        try:
+            if self.is_connected:
+                self._connection.call('feedback_poll', hz=None)
+        finally:
+            reader.close()
+
+    def get_cached_frame(self):
+        """Measured controller cache with original time/sequence; caller checks age."""
+        reader = self._feedback_reader
+        if reader is None:
+            raise RuntimeError('Call start_feedback_polling before reading cached frames')
+        return self.get_feedback_snapshot(reader)
+
     def open_feedback_reader(self):
         """Optional local cache channel; never opens another robot socket."""
         from ..communication.a10_shared_connection import SharedFollowerConnection
@@ -1082,6 +1137,7 @@ class A10Operator(BaseOperator):
         frame = self._feedback_frame(state)
         if reader is not None:
             frame['controller_feedback_sequence'] = snapshot['sequence']
+            frame['feedback_polling'] = snapshot.get('polling', {})
         return frame
 
     def get_frame(self, slop=0.7):

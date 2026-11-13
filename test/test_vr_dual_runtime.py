@@ -28,7 +28,7 @@ IDENTITY = np.array([0., 0., 0., 0., 0., 0., 1.])
 
 def configuration(*, identity_bindings=False):
     cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
-    cfg.update(vr_only=True, record_controller=False)
+    cfg.update(vr_only=True, record_controller=False, feedback_poll_hz=None)  # Legacy synchronous fixtures.
     cfg.zx_grippers.enabled = False
     if identity_bindings:
         # Lifecycle fixtures name arms after their hands; site mapping is tested separately.
@@ -878,6 +878,43 @@ class DualLoopbackTest(unittest.TestCase):
                     self.assertEqual(server.commands.count('stop_follower'), 1)
             finally:
                 runtime.close()
+
+
+class CachedFeedbackRuntimeTest(unittest.TestCase):
+    def test_normal_control_reads_cache_but_start_confirms_new_feedback(self):
+        cfg = configuration(identity_bindings=True)
+        vr = VROperator(**{k: v for k, v in cfg.input.items() if k != 'type'})
+        vr.input = HandInput()
+        robot = DualRobot()
+        robot.start_feedback_polling = lambda hz: robot.events.append(('poll', hz))
+        robot.get_cached_frame = lambda: robot.get_frame()
+        runtime = DualVRTeleopRuntime(vr, robot, execute=True, control_mode='reference',
+                                     feedback_poll_hz=30)
+        try:
+            runtime.connect()
+            self.assertIn(('poll', 30), robot.events)
+            cached = robot.get_frame()
+            with patch.object(robot, 'get_cached_frame', return_value=cached) as read_cache, \
+                 patch.object(robot, 'get_frame', wraps=robot.get_frame) as read_fresh:
+                vr.input.rows = {side: hand(1, False) for side in ('left', 'right')}
+                runtime.step()
+                for index in range(2, 5):
+                    vr.input.rows = {side: hand(index, True) for side in ('left', 'right')}
+                    runtime.step()
+                    cached.update(robot.get_frame())
+                # Explicit calls above update the fake cache; runtime's only fresh
+                # request is after follower startup, not one request per tick.
+                self.assertEqual(read_fresh.call_count, 4)
+                self.assertEqual(read_cache.call_count, 4)
+                cached['received_monotonic_s'] -= 1.
+                with self.assertRaisesRegex(RuntimeError, 'stale'):
+                    runtime._checked_frame(require_active=True)
+                cached.update(robot.get_frame())
+                cached['has_error'] = True
+                with self.assertRaisesRegex(RuntimeError, 'fault'):
+                    runtime._checked_frame(require_active=True)
+        finally:
+            runtime.close()
 
 
 if __name__ == '__main__':

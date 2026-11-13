@@ -15,7 +15,8 @@ teleop = dict(
     stop_on_both_release=True,
     # 查询失败保留VR界面，但冻结新目标；不使用过期反馈继续运动或自动重连。
     keep_session_on_query_error=True,
-    cartesian_adapter='sdk_tool_cumulative', fps=30,
+    cartesian_adapter='sdk_tool_cumulative', fps=90,
+    feedback_poll_hz=30,  # 独立GET频率；控制每轮只读带原始时间戳的缓存。
     # 2026-11-12：保留已验收的运动参数，按用户要求默认开启实机与夹爪。
     # 以下约束前端末端目标；不是电机限速或碰撞距离。
     controller_speed_percent=70,

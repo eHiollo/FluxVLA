@@ -767,7 +767,7 @@ class VRTeleopRuntime:
             failure = getattr(self.robot, 'last_communication_failure', None)
             if (self.keep_session_on_query_error and isinstance(exc, Exception)
                     and failure is not None and failure.get('failed_wall_ns', 0) >= started_wall_ns
-                    and failure.get('command') in ('get', 'record_heartbeat')):
+                    and failure.get('command') in ('get', 'feedback_snapshot', 'record_heartbeat')):
                 if recording is not None:
                     recording.reset_cancel.set()
                 self.communication_pause = dict(reason=error, restart_required=True,
@@ -819,6 +819,8 @@ class VRTeleopRuntime:
                               feedback=self.last_frame,
                               sent_relative_target=self.last_relative_target,
                               step_elapsed_s=time.monotonic() - started,
+                              requested_control_hz=getattr(self, '_requested_control_hz', None),
+                              requested_feedback_hz=getattr(self, 'feedback_poll_hz', None),
                               io_timing_s=dict(self.last_io_timing),
                               error=error, execute=self.execute,
                               cartesian_adapter=self.cartesian_adapter,
@@ -1065,6 +1067,7 @@ class VRTeleopRuntime:
             raise ValueError('fps must be a positive integer')
         if max_steps is not None and (type(max_steps) is not int or max_steps <= 0):
             raise ValueError('max_steps must be a positive integer')
+        self._requested_control_hz = fps
         try:
             self.connect()
             recording = getattr(self, 'recording', None)
@@ -1162,7 +1165,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     """
 
     def __init__(self, vr, robot=None, *, gripper=None, zx_grippers=None,
-                 input_recovery_stable_s=.5, stop_on_both_release=True, **settings):
+                 input_recovery_stable_s=.5, stop_on_both_release=True, feedback_poll_hz=None, **settings):
         from .control import VRPoseController
         if (not getattr(vr, 'is_dual', False) or settings.get('control_mode') != 'reference'
                 or settings.get('pose_mapping', 'anchor_relative') != 'anchor_relative'
@@ -1176,6 +1179,12 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if type(stop_on_both_release) is not bool:
             raise ValueError('stop_on_both_release must be bool')
         self.stop_on_both_release = stop_on_both_release
+        if feedback_poll_hz is not None and (isinstance(feedback_poll_hz, bool)
+                or not isinstance(feedback_poll_hz, (float, int))
+                or not math.isfinite(feedback_poll_hz) or not 1 <= feedback_poll_hz <= 90):
+            raise ValueError('feedback_poll_hz must be None or within 1..90 Hz')
+        self.feedback_poll_hz = feedback_poll_hz
+        self._feedback_polling = False
         if not self.reference_control.config.limit_acceleration:
             raise ValueError('Dual release requires acceleration limiting')
         self._arms = {arm: dict(hand=hand, mapper=vr.mappers[hand],
@@ -1225,6 +1234,9 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     def connect(self):
         try:
             super().connect()
+            if self.robot is not None and self.feedback_poll_hz is not None:
+                self.robot.start_feedback_polling(self.feedback_poll_hz)
+                self._feedback_polling = True
             config = self.reference_control.config
             logging.getLogger(__name__).info(
                 '双臂旋转模式=%s，角速度=%srad/s，加速度=%srad/s²，制动=%srad/s²；'
@@ -1485,9 +1497,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._pause_result()
 
 
-    def _checked_frame(self, *, require_active):
+    def _checked_frame(self, *, require_active, force_refresh=False):
         from .control import pose
-        frame = self._timed_call('robot_feedback_s', self.robot.get_frame)
+        read = (self.robot.get_cached_frame if self._feedback_polling and not force_refresh
+                else self.robot.get_frame)
+        frame = self._timed_call('robot_feedback_s', read)
         self.last_frame = frame
         now = time.monotonic()
         if not isinstance(frame, dict) or frame.get('has_error') is not False:
@@ -1608,7 +1622,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     self.robot.set_tool_coordinate()
                     self.robot.start_follower('cartesian')
                 self._started_follower = True
-                poses = self._checked_frame(require_active=True)
+                poses = self._checked_frame(require_active=True, force_refresh=True)
             targets = {}
             for name, context in self._arms.items():
                 context.update(state='holding', key=None, target=poses[name].copy())
@@ -1669,7 +1683,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                                       feedback_age_s=feedback_age, continuous_reanchor=True)
                 context.update(state='tracking', key=key)
             else:
-                result = control.step_released(poses[name], dt, feedback_age_s=feedback_age)
+                result = control.step_released(poses[name], dt, feedback_age_s=feedback_age,
+                    feedback_time_s=self.last_frame['received_monotonic_s'] if self._feedback_polling else None)
                 if context['state'] == 'releasing' and result['state'] == 'holding':
                     context['mapper'].reset()  # Re-clutch only this hand; preserve the other.
                 if context['state'] == 'releasing':

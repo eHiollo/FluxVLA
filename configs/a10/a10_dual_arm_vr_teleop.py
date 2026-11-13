@@ -33,13 +33,13 @@ teleop = dict(
         max_reference_lead_m=None, max_reference_lead_rad=None,
     ),
     zx_grippers=dict(
-        # 2026-11-13: user requested 20% motor speed; device checks retain 5%.
+        # 2026-11-13: user requested 50% motor speed; device checks retain 5%.
         # Only B/0x1000 is advisory; retain raw alarms in recording diagnostics.
         # Firmware detection remains enabled. Set 'stop' to restore the old latch.
         drop_alarm_policy='warn',
         enabled=True, devices=dict(
-            left=dict(_base_.grippers.left, speed=20),
-            right=dict(_base_.grippers.right, speed=20)),
+            left=dict(_base_.grippers.left, speed=50),
+            right=dict(_base_.grippers.right, speed=50)),
         target_rate_raw_s=3000., deadzone=.1, direction=dict(left=1, right=1),
         # A missing serial reply must not consume the whole 200ms capture budget.
         serial_timeout_s=.05,

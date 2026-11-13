@@ -122,26 +122,47 @@ python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --record-options \
-    record.root=/home/robot/VLA/FluxVLA/datasets/a10_dual_lerobot_record \
+    record.root=/home/robot/VLA/FluxVLA/datasets/dual_20261113\
+    record.resume=True \
+    record.recover=True \
   --cfg-options \
     teleop.record_controller=False \
     teleop.vr_only=False \
     teleop.observe_only=False \
     teleop.operator.allow_motion=True \
     teleop.zx_grippers.enabled=True \
-    teleop.controller_speed_percent=50 \
-    teleop.reference_options.max_linear_speed_m_s=0.08 \
-    teleop.reference_options.max_angular_speed_rad_s=0.6 \
-    teleop.reference_options.max_linear_accel_m_s2=0.4 \
-    teleop.reference_options.max_angular_accel_rad_s2=1.5 \
-    teleop.reference_options.max_reference_lead_m=0.03 \
-    teleop.reference_options.max_reference_lead_rad=0.30 \
-    teleop.max_rotation_step_rad=0.030
+    teleop.input.mapping.pos_scale=1.2 \
+    teleop.input.mapping.angle_scale=0.8 \
+    teleop.input.mapping.fine_scale_factor=0.6
 
 
+  record.resume=True \
+  record.recover=True \
  --measure-vr-latency \
 
-  
+ # 清除右夹爪报警
+ python fluxvla/engines/operators/zx_gripper.py \
+  --port /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_5c9323064b6eef11a2c4e7c2c169b110-if00-port0 \
+  --id 1 --reset-alarm --state --max-position-raw 9000
+
+# 左夹爪报警
+python fluxvla/engines/operators/zx_gripper.py \
+  --port /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0EMMMM-if00-port0 \
+  --id 1 --reset-alarm --state --max-position-raw 9000
+
+
+# 检查VR延迟
+python scripts/teleoperate.py \
+  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --check-record-buttons \
+  --measure-vr-latency
+
+
+python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
+
+
+
 # 夹爪参数
 python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
@@ -177,54 +198,6 @@ python scripts/a10_devices.py --update
 python scripts/a10_devices.py --check-grippers
 
 
-
-python - <<'PY'
-import socket
-import struct
-import time
-
-target = [21, 38, -131, 28, 100, 10,
-          -18, -36, 128, -20, -100, 5]
-
-payload = ('jp --motor_pos=[' +
-           ','.join(map(str, target)) + ']').encode('utf-8')
-
-packet = struct.pack('<IIQqqq', len(payload), 0, 0, 0, 0, 0) + payload
-
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-    print('向 192.168.0.150:9999 持续发送目标，Ctrl+C 停止发送')
-    try:
-        while True:
-            sock.sendto(packet, ('192.168.0.150', 9999))
-            time.sleep(1 / 30)
-    except KeyboardInterrupt:
-        print('\nUDP 发送已结束')
-PY
-
-
-
-python - <<'PY'
-import socket
-import struct
-import time
-
-target = [21, 38, -131, 28, 110, 20,
-          -18, -36, 128, -20, -110, 20]
-
-payload = ('jp --motor_pos=[' +
-           ','.join(map(str, target)) + ']').encode('utf-8')
-
-packet = struct.pack('<IIQqqq', len(payload), 0, 0, 0, 0, 0) + payload
-
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-    print('向 192.168.0.150:9999 持续发送目标，Ctrl+C 停止发送')
-    try:
-        while True:
-            sock.sendto(packet, ('192.168.0.150', 9999))
-            time.sleep(1 / 30)
-    except KeyboardInterrupt:
-        print('\nUDP 发送已结束')
-PY
 ====双臂控制台与VR同时打开（默认共享连接，先开哪个都可以）====
 # 终端一：查询不打断VR；控制命令接管，VR窗口保留
 python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py

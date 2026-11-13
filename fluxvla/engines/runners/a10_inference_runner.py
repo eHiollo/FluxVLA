@@ -434,3 +434,126 @@ class A10InferenceRunner(BaseInferenceRunner):
                     if self._recorder is not None:
                         self._recorder.record('cleanup_complete')
                         self._recorder.close()
+
+
+@RUNNERS.register_module()
+class A10DualInferenceRunner:
+    """Config-driven dual follower with interchangeable remote policy transport."""
+
+    def __init__(
+        self,
+        remote_inference,
+        *,
+        cfg=None,
+        ckpt_path=None,
+        mode="preview",
+        cycles=2,
+        execute_horizon=10,
+        action_dt=1 / 30,
+        max_joint_step_rad=0.2,
+        max_send_lag_s=0.1,
+        prompt=None,
+        max_robot_age_s=0.15,
+        max_camera_age_s=0.15,
+        max_gripper_age_s=0.2,
+        max_skew_s=0.15,
+        log_root="work_dirs/a10/inference_logs",
+        dataset=None,
+        denormalize_action=None,
+        task_suite_name="a10_dual",
+        debug_log=None,
+    ):
+        del dataset, denormalize_action, task_suite_name, debug_log  # Model-server settings, not client transforms.
+        if ckpt_path is not None:
+            raise ValueError("Set the checkpoint on the model server")
+        self.config = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg or {})
+        # The standard entrypoint injects cfg into cfg.inference; omit that back-reference.
+        self.config.get("inference", {}).pop("cfg", None)
+        self.remote = dict(remote_inference)
+        self.mode, self.cycles = mode, cycles
+        self.log_root = log_root
+        self.settings = dict(
+            execute_horizon=execute_horizon,
+            action_dt=action_dt,
+            max_joint_step_rad=max_joint_step_rad,
+            max_send_lag_s=max_send_lag_s,
+            max_robot_age_s=max_robot_age_s,
+            max_camera_age_s=max_camera_age_s,
+            max_gripper_age_s=max_gripper_age_s,
+            max_skew_s=max_skew_s,
+            prompt=prompt,
+        )
+        self._ready = False
+
+    def run_setup(self):
+        if self.mode not in ("preview", "simulate", "read_only", "motion"):
+            raise ValueError("mode must be preview, simulate, read_only or motion")
+        if type(self.cycles) is not int or self.cycles < 1:
+            raise ValueError("cycles must be positive")
+        horizon = self.settings["execute_horizon"]
+        if type(horizon) is not int or not 1 <= horizon <= 30:
+            raise ValueError("execute_horizon must be 1..30")
+        for key, value in self.settings.items():
+            if key == "prompt":
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{key} must be positive and finite")
+        timeout = self.remote.get("timeout_s", 120.0)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (float, int))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("remote timeout_s must be positive and finite")
+        if self.remote.get("protocol") not in ("openpi_ws", "fluxvla_zmq"):
+            raise ValueError("remote protocol must be openpi_ws or fluxvla_zmq")
+        if type(self.remote.get("server_port")) is not int or not 1 <= self.remote["server_port"] <= 65535:
+            raise ValueError("Invalid server port")
+        self._ready = True
+
+    def run(self):
+        from pathlib import Path
+        import uuid
+        from fluxvla.projects.a10 import inference as control
+
+        if not self._ready:
+            self.run_setup()
+        print(json.dumps(dict(mode=self.mode, remote_inference=self.remote, **self.settings), indent=2), flush=True)
+        if self.mode == "preview":
+            return
+        root = Path(self.log_root)
+        if not root.is_absolute():
+            root = control.ROOT / root
+        directory = root / (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8] + "_dual_client")
+        directory.mkdir(parents=True, exist_ok=False)
+        (directory / "config.json").write_text(json.dumps(control.plain(self.config), indent=2))
+        log = control.Journal(directory / "events.jsonl")
+        print(f"A10 run logs: {directory}", flush=True)
+        policy = devices = None
+        try:
+            remote = self.remote
+            args = (remote["server_host"], remote["server_port"], remote.get("timeout_s", 120.0))
+            if remote["protocol"] == "openpi_ws":
+                client_root = remote.get("client_root")
+                if client_root and not Path(client_root).is_absolute():
+                    client_root = str(control.ROOT / client_root)
+                policy = control.RemotePolicy(*args, client_root=client_root)
+            else:
+                policy = control.ZmqPolicy(*args, prompt=self.settings["prompt"])
+            log("connected", metadata=policy.metadata, mode=self.mode)
+            config = dict(self.config, bridge=self.settings)
+            devices = (
+                control.SimDevices(log)
+                if self.mode == "simulate"
+                else control.LiveDevices(config, log, motion=self.mode == "motion")
+            )
+            control.run(devices, policy, self.settings, log, cycles=self.cycles, read_only=self.mode == "read_only")
+            print("A10_DUAL_INFERENCE_OK", flush=True)
+        except BaseException as exc:
+            log("client_error", error=str(exc), type=type(exc).__name__)
+            if devices is None and policy is not None:
+                policy.close()
+            raise
+        finally:
+            log.close()

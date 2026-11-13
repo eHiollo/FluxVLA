@@ -57,39 +57,65 @@ class OpenPIA10DenormalizeAction:
         return np.ascontiguousarray(action, dtype=np.float32)
 
 
+@TRANSFORMS.register_module(name="A10NativeDenormalizeAction")
 @TRANSFORMS.register_module()
 class A10RTCDenormalizeAction:
-    """Undo native RTC training mean/std and restore absolute joint targets."""
+    """Configurable inverse normalization and joint deltas; preserve old RTC defaults."""
 
-    def __init__(self, norm_stats):
+    def __init__(self, norm_stats, state_dim=7, statistic_name="a10", norm_type="mean_std", relative_mask=None):
         if isinstance(norm_stats, (str, Path)):
             norm_stats = json.loads(Path(norm_stats).read_text())
-        stats = norm_stats['a10']['action']
-        self.mean = np.asarray(stats['mean'], dtype=np.float32)
-        self.std = np.asarray(stats['std'], dtype=np.float32)
-        if (self.mean.shape != (7,) or self.std.shape != (7,)
-                or not np.isfinite(self.mean).all() or not np.isfinite(self.std).all()
-                or np.any(self.std < 0)):
-            raise ValueError('Expected finite seven-dimensional action mean/std')
+        if state_dim not in (7, 14) or norm_type not in ("mean_std", "quantile"):
+            raise ValueError("A10 requires state_dim 7/14 and mean_std/quantile normalization")
+        self.state_dim, self.norm_type = state_dim, norm_type
+        self.relative_mask = np.asarray(
+            relative_mask if relative_mask is not None else ([True] * 6 + [False]) * (state_dim // 7), dtype=bool
+        )
+        if self.relative_mask.shape != (state_dim,):
+            raise ValueError("Invalid relative mask")
+        stats = norm_stats[statistic_name]["action"]
+        names = ("q01", "q99") if norm_type == "quantile" else ("mean", "std")
+        first, second = (np.asarray(stats[k], dtype=np.float32) for k in names)
+        if (
+            first.shape != (state_dim,)
+            or second.shape != (state_dim,)
+            or not np.isfinite(first).all()
+            or not np.isfinite(second).all()
+        ):
+            raise ValueError("Invalid action statistics")
+        if norm_type == "quantile":
+            if np.any(second < first):
+                raise ValueError("Reversed quantiles")
+            self.low, self.high = first, second
+        else:
+            if np.any(second < 0):
+                raise ValueError("Negative standard deviation")
+            self.mean, self.std = first, second
 
     def normalize_absolute(self, actions, state):
-        if np.any(self.std <= 0):
-            raise ValueError('RTC guidance requires positive action standard deviations')
         actions = np.array(actions, dtype=np.float32, copy=True)
-        actions[:, :6] -= np.asarray(state, dtype=np.float32)[:6]
+        actions[:, self.relative_mask] -= np.asarray(state, dtype=np.float32)[self.relative_mask]
+        if self.norm_type == "quantile":
+            return np.ascontiguousarray(2 * (actions - self.low) / (self.high - self.low + 1e-6) - 1, dtype=np.float32)
+        if np.any(self.std <= 0):
+            raise ValueError("RTC guidance requires positive action standard deviations")
         return np.ascontiguousarray((actions - self.mean) / self.std, dtype=np.float32)
 
     def __call__(self, data):
-        action = np.asarray(data['action'], dtype=np.float32)
-        state = np.asarray(data['state'], dtype=np.float32)
+        action = np.asarray(data["action"], dtype=np.float32)
+        state = np.asarray(data["state"], dtype=np.float32)
         if action.ndim == 3 and action.shape[0] == 1:
             action = action[0]
-        if action.ndim != 2 or not len(action) or action.shape[1] < 7:
-            raise ValueError('Expected nonempty [T,D>=7] actions')
-        if state.shape != (7,) or not np.isfinite(state).all():
-            raise ValueError('Expected finite original state[7]')
-        action = action[:, :7] * self.std + self.mean
-        action[:, :6] += state[:6]
+        if action.ndim != 2 or not len(action) or action.shape[1] < self.state_dim:
+            raise ValueError(f"Expected nonempty [T,D>={self.state_dim}] actions")
+        if state.shape != (self.state_dim,) or not np.isfinite(state).all():
+            raise ValueError(f"Expected finite original state[{self.state_dim}]")
+        action = action[:, : self.state_dim]
+        if self.norm_type == "quantile":
+            action = (action + 1) / 2 * (self.high - self.low + 1e-6) + self.low
+        else:
+            action = action * self.std + self.mean
+        action[:, self.relative_mask] += state[self.relative_mask]
         if not np.isfinite(action).all():
-            raise ValueError('Nonfinite A10 action')
+            raise ValueError("Nonfinite A10 action")
         return np.ascontiguousarray(action, dtype=np.float32)

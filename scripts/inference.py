@@ -30,7 +30,7 @@ overwatch = initialize_overwatch(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Train a model with the given configuration.')
+        description='Run inference with the given configuration.')
     parser.add_argument(
         '--acceleration', choices=['on', 'off'], default=None,
         help='Select Triton/CUDA Graph (on) or plain PyTorch (off); omitted uses config default')

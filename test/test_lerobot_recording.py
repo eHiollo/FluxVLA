@@ -115,6 +115,10 @@ class NativeWriterTests(unittest.TestCase):
 
 
 class NativeSessionTests(SessionTests):
+    def test_native_same_episode_survives_spike_pause_and_keeps_diagnostics(self):
+        self.use_native_writer()
+        SessionTests.test_spike_pause_keeps_same_episode_measured_frames_and_diagnostics(self)
+
     def test_native_drop_warning_records_and_preserves_alarm(self):
         self.use_native_writer()
         SessionTests.test_drop_warning_records_actual_samples_and_preserves_alarm_in_saved_sidecar(self)

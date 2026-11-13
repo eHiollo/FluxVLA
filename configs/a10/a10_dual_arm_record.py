@@ -24,6 +24,7 @@ record = dict(
 # 独立于writer的实时采集/按键参数。30Hz为目标；接收时间并非硬件曝光时间。
 capture = dict(
     workflow='lerobot',  # 原阶段：准备 -> 录制 -> 整理场景/重录 -> 保存 -> 自动下一集。
+    continue_on_spike=True,  # 位姿跳变只锁接管；实测数据有效时保留同一集。
     sampling_mode='control_loop',  # 与原工具链一致：每轮遥操作后add_frame，不追补帧。
     task='Pick up the water bottle',
     terminal=True,  # 备用终端命令；头显/手柄可独立操作。

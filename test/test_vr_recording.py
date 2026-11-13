@@ -172,6 +172,79 @@ class SessionTests(unittest.TestCase):
     def start(self):
         self.session.command('start'); self.settle(); self.update(); self.update()
 
+    def prepare_spike_recording(self):
+        self.session.backend = 'lerobot'
+        self.session.continue_on_spike = True
+        self.robot.get_feedback_snapshot.side_effect = lambda _: self.runtime.last_frame
+        self.runtime.input_pause_hud = lambda: dict(type='hud', phase='input_paused', error='',
+            hint='left hand: spike_pending', input_pause=self.runtime.input_pause_status,
+            controls=dict(prompt='release grips; center sticks'))
+        self.start()
+        self.runtime.input_pause_status = dict(state='release_required', reason='spike_pending', stopped=False)
+        self.session.input_paused('Dual VR right: spike_pending')
+
+    def test_spike_pause_keeps_same_episode_measured_frames_and_diagnostics(self):
+        self.prepare_spike_recording()
+        session = self.session
+        frames = session.frames
+        self.update()
+        self.assertEqual(session.state, 'recording', session.error)
+        self.assertGreater(session.frames, frames)
+        # A stale hand while motion is locked is not a stale robot measurement.
+        self.update(age=.4)
+        self.assertEqual(session.state, 'recording', session.error)
+        # The optional background sampler obeys the same measured-data rule.
+        sample = session._assemble(time.monotonic(), raw=hands(self.seq, age=.4))
+        self.assertEqual(sample[2]['control_phase'], 'input_pause')
+        self.assertIsNone(sample[2]['sdk_tool_command'])
+        session.options['max_sample_gap_s'] = .05
+        time.sleep(.08)  # Simulate waiting for stop; no invented catch-up frames.
+        self.update()
+        self.assertGreaterEqual(session.sample_gaps, 1)
+        self.runtime.input_pause_status['stopped'] = True
+        self.update()
+        session._hud(time.monotonic())
+        hud = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual(hud['hint'], 'input paused; recording')
+        self.assertTrue(hud['capture_active'])
+        session.command('reset')
+        self.assertIsNone(session.reset_thread)
+        self.assertIsNone(session.pending)
+        # Recovery is supplied by runtime only after release/stability/new press.
+        self.runtime.input_pause_status = None
+        self.update()
+        self.assertEqual(session.state, 'recording')
+        session.command('save'); self.settle(); session.close()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+        rows = [json.loads(line) for line in next((self.root/'meta/xlevr_diagnostics').glob('*.jsonl')).read_text().splitlines()]
+        paused = [row for row in rows if row['details']['control_phase'] == 'input_pause']
+        self.assertTrue(paused)
+        self.assertTrue(any(row['details']['control_phase'] == 'teleop' for row in rows))
+        self.assertEqual(paused[0]['details']['input_pause']['reason'], 'spike_pending')
+        self.assertEqual(paused[0]['details']['grippers']['left']['actual_raw'], 4500)
+        self.assertGreaterEqual(rows[-1]['details']['capture_gap_s'], 0.)
+
+    def test_spike_pause_does_not_allow_camera_or_robot_fault_or_other_pause(self):
+        self.prepare_spike_recording()
+        for change in ('camera', 'robot', 'stop_failed', 'communication', 'stale_pause', 'policy_off'):
+            with self.subTest(change=change):
+                self.runtime._dual_stop_failed = change == 'stop_failed'
+                self.runtime.communication_pause = {'reason': 'get failed'} if change == 'communication' else None
+                self.runtime.input_pause_status['reason'] = 'input_stale' if change == 'stale_pause' else 'spike_pending'
+                self.session.continue_on_spike = change != 'policy_off'
+                self.runtime.last_frame['has_error'] = change == 'robot'
+                if change == 'camera':
+                    with patch.object(self.session.cameras, 'snapshot', side_effect=RuntimeError('camera failed')):
+                        with self.assertRaisesRegex(RuntimeError, 'camera failed'): self.session._assemble(time.monotonic())
+                else:
+                    with self.assertRaises(ValueError): self.session._assemble(time.monotonic())
+        self.session.continue_on_spike = True
+        self.runtime.input_pause_status['reason'] = 'spike_pending'
+        self.runtime._dual_stop_failed = False
+        self.runtime.communication_pause = None
+        self.session.gripper_faulted({'left': 'overcurrent'})
+        self.assertEqual(self.session.state, 'failed')
+
     def test_drop_warning_records_actual_samples_and_preserves_alarm_in_saved_sidecar(self):
         source = self.channels['right'].snapshot.side_effect
         self.channels['right'].snapshot.side_effect = lambda: dict(

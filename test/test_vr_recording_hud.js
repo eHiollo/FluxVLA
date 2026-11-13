@@ -78,3 +78,11 @@ assert.equal(attrs('recordHudNotice').value, 'right drop warning; recording');
 assert.equal(attrs('recordHud').color, '#66BB6A');
 context.applyHud({phase: 'failed', error: 'camera disconnected', gripper_warnings: {right: 'drop detected'}});
 assert.equal(attrs('recordHudNotice').value, 'camera disconnected');
+
+context.applyHud({phase: 'input_paused', capture_active: true, input_pause: {reason: 'spike_pending'},
+  controls: {prompt: 'release grips; center sticks'}});
+assert.equal(attrs('recordHudNotice').value, 'input paused; recording');
+assert.equal(attrs('recordHud').color, '#FFD54F');
+assert.equal(attrs('recordHudPrompt').value, 'release grips; center sticks');
+context.applyHud({phase: 'input_paused', capture_active: false, input_pause: {reason: 'spike_pending'}});
+assert.notEqual(attrs('recordHudNotice').value, 'input paused; recording');

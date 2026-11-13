@@ -963,3 +963,10 @@ python scripts/teleoperate.py \
 ```
 
 真实采集负载测试：在原完整采集命令的`--cfg-options`前加`--measure-vr-latency`，其他参数保留。刷新头显网页，采样约2分钟后Ctrl+C退出；报告在`work_dirs/a10/vr/latency/<本次目录>/summary.json`，逐包数据在同目录`events.jsonl`。测的是应用层RTT及发包/收包/读取间隔，不是机械臂响应时间。具体对照流程见[录制指南第8节](a10_vr_recording.md#8-vr-网络延迟诊断2026-11-09)。
+
+
+### 位姿跳变后继续当前集（2026-11-13）
+
+当前双臂录制配置默认 `capture.continue_on_spike=True`。`spike_pending`时机械臂停并锁接管，实测数据有效则保留同一集继续采样。松开两手侧键/前扳机、摇杆回中，输入稳定0.5秒后重新按侧键，用实际当前位置重建锚点；不必重录。头显黄色`input paused; recording`。
+
+reset仍需先解除接管锁定，再松手，A＋左摇杆上→回中→8秒内再次上。停止等待的采样间隙记录在sidecar，不补帧。详见[录制说明](a10_vr_recording.md#19-2026-11-13位姿跳变锁定接管但保留当前录制)。

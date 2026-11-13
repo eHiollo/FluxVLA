@@ -1526,3 +1526,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 头显短句提示掉落warning；原始报警码、策略、warning和实测位置保留在VR快照/录制sidecar，不把提示等同于成功抓取。
 - 115项Python离线测试和JS头显测试通过；覆盖默认拦截、warn开合、混合报警仍拦截、无自动复位、原生LeRobot保存后诊断可读取。测试日志：`/tmp/zx_drop_policy_tests_v2.log`。
 - 本轮未连接硬件；固件报警状态下是否实际接受并执行后续目标仍需现场验证。本变更并未关闭固件掉落检测。未改动用户CLI或同事的OpenPI远程适配文件。
+
+### 2026-11-13：spike暂停与录制有效性解耦
+
+- 用户选择“输入稳定后松开并重新按侧键接管”。复用runtime既有停止确认、双手释放/回中、稳定0.5秒、新按键及实际位姿重建锚点；不改运动恢复条件和reset权限。
+- 双臂原生LeRobot录制新增默认开启的 `capture.continue_on_spike`。仅spike_pending/spike_reanchor锁定可继续有效实测采样，不让单次手柄跳变直接废弃整集；其他暂停/硬件故障仍按原逻辑处理。
+- 每帧记录input_pause、control_phase=input_pause及真实采样间隙；暂停时清空诊断旧笛卡尔命令。仍采用用户原control_loop采样，不为停止等待补造帧。
+- 头显黄色短提示input paused; recording，按键提示保持松手/回中/重新接管。文档明确reset在idle/recording/review可用，接管锁定期间不可用。
+- 110项Python离线测试、JS头显测试通过；覆盖同集恢复保存、原生LeRobot诊断、混合故障、停止失败、时间间隙，以及原有锚点恢复运动测试。证据：`/tmp/a10_spike_recording_final_tests.log`。未连接设备或修改用户CLI/同事文件。

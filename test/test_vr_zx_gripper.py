@@ -124,9 +124,9 @@ class ChannelTest(unittest.TestCase):
         self.assertFalse(c.check_health())
         self.assertEqual((fake.reset_count, fake.disable_count), (0, 0))
 
-    def test_motor_speed_accepts_1_to_15_without_opening_usb(self):
+    def test_motor_speed_accepts_1_to_20_without_opening_usb(self):
         with patch('serial.Serial') as serial:
-            for speed in (1, 5, 10, 15):
+            for speed in (1, 5, 10, 15, 20):
                 with self.subTest(speed=speed):
                     settings = device(); settings['speed'] = speed
                     c = _ZXGripperChannel('left', settings, options())
@@ -136,18 +136,18 @@ class ChannelTest(unittest.TestCase):
 
     def test_motor_speed_rejects_out_of_range_and_non_integer_values(self):
         with patch('serial.Serial') as serial:
-            for speed in (0, 16, 100, 1.5, True, '10'):
+            for speed in (0, 21, 100, 1.5, True, '10'):
                 with self.subTest(speed=speed):
                     settings = device(); settings['speed'] = speed
-                    with self.assertRaisesRegex(ValueError, 'speed within 1..15%'):
+                    with self.assertRaisesRegex(ValueError, 'speed within 1..20%'):
                         _ZXGripperChannel('left', settings, options())
             settings = device(); settings.update(speed=15, torque=61)
             with self.assertRaises(ValueError):
                 _ZXGripperChannel('left', settings, options())
             serial.assert_not_called()
 
-    def test_worker_forwards_configured_15_percent_speed(self):
-        settings = device(); settings['speed'] = 15
+    def test_worker_forwards_configured_20_percent_speed(self):
+        settings = device(); settings['speed'] = 20
         c = _ZXGripperChannel('left', settings, options())
         self.addCleanup(c.close)
         fake = FakeZX(); c.client = fake
@@ -160,7 +160,7 @@ class ChannelTest(unittest.TestCase):
             c.close()
             self.assertTrue(send.call_args_list)
             for call in send.call_args_list:
-                self.assertEqual(call.kwargs['speed'], 15)
+                self.assertEqual(call.kwargs['speed'], 20)
                 self.assertEqual(call.kwargs['torque'], 60)
 
     def test_neutral_gate_open_close_direction_and_lead_limit(self):
@@ -367,7 +367,7 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.assertEqual(cfg.zx_grippers.target_rate_raw_s, 3000.)
         self.assertEqual(cfg.zx_grippers.max_lead_raw, 600.)
         for side in ('left', 'right'):
-            self.assertEqual(cfg.zx_grippers.devices[side].speed, 15)
+            self.assertEqual(cfg.zx_grippers.devices[side].speed, 20)
             self.assertEqual(device(side)['speed'], 5)
         cfg.vr_only = True; cfg.record_controller = False
         with patch('serial.Serial') as serial:

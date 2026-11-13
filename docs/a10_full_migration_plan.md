@@ -1534,3 +1534,10 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 每帧记录input_pause、control_phase=input_pause及真实采样间隙；暂停时清空诊断旧笛卡尔命令。仍采用用户原control_loop采样，不为停止等待补造帧。
 - 头显黄色短提示input paused; recording，按键提示保持松手/回中/重新接管。文档明确reset在idle/recording/review可用，接管锁定期间不可用。
 - 110项Python离线测试、JS头显测试通过；覆盖同集恢复保存、原生LeRobot诊断、混合故障、停止失败、时间间隙，以及原有锚点恢复运动测试。证据：`/tmp/a10_spike_recording_final_tests.log`。未连接设备或修改用户CLI/同事文件。
+
+### 2026-11-13：知行夹爪VR电机速度提高到20%
+
+- 用户明确确认两侧默认电机速度及VR上限从15%提高到20%；力矩60%、行程0～9000、目标速率3000raw/s、领先量600raw不变，设备检查仍为5%。
+- 更新配置、输入边界及模拟线程下发测试、命令速查；未执行硬件运动。
+- 检查初期发现其他任务的合并冲突，本轮未处理；提交前冲突已不在索引中，仅提交本轮5个相关文件，其他暂存与工作区修改保持原样。
+- 验证：33项夹爪VR离线测试通过，包括20%下发、21%拒绝及力矩上限不变；日志 `/tmp/a10_zx_speed20_tests.log`。

@@ -42,9 +42,9 @@ class _ZXGripperChannel:
         if type(self.tolerance) is not int or not 0 <= self.tolerance <= self.high - self.low:
             raise ValueError('Invalid ZX raw position tolerance')
         self.speed, self.torque = device['speed'], device['torque']
-        if (type(self.speed) is not int or not 1 <= self.speed <= 15 or
+        if (type(self.speed) is not int or not 1 <= self.speed <= 20 or
                 type(self.torque) is not int or not 1 <= self.torque <= 60):
-            raise ValueError('ZX teleop requires integer speed within 1..15% and torque within 1..60%')
+            raise ValueError('ZX teleop requires integer speed within 1..20% and torque within 1..60%')
         self.direction = options['direction'][side]
         if self.direction not in (-1, 1) or isinstance(self.direction, bool):
             raise ValueError('ZX direction must be 1 or -1 for each hand')

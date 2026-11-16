@@ -303,7 +303,9 @@ class VRTeleopRuntime:
                  pose_mapping='anchor_relative', pose_calibration=None,
                  controller_speed_percent=None, cartesian_adapter='legacy_anchor',
                  record_controller=False, keep_session_on_query_error=False, confirm_stop=True,
-                 resilient_takeover=False):
+                 resilient_takeover=False, diagnostics_hz=10.):
+        from .diagnostics import DiagnosticsRateGate
+        self._diagnostics_gate = DiagnosticsRateGate(diagnostics_hz)
         if cartesian_adapter not in ('legacy_anchor', 'sdk_tool_cumulative'):
             raise ValueError('Unknown cartesian_adapter')
         if cartesian_adapter == 'sdk_tool_cumulative':
@@ -833,7 +835,8 @@ class VRTeleopRuntime:
                     raise RuntimeError(error) from exc
             raise
         finally:
-            if self._diagnostics is not None:
+            if self._diagnostics is not None and self._diagnostics_gate.ready(
+                    self._diagnostics_signature(error)):
                 getter = getattr(self.mapper, 'get_last_diagnostics', None)
                 record = dict(getter() or {}) if getter else {}
                 if getattr(self.teleoperator, 'is_dual', False):
@@ -874,6 +877,18 @@ class VRTeleopRuntime:
                     record['communication_failure'] = failure
                 self._diagnostics.write(record)
             self._frame_index += 1
+
+    def _diagnostics_signature(self, error):
+        """Small state keys only: no deep copies or full recording snapshots."""
+        pause = getattr(self, 'input_pause_status', None) or {}
+        reference = self.last_reference_result or {}
+        recording = getattr(self, 'recording', None)
+        grippers = self.last_gripper_command or {}
+        accessories = tuple((side, value.get('error'), value.get('communication_error'), value.get('warning'))
+                            for side, value in grippers.items() if isinstance(value, dict))
+        return (error, reference.get('state'), pause.get('reason'), pause.get('state'),
+                getattr(recording, 'state', None), getattr(recording, 'error', None),
+                bool(self.communication_pause), bool(self.shared_control_pause), accessories)
 
     def _step(self, raw, action):
         """Accumulate tool deltas; release/reset/stale input replaces motion with hold."""

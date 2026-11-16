@@ -11,11 +11,32 @@ import logging
 import math
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 
 _STOP = object()
+
+
+class DiagnosticsRateGate:
+    """Select periodic snapshots before copying; state changes bypass the limit."""
+
+    def __init__(self, hz=10.):
+        if isinstance(hz, bool) or not isinstance(hz, (int, float)) or not math.isfinite(hz) or hz <= 0:
+            raise ValueError('diagnostics_hz must be finite and positive')
+        self.interval = 1. / hz
+        self.last_periodic = float('-inf')
+        self.signature = None
+
+    def ready(self, signature, *, now=None):
+        now = time.monotonic() if now is None else now
+        periodic = now - self.last_periodic >= self.interval - 1e-9
+        changed = signature != self.signature
+        self.signature = signature
+        if periodic:
+            self.last_periodic = now
+        return periodic or changed
 
 
 def _json_safe(value: Any) -> Any:

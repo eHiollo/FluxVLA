@@ -62,7 +62,7 @@ class LeRobotWorkflowTests(SessionTests):
         self.assertEqual(self.writer.info['total_episodes'], 0)
         self.session.command('stop'); self.settle()
         self.assertTrue(self.session.quit_requested)
-        self.assertEqual(self.writer.info['total_episodes'], 1)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
 
     def reset_arms(self):
         with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init') as move:
@@ -262,7 +262,7 @@ class LeRobotWorkflowTests(SessionTests):
         for channel in self.channels.values():
             channel.submit.assert_not_called()
         self.session.command('stop'); self.settle()
-        self.assertEqual(self.writer.info['total_episodes'], 1)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
 
     def test_manual_gripper_reset_requires_release_and_verified_stop(self):
         self.runtime.prepare_gripper_maintenance.side_effect = TimeoutError('stop unconfirmed')

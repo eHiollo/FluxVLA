@@ -25,7 +25,7 @@ LOG = logging.getLogger(__name__)
 
 
 class LeRobotEpisodeWriter:
-    def __init__(self, root, cameras, fps=30, *, resume=False, recover=False,
+    def __init__(self, root, cameras, fps=30, *, resume=False,
                  schema='a10_dual_v1', device_metadata=None, synthetic=False,
                  max_episode_frames=18000, image_writer_threads=6,
                  repo_id='local/a10_dual_record'):
@@ -39,7 +39,7 @@ class LeRobotEpisodeWriter:
         if (not self.schema.dual or fps != 30 or set(cameras) != set(self.schema.cameras)
                 or type(image_writer_threads) is not int or image_writer_threads < 1
                 or type(max_episode_frames) is not int or max_episode_frames < 2
-                or type(synthetic) is not bool or (recover and not resume)):
+                or type(synthetic) is not bool):
             raise ValueError('Invalid native LeRobot dual-arm recording configuration')
         for cfg in cameras.values():
             if any(type(cfg.get(k)) is not int or cfg[k] < 64 or cfg[k] % 2 for k in ('width', 'height')):
@@ -71,20 +71,9 @@ class LeRobotEpisodeWriter:
         self._count = 0
         self._stage = self.root / '.recording/active'
         try:
+            self._discard_pending()
             info = self.root / 'meta/info.json'
             self.info = json.loads(info.read_text()) if info.is_file() else {'total_episodes': 0, 'total_frames': 0}
-            if self._stage.exists():
-                phase = json.loads((self._stage / 'episode.json').read_text()).get('phase')
-                if phase == 'saving':
-                    raise RuntimeError('Interrupted native save found; preserve this directory for inspection '
-                                       'and record into a NEW root (no automatic metadata repair)')
-                if not recover:
-                    raise RuntimeError('Unfinished episode found; inspect it then use record.recover=True')
-                archive = self._stage.with_name(f'recovered-{time.time_ns()}')
-                self._stage.rename(archive)
-                images = self.root / 'images'
-                if images.exists():
-                    images.rename(archive / 'images')
             if not resume:
                 self._new_dataset()
                 json_write(self.root / 'meta/recording_contract.json', self.contract)
@@ -93,6 +82,47 @@ class LeRobotEpisodeWriter:
         except BaseException:
             self.close()
             raise
+
+    def _discard_pending(self):
+        """Under the dataset lock, roll back only an uncommitted episode."""
+        if not self._stage.exists():
+            return
+        manifest = self._stage / 'baseline.json'
+        if manifest.exists():
+            baseline = json.loads(manifest.read_text())
+            keep = set(baseline['files'])
+            # Saved episodes use closed files; this save only creates new ones.
+            for area in ('data', 'videos', 'meta'):
+                for path in (self.root / area).rglob('*'):
+                    if path.is_file() and str(path.relative_to(self.root)) not in keep:
+                        path.unlink()
+            shutil.copytree(self._stage / 'baseline_meta', self.root / 'meta', dirs_exist_ok=True)
+        elif json.loads((self._stage / 'episode.json').read_text()).get('phase') == 'saving':
+            # Compatibility with old interrupted saves: only remove files that
+            # no committed episode references. Never delete a shared saved file.
+            from .episode_writer import load_v3, safe_path
+            from .a10_recording_io import data_path
+            info, episodes, _ = load_v3(self.root)
+            if [e['episode_index'] for e in episodes] != list(range(info['total_episodes'])):
+                raise RuntimeError('Old dataset metadata is damaged; cannot identify saved episodes')
+            keep = set()
+            for ep in episodes:
+                keep.add(data_path(self.root, info, ep).resolve())
+                for key, feature in info['features'].items():
+                    if feature['dtype'] == 'video':
+                        keep.add(safe_path(self.root, info['video_path'].format(video_key=key,
+                            chunk_index=ep[f'videos/{key}/chunk_index'],
+                            file_index=ep[f'videos/{key}/file_index'])).resolve())
+            for area in ('data', 'videos'):
+                for path in (self.root / area).rglob('*'):
+                    if path.is_file() and path.resolve() not in keep:
+                        path.unlink()
+        shutil.rmtree(self.root / 'images', ignore_errors=True)
+        for path in self.root.glob('tmp*'):
+            if path.is_dir() and all(p.suffix == '.mp4' for p in path.rglob('*') if p.is_file()):
+                shutil.rmtree(path)
+        shutil.rmtree(self._stage)
+        LOG.warning('已丢弃未保存或保存未完成的当前集，保留已保存数据')
 
     def _new_dataset(self):
         started = time.perf_counter()
@@ -176,6 +206,12 @@ class LeRobotEpisodeWriter:
         if self.active is None or self._error or self._count < 2:
             raise RuntimeError('Need at least two valid frames; discard a failed episode')
         eid = self.info['total_episodes']
+        # Snapshot small metadata, not videos. Each completed episode closes its
+        # parquet files, so a later failure cannot corrupt earlier saved episodes.
+        shutil.copytree(self.root / 'meta', self.active / 'baseline_meta')
+        files = [str(p.relative_to(self.root)) for area in ('meta', 'data', 'videos')
+                 for p in (self.root / area).rglob('*') if p.is_file()]
+        json_write(self.active / 'baseline.json', dict(files=files))
         json_write(self.active / 'episode.json', dict(task=self.task, phase='saving', episode_index=eid))
         # Keep native parallel video encoding and the open cross-episode writers.
         # The recording entrypoint selects spawn before starting device threads.
@@ -184,8 +220,11 @@ class LeRobotEpisodeWriter:
                  eid+1, self._count, len(self.cameras))
         try:
             self.dataset.save_episode()
+            self.dataset.finalize()
+            self.dataset.meta.load_metadata()
+            self.dataset.latest_episode = self.dataset.meta.latest_episode = None
         except BaseException:
-            LOG.exception('LeRobot 第 %d 集保存失败，耗时 %.3fs；保留未完成文件',
+            LOG.exception('LeRobot 第 %d 集保存失败，耗时 %.3fs；本集将在清理时丢弃',
                           eid+1, time.perf_counter()-started)
             raise
         self.info = dict(self.dataset.meta.info)
@@ -204,7 +243,15 @@ class LeRobotEpisodeWriter:
         if self.active is None:
             return
         if json.loads((self.active / 'episode.json').read_text())['phase'] == 'saving':
-            raise RuntimeError('Save was interrupted; preserve files and use a new root')
+            self.dataset.stop_image_writer()
+            self.dataset.finalize()
+            self.dataset = None
+            if self._sidecar is not None: self._sidecar.close()
+            self._sidecar = None
+            self._discard_pending()
+            self.info = json.loads((self.root / 'meta/info.json').read_text())
+            self.active, self._error = None, None
+            return
         self.dataset.clear_episode_buffer()
         self._sidecar.close()
         self._sidecar = None
@@ -228,5 +275,7 @@ class LeRobotEpisodeWriter:
             finally:
                 if self._sidecar is not None:
                     self._sidecar.close()
+                self._discard_pending()
+                self.active = None
         finally:
             self._lock.close()

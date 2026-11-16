@@ -18,7 +18,7 @@ record = dict(
                   for side, cfg in _base_.grippers.items()}),
     image_writer_threads=6,  # 原生后台PNG写入，保存时由LeRobot编码视频。
     max_episode_frames=18000,
-    resume=False, recover=False, synthetic=False,
+    resume=False, synthetic=False,  # 未保存/保存失败的当前集自动丢弃，无需recover。
 )
 
 # 独立于writer的实时采集/按键参数。30Hz为目标；接收时间并非硬件曝光时间。

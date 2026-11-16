@@ -114,34 +114,55 @@ class NativeWriterTests(unittest.TestCase):
                 self.assertIs(writer.dataset, dataset)
                 self.assertIs(writer.dataset.image_writer, image_writer)
             self.assertEqual(save.call_args_list, [unittest.mock.call()]*3)
-            finalize.assert_not_called(); stop_images.assert_not_called()
+            self.assertEqual(finalize.call_count, 3); stop_images.assert_not_called()
             writer.close(); writer.close()
-            finalize.assert_called_once(); stop_images.assert_called_once()
+            self.assertEqual(finalize.call_count, 4); stop_images.assert_called_once()
         report = validate_dataset(self.root)
         self.assertEqual((report['episodes'], report['frames']), (3, 12))
 
-    def test_unfinished_episode_is_preserved_and_can_be_archived_without_publishing(self):
+    def test_unfinished_episode_is_discarded_on_close_without_recover_option(self):
         writer = self.writer()
         writer.start('unfinished'); self.frames(writer); writer.close()
-        self.assertTrue((self.root/'.recording/active/diagnostics.jsonl').is_file())
-        with self.assertRaisesRegex(RuntimeError, 'Unfinished'):
-            self.writer(resume=True)
-        writer = self.writer(resume=True, recover=True)
-        archive, = (self.root/'.recording').glob('recovered-*')
-        self.assertTrue(any((archive/'images').rglob('*.png')))
+        self.assertFalse((self.root/'.recording/active').exists())
+        writer = self.writer(resume=True)
         writer.start('after recovery'); self.frames(writer); writer.save(); writer.close()
         self.assertEqual(validate_dataset(self.root)['episodes'], 1)
 
-    def test_interrupted_native_save_is_never_discarded_or_silently_repaired(self):
+    def test_failed_save_is_discarded_and_previous_saved_episode_remains_readable(self):
         writer = self.writer()
+        writer.start('saved'); self.frames(writer); writer.save()
+        saved_files = {str(p): p.read_bytes() for p in (self.root/'videos').rglob('*.mp4')}
         writer.start('interrupted save'); self.frames(writer)
-        with patch.object(writer.dataset, 'save_episode', side_effect=OSError('disk failed')):
+        native_save = writer.dataset.save_episode
+        def incomplete():
+            native_save()  # Simulate a failure even after native metadata changed.
+            raise OSError('disk failed')
+        with patch.object(writer.dataset, 'save_episode', side_effect=incomplete):
             with self.assertRaisesRegex(OSError, 'disk failed'): writer.save()
-        with self.assertRaisesRegex(RuntimeError, 'Save was interrupted'): writer.discard()
+        writer.discard()
         writer.close()
-        with self.assertRaisesRegex(RuntimeError, 'Interrupted native save'):
-            self.writer(resume=True, recover=True)
-        self.assertTrue((self.root/'.recording/active').exists())
+        self.assertFalse((self.root/'.recording/active').exists())
+        self.assertEqual(validate_dataset(self.root)['episodes'], 1)
+        self.assertEqual(saved_files, {str(p):p.read_bytes() for p in (self.root/'videos').rglob('*.mp4')})
+        writer = self.writer(resume=True)
+        writer.start('new'); self.frames(writer); writer.save(); writer.close()
+        self.assertEqual(validate_dataset(self.root)['episodes'], 2)
+
+    def test_startup_rolls_back_interrupted_save_before_accepting_new_episode(self):
+        writer = self.writer()
+        writer.start('saved'); self.frames(writer); writer.save()
+        writer.start('interrupted'); self.frames(writer)
+        with patch.object(writer.dataset, 'save_episode', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError): writer.save()
+        # Emulate process loss: release resources without running adapter cleanup.
+        writer.dataset.stop_image_writer(); writer.dataset.finalize()
+        writer._sidecar.close(); writer._lock.close(); writer._closed = True
+        orphan = self.root/'videos/partial.mp4'; orphan.write_bytes(b'incomplete')
+        writer = self.writer(resume=True)
+        self.assertFalse(orphan.exists())
+        self.assertFalse((self.root/'.recording/active').exists())
+        writer.close()
+        self.assertEqual(validate_dataset(self.root)['episodes'], 1)
 
     def test_old_backend_directory_wrong_identity_and_second_writer_are_rejected(self):
         writer = self.writer()
@@ -237,7 +258,7 @@ class NativeSessionTests(SessionTests):
         self.assertEqual(self.writer.info['total_episodes'], 1)  # Re-record keeps the same episode index.
         session.command('stop'); self.settle(); session.close()
         self.assertTrue(session.quit_requested)
-        self.assertEqual(validate_dataset(self.root)['episodes'], 2)
+        self.assertEqual(validate_dataset(self.root)['episodes'], 1)
 
     def test_native_episode_contains_m_init_measurements_and_three_videos(self):
         import pyarrow.parquet as pq

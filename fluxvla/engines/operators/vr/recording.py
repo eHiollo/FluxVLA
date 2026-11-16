@@ -568,7 +568,7 @@ class RecordingSession:
             LOG.info('录制：%s %s', self.state, self.notice)
         except Exception as exc:
             self.state = 'failed'; self.error = str(exc)
-            LOG.error('录制%s失败，保留未完成文件：%s', operation, exc)
+            LOG.error('录制%s失败：%s；未保存的当前集在丢弃/退出时清理', operation, exc)
         finally:
             self.future = None
 
@@ -721,12 +721,10 @@ class RecordingSession:
         elif command == 'stop':
             self._auto_start = False
             self.events.update(stop_recording=True, exit_early=True)
-            if self.events['rerecord_episode'] and self.writer.active is not None:
+            if self.writer.active is not None:
                 self._work('discarding', self.writer.discard)
-            elif self.state in ('recording', 'review') and not self.error and self.frames >= 2:
-                self._work('saving', self.writer.save)
             else:
-                self.quit_requested = True  # Failed/empty buffers stay preserved, never published.
+                self.quit_requested = True
         elif command == 'reset':
             self._auto_start = False
             if (self.state not in ('idle', 'recording', 'review') or not self._released()
@@ -864,7 +862,7 @@ class RecordingSession:
                      redo or (self.state == 'review' and not self.error and self.frames >= 2))
             if self.state in ('idle', 'recording', 'review'):
                 show('up', 'RESET', self._released() and not paused)
-            show('down', 'STOP RECORDING')
+            show('down', 'DISCARD + EXIT')
         if self.pending:
             key = 'up' if self.pending == 'reset' else 'left'
             if directions[key]['enabled']: show(key, 'CONFIRM ' + self.pending.upper())
@@ -954,8 +952,8 @@ class RecordingSession:
         if self._closed: return
         self._closed = True; self._closing.set()
         self._stop_sampling()
-        # Invoked AFTER robot cleanup. Closing never silently saves/discards a
-        # partial episode. An already requested save is allowed to finish.
+        # Invoked AFTER robot cleanup. Native recording discards unsaved input;
+        # an already explicitly requested save is allowed to finish first.
         try:
             if self.pool: self.pool.shutdown(wait=True)
             self._poll_future()

@@ -226,6 +226,7 @@ class SessionTests(unittest.TestCase):
 
     def test_spike_pause_does_not_allow_camera_or_robot_fault_or_other_pause(self):
         self.prepare_spike_recording()
+        self.session.continue_on_vr_pause = False  # Historical spike-only policy.
         for change in ('camera', 'robot', 'stop_failed', 'communication', 'stale_pause', 'policy_off'):
             with self.subTest(change=change):
                 self.runtime._dual_stop_failed = change == 'stop_failed'
@@ -244,6 +245,142 @@ class SessionTests(unittest.TestCase):
         self.runtime.communication_pause = None
         self.session.gripper_faulted({'left': 'overcurrent'})
         self.assertEqual(self.session.state, 'failed')
+
+    def test_stream_pause_keeps_same_episode_and_saves_measured_frames(self):
+        self.prepare_spike_recording()
+        self.runtime.input_pause_status = dict(reason='vr_stream_stale', state='release_required', stopped=True)
+        self.session.input_paused('Dual VR right: vr_stream_stale')
+        count = self.session.frames
+        self.update(age=1.9)
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreater(self.session.frames, count)
+        sample = self.session._assemble(time.monotonic(), raw=hands(100, age=1.9))
+        self.assertEqual(sample[2]['input_pause']['reason'], 'vr_stream_stale')
+        self.assertIsNone(sample[2]['sdk_tool_command'])
+        self.assertIsNone(sample[2]['reference_control'])
+        self.assertEqual(sample[0].shape, (14,))
+        hud = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertTrue(hud['capture_active'])
+        self.assertEqual(hud['recording_state'], 'recording')
+        self.assertEqual(hud['hint'], 'input paused; recording')
+        self.robot.start_follower.assert_not_called()
+        self.runtime.input_pause_status = None
+        self.update()
+        self.assertEqual(self.session.state, 'recording')
+        self.assertEqual(self.session.status()['episode'], 1)
+        self.session.command('save'); self.settle(); self.session.close()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+        rows = [json.loads(line) for line in next((self.root/'meta/xlevr_diagnostics').glob('*.jsonl')).read_text().splitlines()]
+        self.assertTrue(any((r['details']['input_pause'] or {}).get('reason') == 'vr_stream_stale' for r in rows))
+
+    def test_stale_input_before_runtime_guard_does_not_fail_background_sample(self):
+        self.prepare_spike_recording()
+        self.runtime.input_pause_status = None
+        self.update(age=.4)  # before_step detects stale before runtime sets pause.
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        raw = hands(100)
+        for hand in raw.values(): hand['xlevr.sample_receive_time_s'] = time.monotonic()-1.9
+        sample = self.session._assemble(time.monotonic(), raw=raw)
+        self.assertEqual(sample[2]['control_phase'], 'input_pause')
+        self.assertEqual(sample[2]['input_pause']['state'], 'pending_runtime_guard')
+        self.assertIsNone(sample[2]['sdk_tool_command'])
+
+    def test_stream_pause_policy_off_and_unsafe_pause_still_fail(self):
+        self.prepare_spike_recording()
+        for reason in ('feedback_stale', 'control_gap', 'unknown'):
+            self.runtime.input_pause_status = dict(reason=reason, stopped=True)
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                self.session._assemble(time.monotonic(), raw=hands(1, age=1))
+        self.runtime.input_pause_status = dict(reason='vr_stream_stale', stopped=True)
+        self.session.continue_on_vr_pause = False
+        self.session.input_paused('VR stream stale')
+        self.assertEqual(self.session.state, 'failed')
+        self.assertFalse(self.session.capturing)
+
+    def test_stream_pause_rejects_real_sensor_faults_and_unconfirmed_stop(self):
+        self.prepare_spike_recording()
+        self.runtime.input_pause_status = dict(reason='vr_stream_stale', stopped=True)
+        for issue in ('robot', 'camera', 'gripper', 'stop', 'communication'):
+            with self.subTest(issue=issue):
+                self.runtime._dual_stop_failed = issue == 'stop'
+                self.runtime.communication_pause = {'reason': 'failed'} if issue == 'communication' else None
+                self.runtime.last_frame['has_error'] = issue == 'robot'
+                with patch.object(self.session.cameras, 'snapshot', side_effect=(RuntimeError('camera fault') if issue == 'camera' else self.session.cameras.snapshot.side_effect)), \
+                     patch.object(self.channels['left'], 'snapshot', side_effect=lambda: dict(
+                         actual_raw=4500, feedback_monotonic_s=time.monotonic(), error='gripper fault' if issue == 'gripper' else None,
+                         enabled=True, alarm_a=0, alarm_b=0)):
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        self.session._assemble(time.monotonic(), raw=hands(1, age=1))
+
+    def test_failed_recording_hud_cannot_be_overwritten_by_runtime_pause(self):
+        self.prepare_spike_recording()
+        self.session.fail('camera disconnected')
+        self.session._hud(time.monotonic())
+        hud = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual(hud['recording_state'], 'failed')
+        self.assertEqual(hud['error'], 'camera disconnected')
+        self.assertFalse(hud['capture_active'])
+        self.assertNotIn('input paused; recording', hud['hint'])
+
+    def test_vr_pause_does_not_start_idle_or_allow_reset(self):
+        self.session.backend = 'lerobot'
+        self.runtime.input_pause_status = dict(reason='vr_stream_stale', stopped=True)
+        self.runtime.input_pause_hud = lambda: dict(phase='input_paused', hint='vr signal delayed',
+            controls=dict(prompt='release grips; wait for signal'))
+        self.session.input_paused('VR stream stale')
+        self.update(age=1)
+        self.session.command('start')
+        self.assertEqual(self.session.state, 'idle')
+        self.assertIsNone(self.session.future)
+        self.session.command('reset')
+        self.assertIsNone(self.session.reset_thread)
+        self.assertIsNone(self.session.pending)
+
+    def test_background_30hz_keeps_writing_during_stream_pause(self):
+        self.prepare_spike_recording()
+        self.runtime.input_pause_status = dict(reason='vr_stream_stale', stopped=True)
+        raw = hands(100, age=1.9)
+        for hand in raw.values(): hand['xlevr.sample_receive_time_s'] = time.monotonic()-1.9
+        self.runtime.teleoperator.input.get_hand_actions.return_value = raw
+        def feedback(_):
+            frame = copy.deepcopy(self.runtime.last_frame)
+            frame['received_monotonic_s'] = time.monotonic()
+            for arm in frame['arms'].values():
+                arm['received_monotonic_s'] = frame['received_monotonic_s']
+            return frame
+        self.robot.get_feedback_snapshot.side_effect = feedback
+        before = self.session.frames
+        self.session._start_sampling()
+        try:
+            deadline = time.monotonic()+1.
+            while self.session.frames < before+4 and time.monotonic() < deadline:
+                time.sleep(.01)
+        finally:
+            self.session._stop_sampling()
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreaterEqual(self.session.frames, before+4)
+        self.assertEqual(self.session.status()['episode'], 1)
+        self.assertEqual(self.session.record['fps'], 30)
+        self.robot.start_follower.assert_not_called()
+
+    def test_stream_pause_still_skips_stale_measurements_and_fails_persistent_loss(self):
+        self.prepare_spike_recording()
+        self.runtime.input_pause_status = dict(reason='vr_stream_stale', stopped=True)
+        frame = copy.deepcopy(self.runtime.last_frame)
+        frame['received_monotonic_s'] = time.monotonic()-1.
+        before = self.session.frames
+        self.session._prepare_sample(time.monotonic(), frame=frame, raw=hands(100, age=1))
+        self.assertIsNone(self.session.ready_sample)
+        self.assertEqual(self.session.state, 'recording')
+        self.assertGreater(self.session.skipped_samples, 0)
+        self.session._append_sample(time.monotonic())
+        self.assertEqual(self.session.frames, before)
+        self.session._missing_since = time.monotonic()-2.
+        self.session._prepare_sample(time.monotonic(), frame=frame, raw=hands(100, age=1))
+        self.assertEqual(self.session.state, 'failed')
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
 
     def test_drop_warning_records_actual_samples_and_preserves_alarm_in_saved_sidecar(self):
         source = self.channels['right'].snapshot.side_effect
@@ -400,6 +537,124 @@ class SessionTests(unittest.TestCase):
         deadline = time.monotonic()+1
         while self.session.ready_sample is None and time.monotonic() < deadline: time.sleep(.005)
         self.assertIsNotNone(self.session.ready_sample)
+
+    def test_90hz_controls_and_independent_30hz_samples_with_slow_feedback(self):
+        self.session.backend = 'lerobot'
+        self.session.sampling_mode = 'background_30hz'
+        self._background_inputs()
+        stop = threading.Event()
+        cache = [self.robot.get_feedback_snapshot(None)]
+        requests = []
+        def poll_feedback():
+            due = time.monotonic()
+            while not stop.wait(max(0., due-time.monotonic())):
+                time.sleep(.020)  # GET itself exceeds the 11.1ms control budget.
+                now = time.monotonic(); requests.append(now)
+                cache[0] = dict(has_error=False, received_monotonic_s=now,
+                    controller_feedback_sequence=len(requests), arms={
+                        'left': dict(ee_id=0, joints=[.2]*6, received_monotonic_s=now),
+                        'right': dict(ee_id=1, joints=[.1]*6, received_monotonic_s=now)})
+                due = max(due+1/30, time.monotonic())
+        self.robot.get_feedback_snapshot.side_effect = lambda _: cache[0]
+        self.robot.get_frame.side_effect = AssertionError('Control/recording must not issue GET')
+        worker = threading.Thread(target=poll_feedback, daemon=True); worker.start()
+        try:
+            self.session.command('start'); self.settle()
+            begin = next_tick = time.monotonic(); calls = []
+            first_request = len(requests)
+            while time.monotonic()-begin < 2.:
+                self.seq += 1
+                raw = hands(self.seq)
+                self.session.before_step(raw, actions())
+                self.session.after_step()
+                calls.append(time.monotonic())
+                next_tick += 1/90
+                time.sleep(max(0., next_tick-time.monotonic()))
+            controls_duration = time.monotonic()-begin
+            feedback_count = len(requests)-first_request
+            self.assertEqual(self.session.state, 'recording', self.session.error)
+            self.assertGreater(len(calls), 150)
+            self.assertLess(len(calls), 200)
+            self.assertGreater(self.session.frames, 45)
+            self.assertLess(self.session.frames, 75)
+            self.assertGreater(feedback_count, 45)
+            self.assertLess(feedback_count, 75)
+            self.session.command('save')
+            deadline = time.monotonic()+3
+            while self.session.state != 'idle' and time.monotonic()<deadline:
+                self.session.after_step(); time.sleep(.005)
+            self.assertEqual(self.session.state, 'idle', self.session.error)
+            self.session._stop_sampling(); self.session.close()
+        finally:
+            stop.set(); worker.join(1.)
+        rows = [json.loads(line) for line in next((self.root/'meta/xlevr_diagnostics').glob('*.jsonl')).read_text().splitlines()]
+        duration = rows[-1]['capture_monotonic_s']-rows[0]['capture_monotonic_s']
+        measured_hz = (len(rows)-1)/duration
+        self.assertGreater(measured_hz, 25.)
+        self.assertLess(measured_hz, 35.)
+        self.assertTrue(all(row['details']['nominal_capture_hz'] == 30 for row in rows))
+        self.assertTrue(all(row['details']['robot_received_monotonic_s'] <= row['capture_monotonic_s'] for row in rows))
+        self.assertTrue(any(row['details']['controller_feedback_sequence'] for row in rows))
+        print(f'RATE TEST: controls={len(calls)/controls_duration:.2f}Hz capture={measured_hz:.2f}Hz feedback={feedback_count/controls_duration:.2f}Hz')
+
+    def test_slow_add_frame_does_not_block_control_or_lose_finish_button(self):
+        self.session.backend = 'lerobot'; self.session.workflow = 'lerobot'
+        self._background_inputs()
+        entered = threading.Event(); release = threading.Event()
+        append = self.writer.append
+        def slow_append(*args, **kwargs):
+            entered.set(); release.wait(2.)
+            return append(*args, **kwargs)
+        with patch.object(self.writer, 'append', side_effect=slow_append):
+            self.session.command('start'); self.settle()
+            self.assertTrue(entered.wait(1.))
+            worst = 0.
+            # Real modifier/neutral/direction sequence, while append stays blocked.
+            for kw in ({}, {'modifier': True}, {'modifier': True, 'x': 1.}, {}):
+                self.seq += 1; before = time.monotonic()
+                self.session.before_step(hands(self.seq, **kw), actions())
+                self.session.after_step()
+                worst = max(worst, time.monotonic()-before)
+            self.assertLess(worst, .05)
+            self.assertFalse(self.session.commands.empty())
+            self.assertEqual(self.session.state, 'recording')
+            release.set()
+            deadline = time.monotonic()+1
+            while self.session.state != 'review' and time.monotonic()<deadline:
+                self.session.after_step(); time.sleep(.005)
+            self.assertEqual(self.session.state, 'review')
+            self.assertGreaterEqual(self.session.frames, 1)
+        self.session._stop_sampling()
+
+    def test_inflight_append_never_delays_reset_cancel_or_overwrites_fault(self):
+        self.session.backend = 'lerobot'; self.session.workflow = 'lerobot'
+        self._background_inputs()
+        entered = threading.Event(); release = threading.Event()
+        append = self.writer.append
+        def slow_append(*args, **kwargs):
+            entered.set(); release.wait(2.)
+            return append(*args, **kwargs)
+        with patch.object(self.writer, 'append', side_effect=slow_append):
+            self.session.command('start'); self.settle()
+            self.assertTrue(entered.wait(1.))
+            # An existing m_init remains exclusive; cancellation must not wait
+            # for disk IO. Mimic the actual resetting state without motion.
+            self.session.state = 'resetting'
+            self.session._reset_return_state = 'recording'
+            self.session.reset_thread = Mock(is_alive=lambda: True)
+            self.session.commands.put_nowait('down')
+            self.session.after_step()
+            self.assertTrue(self.session.reset_cancel.is_set())
+            self.session.reset_thread = None
+            self.session.state = 'recording'
+            self.session.record['max_episode_frames'] = 1
+            self.session.fail('camera failed during append')
+            release.set()
+            deadline = time.monotonic()+1
+            while self.session._append_inflight and time.monotonic()<deadline: time.sleep(.005)
+            self.assertEqual(self.session.state, 'failed')
+            self.assertIn('camera failed', self.session.error)
+        self.session._stop_sampling()
 
     def test_background_sampler_keeps_real_frames_during_300ms_main_thread_stop(self):
         self._background_inputs()
@@ -710,6 +965,23 @@ class InitCancelTest(unittest.TestCase):
 
 
 class EntryTest(unittest.TestCase):
+    def test_recording_cadence_is_independent_only_in_background_mode(self):
+        from scripts.teleoperate import main
+        args=['--config', str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),
+              '--record-config', str(ROOT/'configs/a10/a10_dual_arm_record.py'), '--preview']
+        with patch('fluxvla.engines.operators.vr.recording.RecordingSession.connect', side_effect=AssertionError('IO')):
+            self.assertEqual(main(args+['--cfg-options', 'teleop.fps=90']), 0)
+            with self.assertRaises(SystemExit):
+                main(args+['--record-options', 'capture.sampling_mode=control_loop',
+                           '--cfg-options', 'teleop.fps=90'])
+            self.assertEqual(main(args+['--record-options', 'capture.sampling_mode=control_loop',
+                                       '--cfg-options', 'teleop.fps=30']), 0)
+            with self.assertRaises(SystemExit):
+                main(args+['--record-options', 'record.fps=90'])
+        from mmengine import Config
+        config = Config.fromfile(str(ROOT/'configs/a10/a10_dual_arm_record.py'))
+        self.assertTrue(all(c.fps == 30 for c in config.record.cameras.values()))
+
     def test_button_preview_is_robot_free_and_live_requires_grippers(self):
         from scripts.teleoperate import main
         args=['--config',str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),

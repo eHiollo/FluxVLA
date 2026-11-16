@@ -3,8 +3,9 @@ import socket
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from fluxvla.engines.operators.a10_operator import A10Operator, _FollowerConnection
+from fluxvla.engines.operators.a10_operator import A10Operator, _FollowerConnection, A10NotReadyError, A10ControllerError
 from fluxvla.engines.communication.a10_shared_connection import SharedFollowerConnection
 from fluxvla.engines.communication.a10_shared_server import SharedControl, SharedControlServer, ConsoleSharedControl
 from test_a10_operator import FakeController, status_reply
@@ -50,6 +51,36 @@ class SharedControlTest(unittest.TestCase):
         self.clients.append(client)
         client.connect()
         return client
+
+    def test_request_stop_sends_once_without_controller_result_or_state_reads(self):
+        client = self.client('teleop')
+        client.start_follower()
+        self.controller.change_mode = False  # Native follower deliberately remains active.
+        with patch.object(self.robot, 'read_state', side_effect=AssertionError('Stop queried state')),              patch.object(client, '_wait_mode', side_effect=AssertionError('Stop waited for mode')):
+            result = client.request_stop_follower()
+            self.assertEqual(result, dict(requested=True, confirmed=False))
+            self.assertEqual(client._connection.call('stop_request'), result)  # No replay on duplicate.
+        self.assertIsNone(self.robot.owner)
+        self.assertIn(client._connection.session_id, self.robot.revoked)
+        self.assertFalse(client.follower_stop_pending)
+        self.assertFalse(client.last_stop_confirmed)
+        deadline = time.monotonic() + 1.
+        while 'stop_follower' not in self.controller.commands and time.monotonic() < deadline:
+            time.sleep(.005)
+        self.assertEqual(self.controller.commands.count('stop_follower'), 1)
+        self.assertTrue(self.controller.active)  # No claim of actual native stop.
+        with self.assertRaises(PermissionError):
+            self.robot.claim('another-session', 'teleop')
+
+    def test_request_stop_never_stops_another_owner(self):
+        owner = self.client('teleop')
+        other = self.client('teleop')
+        owner.start_follower()
+        with self.assertRaises(PermissionError):
+            other._connection.call('stop_request')
+        self.assertEqual(self.robot.owner, owner._connection.session_id)
+        self.assertNotIn('stop_follower', self.controller.commands)
+        owner.stop_follower()
 
     def speed_controller(self):
         values = dict(percent=40)
@@ -375,5 +406,63 @@ class SharedControlTest(unittest.TestCase):
         self.controller.active = False
 
 
+    def test_recording_poll_error_is_visible_but_does_not_revoke_command_only_owner(self):
+        import time
+        client = self.client('teleop')
+        client._connection.shared['require_feedback'] = False
+        client.start_follower()
+        session = client._connection.session_id
+        self.robot.configure_feedback_poll(session, 30.)
+        with patch.object(self.robot, 'read_state', side_effect=TimeoutError('recording GET failed')):
+            deadline = time.monotonic() + 1.
+            while self.robot._poll_error is None and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertIsNotNone(self.robot._poll_error)
+            self.assertNotIn(session, self.robot.revoked)
+            self.assertEqual(self.robot.owner, session)
+            with self.assertRaisesRegex(TimeoutError, 'recording GET failed'):
+                client._connection.call('feedback_snapshot')
+            client.send_joints({'right': [.1]*6})
+            self.assertTrue(self.controller.joint_udp.recv(1024))
+        client.stop_follower()
+
+
+    def test_regular_owner_still_requires_healthy_feedback(self):
+        client = self.client('teleop')
+        client.start_follower()
+        with self.robot._poll_lock:
+            self.robot._poll_error = TimeoutError('regular GET failed')
+        with self.assertRaisesRegex(TimeoutError, 'regular GET failed'):
+            client.send_joints({'right': [.1]*6})
+        client.stop_follower()
+
+
+
 if __name__ == '__main__':
     unittest.main()
+
+
+class ToolCoordinateTest(unittest.TestCase):
+    def test_already_tool_skips_coordinate_command_even_while_native_stop_is_pending(self):
+        with FakeController(initial_active=True) as controller:
+            controller.motion = 'Running'
+            operator = controller.operator()
+            operator.ensure_tool_coordinate()
+            self.assertTrue(all(c == 'get' for c in controller.commands))
+            self.assertFalse(operator.follower_stop_pending)
+
+
+    def test_real_coordinate_change_keeps_stopped_and_fault_checks(self):
+        with FakeController() as controller:
+            controller.coordinate = 'Axis'
+            controller.motion = 'Running'
+            operator = controller.operator()
+            with self.assertRaises(A10NotReadyError):
+                operator.ensure_tool_coordinate()
+            self.assertTrue(all(c == 'get' for c in controller.commands))
+            controller.motion = 'Stopped'
+            operator.ensure_tool_coordinate()
+            self.assertEqual(controller.coordinate, 'Tool')
+            controller.driver_fault = True
+            with self.assertRaises(A10ControllerError):
+                operator.ensure_tool_coordinate()

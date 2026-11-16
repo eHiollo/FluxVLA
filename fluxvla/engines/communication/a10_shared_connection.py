@@ -168,7 +168,8 @@ class SharedFollowerConnection:
         self.call('command', command=command)
 
     def lease(self, operation):
-        return self.call('lease', operation=operation)
+        return self.call('lease', operation=operation,
+                         require_feedback=self.shared.get('require_feedback', True))
 
     def close(self):
         sock, reader = self._sock, self._reader

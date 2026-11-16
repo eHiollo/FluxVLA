@@ -115,6 +115,18 @@ class NativeWriterTests(unittest.TestCase):
 
 
 class NativeSessionTests(SessionTests):
+    def test_native_90hz_controls_preserve_30hz_dataset_with_slow_feedback(self):
+        self.use_native_writer()
+        SessionTests.test_90hz_controls_and_independent_30hz_samples_with_slow_feedback(self)
+        import pyarrow.parquet as pq
+        table = pq.read_table(next((self.root/'data').rglob('*.parquet')))
+        timestamps = table.column('timestamp').to_numpy()
+        np.testing.assert_allclose(np.diff(timestamps), 1/30, atol=1e-6)
+        rows = [json.loads(line) for line in next((self.root/'meta/xlevr_diagnostics').glob('*.jsonl')).read_text().splitlines()]
+        self.assertEqual(len(timestamps), len(rows))
+        self.assertAlmostEqual(float(timestamps[-1]),
+                               rows[-1]['capture_monotonic_s']-rows[0]['capture_monotonic_s'], delta=.10)
+
     def test_native_same_episode_survives_spike_pause_and_keeps_diagnostics(self):
         self.use_native_writer()
         SessionTests.test_spike_pause_keeps_same_episode_measured_frames_and_diagnostics(self)

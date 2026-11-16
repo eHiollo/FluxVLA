@@ -106,9 +106,20 @@ AFRAME.registerComponent('controller-updater', {
       };
       el.setAttribute('value', data.pending ? `confirm ${shortText(data.pending, 20)}` : (titles[phase] || shortText(phase, 28)));
       el.setAttribute('color', data.pending ? '#FFD54F' : (colors[phase] || '#FFFFFF'));
-      const spikeRecording = data.capture_active && !data.error &&
-        ['spike_pending', 'spike_reanchor'].includes(data.input_pause?.reason);
-      if (spikeRecording) el.setAttribute('color', '#FFD54F');
+      const feedbackPaused = data.input_pause?.reason === 'feedback_stale';
+      if (feedbackPaused && !data.pending) {
+        el.setAttribute('value', phase === 'input_ready' ? 'robot ready' : 'robot paused');
+      }
+      const pausedRecording = data.capture_active && !data.error &&
+        ['spike_pending', 'spike_reanchor', 'vr_stream_stale', 'input_stale',
+         'stale_age', 'sample_gap', 'tracking_lost', 'invalid_sample',
+         'sequence_rollback'].includes(data.input_pause?.reason);
+      const recordingFailed = data.recording_state === 'failed';
+      if (pausedRecording) el.setAttribute('color', '#FFD54F');
+      if (recordingFailed) {
+        el.setAttribute('value', 'episode invalid');
+        el.setAttribute('color', '#EF5350');
+      }
       const details = [];
       if (Number.isFinite(data.episode) && data.episode > 0) details.push(`ep ${data.episode}`);
       if (Number.isFinite(data.elapsed_s)) details.push(`time ${data.elapsed_s.toFixed(1)}s`);
@@ -118,7 +129,14 @@ AFRAME.registerComponent('controller-updater', {
       const diagnostic = String(data.error || data.hint || '').toLowerCase();
       let notice = shortText(diagnostic);
       // Full diagnostics stay in the terminal/JSONL, not across the headset.
-      if (spikeRecording) notice = 'input paused; recording';
+      if (recordingFailed) notice = shortText(data.error || 'recording blocked');
+      else if (feedbackPaused) {
+        notice = data.input_pause.state === 'stop_unconfirmed' ? 'stop unconfirmed; check controller' :
+          data.input_pause.state === 'feedback_wait' ? 'waiting for robot feedback' :
+          phase === 'input_ready' ? 'feedback stable' : 'release grips; wait for feedback';
+      }
+      else if (pausedRecording) notice = 'input paused; recording';
+      else if (diagnostic.includes('input paused; recording')) notice = 'recording blocked';
       else if (diagnostic.includes('retry pending') || diagnostic.includes('retry queued')) notice = 'retry queued; center sticks';
       else if (diagnostic.includes('gripper locked')) notice = 'gripper fault; arms available';
       else if (diagnostic.includes('vr input stale') || diagnostic.includes('vr input stream lost')) notice = 'vr signal delayed';

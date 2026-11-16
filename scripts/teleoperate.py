@@ -117,12 +117,15 @@ def main(argv=None):
         observe_only=runtime.observe_only, fps=cfg.teleop.get('fps', 30),
         record_controller=runtime.record_controller)
     if args.record_config:
-        if cfg.teleop.get('fps', 30) != 30:
-            parser.error('双臂数据录制要求teleop.fps=30')
         from fluxvla.engines.operators.vr.recording import RecordingSession
         record_config = Config.fromfile(str(args.record_config))
         if args.record_options: record_config.merge_from_dict(args.record_options)
         record_cfg = record_config.to_dict()
+        if record_cfg['record'].get('fps', 30) != 30:
+            parser.error('双臂数据录制要求record.fps=30')
+        if (record_cfg.get('capture', {}).get('sampling_mode', 'background_30hz') == 'control_loop'
+                and cfg.teleop.get('fps', 30) != 30):
+            parser.error('control_loop采集要求teleop.fps=30；90Hz控制请使用background_30hz采集')
         runtime.recording = RecordingSession(runtime, record_cfg, button_check=args.check_record_buttons)
         runtime.vr.recording_enabled = True
         print(f'数据入口：backend={runtime.recording.backend}，workflow={runtime.recording.workflow}，'
@@ -131,7 +134,12 @@ def main(argv=None):
               f'目录={record_cfg["record"]["root"]}，右手功能键={runtime.recording.buttons.button}；'
               f'只读按键检查={args.check_record_buttons}')
     if args.preview:
+        continuous_feedback = getattr(runtime, 'continuous_feedback', True)
+        query_hz = cfg.teleop.get('feedback_poll_hz') if (continuous_feedback or args.record_config) else None
+        query_description = f'{query_hz}Hz' if query_hz is not None else '关闭'
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
+              f'控制目标={cfg.teleop.get("fps", 30)}Hz，独立状态查询={query_description}，'
+              f'continuous_feedback={continuous_feedback}，'
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
               f'record_controller={runtime.record_controller}，measure_vr_latency={args.measure_vr_latency}，'
               f'zx_grippers={getattr(runtime, "zx_grippers_enabled", False)}，'

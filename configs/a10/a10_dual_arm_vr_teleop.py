@@ -15,7 +15,8 @@ teleop = dict(
     stop_on_both_release=True,
     # 查询失败保留VR界面，但冻结新目标；不使用过期反馈继续运动或自动重连。
     keep_session_on_query_error=True,
-    cartesian_adapter='sdk_tool_cumulative', fps=30,
+    cartesian_adapter='sdk_tool_cumulative', fps=90,
+    feedback_poll_hz=30,  # 独立GET频率；控制每轮只读带原始时间戳的缓存。
     # 2026-11-12：保留已验收的运动参数，按用户要求默认开启实机与夹爪。
     # 以下约束前端末端目标；不是电机限速或碰撞距离。
     controller_speed_percent=70,
@@ -32,13 +33,13 @@ teleop = dict(
         max_reference_lead_m=None, max_reference_lead_rad=None,
     ),
     zx_grippers=dict(
-        # 2026-11-13: user requested 20% motor speed; device checks retain 5%.
+        # 2026-11-13: user requested 50% motor speed; device checks retain 5%.
         # Only B/0x1000 is advisory; retain raw alarms in recording diagnostics.
         # Firmware detection remains enabled. Set 'stop' to restore the old latch.
         drop_alarm_policy='warn',
         enabled=True, devices=dict(
-            left=dict(_base_.grippers.left, speed=20),
-            right=dict(_base_.grippers.right, speed=20)),
+            left=dict(_base_.grippers.left, speed=50),
+            right=dict(_base_.grippers.right, speed=50)),
         target_rate_raw_s=3000., deadzone=.1, direction=dict(left=1, right=1),
         # A missing serial reply must not consume the whole 200ms capture budget.
         serial_timeout_s=.05,

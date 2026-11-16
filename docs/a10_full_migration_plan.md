@@ -1633,3 +1633,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 70项日志、控制保护、录制工作流回归通过；加强跳过mapper快照构建的4项复测通过。日志 `/tmp/a10_vr_10hz_tests.log`、`/tmp/a10_vr_10hz_final_tests.log`。只使用合成机器人，未实机运动。
 - 保存调研发现meta快照复制大量历史sidecar；cloth_folding_04约67.9MB中诊断占67.49MB。建议后续只备份可变元数据，先补分段计时。CPU H.264小探测可用，PyAV NVENC探测未启动，编码性能对照尚待同素材实测；详见录制指南第24节。本次未修改保存参数或速度优先策略。
 - 仅提交本次runtime/diagnostics、新测试及文档增量，保留并行配置重构、用户CLI和其他未提交工作。
+
+
+### 2026-11-16：保存快照排除历史诊断日志
+
+- 元数据copytree排除xlevr_diagnostics，其他元数据继续备份，baseline文件清单继续保留历史诊断路径；原始日志留在原位置，失败回滚不删除前面已保存集的诊断。
+- 增加备份、原生保存、文件收尾耗时；总计时覆盖备份阶段。保持原生三路并行编码、编码参数和每集保存边界。只操作临时合成数据，未改写现场数据集或操作设备。
+- 本次不纳入用户CLI、配置重命名及其他会话未提交内容。
+- 验证：2项新增真实LeRobot快照/失败回滚测试与3项连续多集、失败重录、启动清理回归通过；diff检查通过。测试日志 `/tmp/a10_metadata_backup_tests.log`、`/tmp/a10_metadata_backup_regression.log`。需重启采集程序加载新保存逻辑。

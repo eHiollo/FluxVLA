@@ -206,23 +206,31 @@ class LeRobotEpisodeWriter:
         if self.active is None or self._error or self._count < 2:
             raise RuntimeError('Need at least two valid frames; discard a failed episode')
         eid = self.info['total_episodes']
+        started = time.perf_counter()
         # Snapshot small metadata, not videos. Each completed episode closes its
         # parquet files, so a later failure cannot corrupt earlier saved episodes.
-        shutil.copytree(self.root / 'meta', self.active / 'baseline_meta')
+        # Historical sidecars are immutable; the manifest preserves their files.
+        shutil.copytree(self.root / 'meta', self.active / 'baseline_meta',
+                        ignore=shutil.ignore_patterns('xlevr_diagnostics'))
         files = [str(p.relative_to(self.root)) for area in ('meta', 'data', 'videos')
                  for p in (self.root / area).rglob('*') if p.is_file()]
         json_write(self.active / 'baseline.json', dict(files=files))
         json_write(self.active / 'episode.json', dict(task=self.task, phase='saving', episode_index=eid))
+        backup_elapsed = time.perf_counter() - started
+        LOG.info('LeRobot 元数据备份完成，耗时 %.3fs；跳过历史诊断日志', backup_elapsed)
         # Keep native parallel video encoding and the open cross-episode writers.
         # The recording entrypoint selects spawn before starting device threads.
-        started = time.perf_counter()
         LOG.info('LeRobot 第 %d 集开始保存：%d 帧，%d 路视频，原生并行编码',
                  eid+1, self._count, len(self.cameras))
         try:
+            native_started = time.perf_counter()
             self.dataset.save_episode()
+            native_elapsed = time.perf_counter() - native_started
+            finalize_started = time.perf_counter()
             self.dataset.finalize()
             self.dataset.meta.load_metadata()
             self.dataset.latest_episode = self.dataset.meta.latest_episode = None
+            finalize_elapsed = time.perf_counter() - finalize_started
         except BaseException:
             LOG.exception('LeRobot 第 %d 集保存失败，耗时 %.3fs；本集将在清理时丢弃',
                           eid+1, time.perf_counter()-started)
@@ -235,8 +243,9 @@ class LeRobotEpisodeWriter:
         shutil.move(self.active / 'diagnostics.jsonl', dest)
         shutil.rmtree(self.active)
         self.active = None
-        LOG.info('LeRobot 第 %d 集保存完成，耗时 %.3fs；复用数据集继续下一集',
-                 eid+1, time.perf_counter()-started)
+        LOG.info('LeRobot 第 %d 集保存完成，总耗时 %.3fs（备份 %.3fs，原生保存 %.3fs，'
+                 '文件收尾 %.3fs）；复用数据集继续下一集',
+                 eid+1, time.perf_counter()-started, backup_elapsed, native_elapsed, finalize_elapsed)
         return eid
 
     def discard(self):

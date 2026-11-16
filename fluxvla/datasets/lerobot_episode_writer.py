@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import json
+import logging
 from pathlib import Path
 import shutil
 import tempfile
@@ -18,6 +19,9 @@ import numpy as np
 
 from .a10_recording_schema import get_schema
 from .episode_writer import json_write
+
+
+LOG = logging.getLogger(__name__)
 
 
 class LeRobotEpisodeWriter:
@@ -91,6 +95,7 @@ class LeRobotEpisodeWriter:
             raise
 
     def _new_dataset(self):
+        started = time.perf_counter()
         # create() requires a nonexistent root. Initialise beside the lock,
         # then relocate the empty native dataset before any frame paths exist.
         with tempfile.TemporaryDirectory(prefix='.lerobot-init-', dir=self.root) as tmp:
@@ -102,6 +107,7 @@ class LeRobotEpisodeWriter:
         ds.meta.info['a10_recording_schema'] = self.schema.name
         json_write(self.root / 'meta/info.json', ds.meta.info)
         self.dataset, self.info = ds, ds.meta.info
+        LOG.info('LeRobot 数据集创建完成：%s，耗时 %.3fs', self.root, time.perf_counter()-started)
 
     def _features(self):
         result = {key: dict(dtype='float32', shape=(14,), names=list(names))
@@ -119,9 +125,11 @@ class LeRobotEpisodeWriter:
         else:
             # Only local, already committed datasets reach the native loader.
             from .a10_recording_io import validate_dataset
+            started = time.perf_counter()
             validate_dataset(self.root, check_videos=False, _locked=True)
             self.dataset = self.dataset_type(self.repo_id, root=self.root, video_backend='pyav')
             self.dataset.start_image_writer(num_threads=self.image_writer_threads)
+            LOG.info('LeRobot 续录打开完成：%s，耗时 %.3fs', self.root, time.perf_counter()-started)
 
     def start(self, task):
         if self._closed or self.active is not None:
@@ -169,13 +177,18 @@ class LeRobotEpisodeWriter:
             raise RuntimeError('Need at least two valid frames; discard a failed episode')
         eid = self.info['total_episodes']
         json_write(self.active / 'episode.json', dict(task=self.task, phase='saving', episode_index=eid))
-        # Native codec/stats/metadata, no custom encoder. Sequential encoding
-        # avoids forking an active VR/USB process; this runs in the disk worker.
-        self.dataset.save_episode(parallel_encoding=False)
-        self.dataset.finalize()
-        self.dataset.stop_image_writer()
+        # Keep native parallel video encoding and the open cross-episode writers.
+        # The recording entrypoint selects spawn before starting device threads.
+        started = time.perf_counter()
+        LOG.info('LeRobot 第 %d 集开始保存：%d 帧，%d 路视频，原生并行编码',
+                 eid+1, self._count, len(self.cameras))
+        try:
+            self.dataset.save_episode()
+        except BaseException:
+            LOG.exception('LeRobot 第 %d 集保存失败，耗时 %.3fs；保留未完成文件',
+                          eid+1, time.perf_counter()-started)
+            raise
         self.info = dict(self.dataset.meta.info)
-        self.dataset = None  # Reopen natively next episode; never overwrite closed parquet files.
         self._sidecar.close()
         self._sidecar = None
         dest = self.root / 'meta/xlevr_diagnostics' / f'episode_{eid:06d}.jsonl'
@@ -183,6 +196,8 @@ class LeRobotEpisodeWriter:
         shutil.move(self.active / 'diagnostics.jsonl', dest)
         shutil.rmtree(self.active)
         self.active = None
+        LOG.info('LeRobot 第 %d 集保存完成，耗时 %.3fs；复用数据集继续下一集',
+                 eid+1, time.perf_counter()-started)
         return eid
 
     def discard(self):
@@ -200,11 +215,18 @@ class LeRobotEpisodeWriter:
         if self._closed:
             return
         self._closed = True
+        started = time.perf_counter()
         try:
-            if self.dataset is not None:
-                self.dataset.stop_image_writer()
-                self.dataset.finalize()
-            if self._sidecar is not None:
-                self._sidecar.close()
+            try:
+                if self.dataset is not None:
+                    try:
+                        self.dataset.stop_image_writer()
+                    finally:
+                        self.dataset.finalize()
+                    LOG.info('LeRobot 退出收尾完成：%s，耗时 %.3fs',
+                             self.root, time.perf_counter()-started)
+            finally:
+                if self._sidecar is not None:
+                    self._sidecar.close()
         finally:
             self._lock.close()

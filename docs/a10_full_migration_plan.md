@@ -1596,3 +1596,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 原因：通用m_init结束时恢复调用前已开启的笛卡尔跟随，录制入口却清空本地锚点；新锚点流程要求inactive + Stopped，因此卡在接管条件。仅修正录制入口的复位工作线程：通用m_init返回后，停止其恢复的跟随并确认停止，再交回VR；下一次松手重新按键时正常建立新会话和累计增量编码。
 - 保留控制台m_init恢复原状态的行为、自动下一集、原始数据与用户CLI；停止失败仍进入reset_failed并锁住运动，不自动接管已有跟随。等待在后台复位线程执行，未finish的本集继续录实测数据。
 - 验证：录制工作流/世界坐标遥操28项、VR录制/双臂runtime/原生LeRobot124项离线测试通过，覆盖复位恢复跟随、停止交接、保存后自动下一集与停止失败不放行；`git diff --check`通过。测试记录 `/tmp/a10_record_reset_handoff_tests.log`、`/tmp/a10_record_reset_handoff_regression.log`。未发送实机指令，需正常退出旧进程、重启原录制命令后现场验收。
+
+### 2026-11-16：合入90Hz分支的数据保存提速
+
+- 合入 `kaanh_vr_90hz` 已提交的 `d554e62`：恢复LeRobot原生三路视频并行编码，入口在设备线程启动前选择spawn；跨集复用dataset和图片写入器，退出时统一停止写入器并finalize，增加创建、续录、保存和退出耗时日志。
+- 数据格式、AV1编码参数和采集命令兼容；保存完成后继续下一集。数据集正在被采集进程持有时，外部读取可能尚缺Parquet收尾信息，验证和训练应等待正常退出完成。
+- 保留本分支的归位后接管修复；两边未提交的CLI、90Hz工作区新控制台开发均未纳入。合入前备份分支为 `backup/kaanh_follower-before-save-speedup-20261116`；用户CLI已保存补丁和校验值并核对一致。
+- 来源提交的三路640×480、1800帧离线对照为原生29.84秒、适配层28.83秒；该记录不是本次实机负载测试，也不保证现场固定保存时间。
+- 本次合并验证：原生LeRobot读写/连续多集复用与退出收尾、录制状态机、世界坐标遥操和双臂runtime共154项离线测试通过；录制配置preview及diff检查通过，用户CLI校验一致。测试日志 `/tmp/fluxvla_save_speedup_merge_tests_20261116.log`，预览记录 `/tmp/fluxvla_save_speedup_preview_20261116.log`。未连接设备；重启采集程序后加载新保存流程。

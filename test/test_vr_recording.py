@@ -580,7 +580,7 @@ class SessionTests(unittest.TestCase):
             self.assertGreater(feedback_count, 45)
             self.assertLess(feedback_count, 75)
             self.session.command('save')
-            deadline = time.monotonic()+3
+            deadline = time.monotonic()+getattr(self, 'save_timeout_s', 3)
             while self.session.state != 'idle' and time.monotonic()<deadline:
                 self.session.after_step(); time.sleep(.005)
             self.assertEqual(self.session.state, 'idle', self.session.error)

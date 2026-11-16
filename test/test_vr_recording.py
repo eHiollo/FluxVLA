@@ -287,7 +287,7 @@ class SessionTests(unittest.TestCase):
 
     def test_stream_pause_policy_off_and_unsafe_pause_still_fail(self):
         self.prepare_spike_recording()
-        for reason in ('feedback_stale', 'control_gap', 'unknown'):
+        for reason in ('feedback_stale', 'unknown'):
             self.runtime.input_pause_status = dict(reason=reason, stopped=True)
             with self.subTest(reason=reason), self.assertRaises(ValueError):
                 self.session._assemble(time.monotonic(), raw=hands(1, age=1))
@@ -296,6 +296,47 @@ class SessionTests(unittest.TestCase):
         self.session.input_paused('VR stream stale')
         self.assertEqual(self.session.state, 'failed')
         self.assertFalse(self.session.capturing)
+
+    def test_control_gap_pauses_motion_but_keeps_same_measured_episode(self):
+        self.prepare_spike_recording()
+        self.runtime.input_pause_status = dict(reason='control_gap', state='release_required',
+                                              stopped=False, control_gap_s=.169, max_control_gap_s=.1)
+        self.session.input_paused('Dual VR right: control_gap')
+        count = self.session.frames
+        self.update()
+        self.assertEqual(self.session.state, 'recording', self.session.error)
+        self.assertGreater(self.session.frames, count)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+        self.assertEqual(self.runtime.input_pause_status['state'], 'release_required')
+        sample = self.session._assemble(time.monotonic(), raw=hands(100))
+        self.assertEqual(sample[2]['control_phase'], 'input_pause')
+        self.assertEqual(sample[2]['input_pause']['reason'], 'control_gap')
+        self.assertIsNone(sample[2]['sdk_tool_command'])
+        self.assertIsNone(sample[2]['reference_control'])
+        hud = self.runtime.teleoperator.send_feedback.call_args.args[0]
+        self.assertEqual(hud['hint'], 'input paused; recording')
+        # The recording layer must not rearm control or hide real stop failures.
+        for issue in ('stop_failed', 'communication', 'robot_fault', 'stop_unconfirmed'):
+            self.runtime._dual_stop_failed = issue == 'stop_failed'
+            self.runtime.communication_pause = {'reason': 'get failed'} if issue == 'communication' else None
+            self.runtime.last_frame['has_error'] = issue == 'robot_fault'
+            self.runtime.input_pause_status['state'] = 'stop_unconfirmed' if issue == 'stop_unconfirmed' else 'release_required'
+            with self.subTest(issue=issue), self.assertRaises(ValueError):
+                self.session._assemble(time.monotonic())
+        self.runtime._dual_stop_failed = False
+        self.runtime.communication_pause = None
+        self.runtime.last_frame['has_error'] = False
+        self.runtime.input_pause_status = None  # Runtime releases only after stable input + new clutch.
+        self.update()
+        self.session.command('save'); self.settle(); self.session.close()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+
+    def test_control_gap_policy_off_still_invalidates_episode(self):
+        self.prepare_spike_recording()
+        self.session.continue_on_vr_pause = False
+        self.runtime.input_pause_status = dict(reason='control_gap', state='release_required')
+        self.session.input_paused('Dual VR right: control_gap')
+        self.assertEqual(self.session.state, 'failed')
 
     def test_stream_pause_rejects_real_sensor_faults_and_unconfirmed_stop(self):
         self.prepare_spike_recording()
@@ -810,6 +851,7 @@ class SessionTests(unittest.TestCase):
 
     def test_failed_episode_discards_after_two_real_gradual_left_gestures(self):
         self.start()
+        self.session.continue_on_vr_pause = False  # Explicit historical fail-on-control-gap policy.
         self.runtime.input_pause_status = dict(state='release_required', reason='control_gap')
         self.runtime.input_pause_hud = lambda: dict(type='hud', phase='input_paused', error='',
             hint='CONTROL LOOP DELAY', pending=None,

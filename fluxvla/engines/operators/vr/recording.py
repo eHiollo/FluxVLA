@@ -158,7 +158,7 @@ class RecordingSession:
         return not self.blocks_motion or self.capturing
 
     def _recordable_input_pause(self, raw=None, now=None):
-        """VR availability is independent of measured training data validity.
+        """Input/control timing pauses are independent of measured data validity.
 
         Motion remains locked by runtime; this never rearms or sends a target.
         Legacy storage and real controller/reset failures retain their guards.
@@ -176,7 +176,7 @@ class RecordingSession:
                 return self.continue_on_spike
             return self.continue_on_vr_pause and reason in (
                 'vr_stream_stale', 'input_stale', 'stale_age', 'sample_gap',
-                'tracking_lost', 'invalid_sample', 'sequence_rollback')
+                'tracking_lost', 'invalid_sample', 'sequence_rollback', 'control_gap')
         # before_step and the background sampler can see stale input BEFORE
         # runtime publishes its pause. Do not invalidate the episode in that gap.
         return self.continue_on_vr_pause and self._vr_input_unavailable(raw, now)

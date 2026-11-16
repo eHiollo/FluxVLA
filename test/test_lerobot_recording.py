@@ -186,6 +186,12 @@ class NativeWriterTests(unittest.TestCase):
 class NativeSessionTests(SessionTests):
     save_timeout_s = 60
 
+    def test_native_control_gap_keeps_same_measured_episode(self):
+        self.use_native_writer()
+        SessionTests.test_control_gap_pauses_motion_but_keeps_same_measured_episode(self)
+        report = validate_dataset(self.root)
+        self.assertEqual(report['episodes'], 1)
+
     def settle(self):
         if self.session.future:
             self.session.future.result(timeout=60)

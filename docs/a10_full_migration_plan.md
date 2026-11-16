@@ -1577,3 +1577,8 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 录制HUD增加独立recording_state并保留真实失败原因，修正failed集被旧“recording”提示覆盖；VR暂停续录为黄色短句。详见a10_vr_recording.md第20节。
 - 本次仅修改录制配置/录制协调/头显/相应测试及文档；现有CLI、坐标映射和其他未提交开发改动不纳入提交。未执行硬件动作。
 - 验证：198项Python离线回归通过，覆盖断流同集保存、后台30Hz持续写帧、runtime发布前采样、旧策略开关、真实设备故障和停止未确认不放行，以及原生LeRobot保存、接管恢复、夹爪和复位；头显Node回归、配置preview、git diff --check通过。测试日志 `/tmp/a10_vr_stream_recording_tests.log`，现场效果待验收。
+
+### 2026-11-16：头显状态文字透明显示并下移
+
+- 移除录制状态HUD的黑色背景平面，仅显示原有彩色状态文字与功能键提示。状态区域、延迟文字和头显信息整体下移0.12个场景单位，保持字体大小、显示距离和各区域间距。
+- 修改位置为 `fluxvla/engines/operators/vr/web-ui/index.html`；刷新头显网页后生效。通过现有头显Node回归及HTML结构检查；未进行头显现场视觉验收。

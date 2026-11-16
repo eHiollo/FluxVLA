@@ -101,3 +101,25 @@ context.applyHud({phase:'input_paused', input_pause:{reason:'feedback_stale',sta
   controls:{prompt:'check controller; restart session'}});
 assert.equal(attrs('recordHudNotice').value, 'stop unconfirmed; check controller');
 console.log('Robot feedback pause / rearm / unconfirmed stop HUD checks passed.');
+
+for (const reason of ['vr_stream_stale', 'input_stale', 'tracking_lost']) {
+  context.applyHud({phase:'input_paused', recording_state:'recording', capture_active:true,
+    input_pause:{reason}, episode:3, elapsed_s:12,
+    controls:{prompt:'RELEASE BOTH GRIPS/TRIGGERS + CENTER STICKS'}});
+  assert.equal(attrs('recordHud').color, '#FFD54F');
+  assert.equal(attrs('recordHudNotice').value, 'input paused; recording');
+  assert.match(attrs('recordHudDetails').value, /ep 3.*12.0s/);
+  assert.equal(attrs('recordHudPrompt').value, 'release grips; center sticks');
+}
+context.applyHud({phase:'input_paused', recording_state:'failed', capture_active:false,
+  error:'camera disconnected', hint:'input paused; recording', input_pause:{reason:'vr_stream_stale'}});
+assert.equal(attrs('recordHud').value, 'episode invalid');
+assert.equal(attrs('recordHud').color, '#EF5350');
+assert.equal(attrs('recordHudNotice').value, 'camera disconnected');
+context.applyHud({phase:'input_paused', capture_active:false, hint:'input paused; recording',
+  input_pause:{reason:'vr_stream_stale'}});
+assert.equal(attrs('recordHudNotice').value, 'recording blocked');
+context.applyHud({phase:'recording', recording_state:'recording', capture_active:true, input_pause:null});
+assert.equal(attrs('recordHud').color, '#66BB6A');
+assert.equal(attrs('recordHudNotice').value, 'capture active');
+console.log('Stream pause preserves recording; failed capture cannot display recording.');

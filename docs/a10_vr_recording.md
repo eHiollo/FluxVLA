@@ -4,7 +4,7 @@
 本页后文 `control_loop` 默认描述为历史记录；本分支默认 `background_30hz`。
 运行目录、实测结果与新数据目录要求见 [频率改造说明](a10_vr_frequency.md)。
 
-2026-11-13，分支 `kaanh_lerobot_recording`：默认使用原 LeRobot 工具链的 **LeRobotDataset**，采集阶段顺序也对齐原 `lerobot_record.record()`。夹爪故障只锁故障夹爪，机械臂和界面继续；当前双臂配置将掉落报警B/0x1000改为提示，可继续控制与录制，其他报警仍须清除。已完成离线验证，整套真机录制仍需操作者验收。第8节起保留历史记录，与当前默认不一致时以第2、3、6、18、19节为准。
+2026-11-13，分支 `kaanh_lerobot_recording`：默认使用原 LeRobot 工具链的 **LeRobotDataset**，采集阶段顺序也对齐原 `lerobot_record.record()`。夹爪故障只锁故障夹爪，机械臂和界面继续；当前双臂配置将掉落报警B/0x1000改为提示，可继续控制与录制，其他报警仍须清除。已完成离线验证，整套真机录制仍需操作者验收。第8节起保留历史记录，与当前默认不一致时以第2、3、6、18、19、20节为准。
 
 ## 1. 先确认右手 A 键（不接机器人）
 
@@ -403,3 +403,24 @@ teleop.zx_grippers.drop_alarm_policy=stop
 **reset条件保持原约定：** idle、recording、review阶段可用，须释放两手侧键/前扳机，没有VR接管锁定，也没有正在保存/归位或归位失败。A＋左摇杆向上、回中、8秒内再次向上确认。recording阶段归位录入同集，idle/review阶段不录。spike暂停时先按上面的动作解除锁定，再松手操作reset。真实控制器故障不能用reset绕过。
 
 如需恢复旧的“跳变使本集失效”，在 `--record-options` 下传 `capture.continue_on_spike=False`。110项Python离线测试及头显JS测试通过，包含暂停期间实际采样、同集保存、原生LeRobot诊断读取、采样间隙记录、其他故障不放行，以及持续按住不自动恢复/重新按键后按实际位姿重建锚点。未执行硬件运动测试。
+
+
+## 20. 2026-11-16：VR断流锁定接管，实测数据有效时继续同一集
+
+90Hz分支默认增加 `capture.continue_on_vr_pause=True`，沿用原录制命令和数据目录。
+旧第19节仅允许spike续录的限制在本配置下扩展为：`vr_stream_stale`、`input_stale`、`stale_age`、`sample_gap`、`tracking_lost`、`invalid_sample`、`sequence_rollback`。
+位姿跳变仍由原 `capture.continue_on_spike` 控制；两项仅对LeRobot后端生效。
+
+- VR暂停时，runtime仍按原逻辑停止、锁定接管。录制保留episode编号和已录内容，机器人实际关节、夹爪位置及三路相机有效就继续按30Hz目标采样；训练state/action格式不变。
+- 录制before_step和后台采样可能早于runtime看到输入过期。本次同时覆盖该顺序：过期VR本身不再先把本集判失败。不会因VR恢复自动开启新一集。
+- 实际设备数据保留原时间戳和年龄/同步检查。短暂缺失跳过并记录；持续缺失达到原配置 `max_missing_feedback_s=1` 秒时仍中断。相机硬故障、阻断夹爪报警、机器人故障、停止未确认、控制器通信故障仍禁止无效集正常发布；原始片段保留供检查。
+- 控制器反馈过期和control_gap不属于此次放行的VR输入原因。启停等待、控制频率、运动参数及250ms输入保护未改。
+- 恢复接管仍要求输入稳定、松手回中后重新按侧键，runtime按实际位姿重新建立锚点，不重放断流前目标。reset仍须解除接管锁定并满足原有松手/确认条件。
+- 头显在输入暂停且仍采集时用黄色显示 `input paused; recording`，保留集数和时间。录制已失败时明确显示 `episode invalid` 和失败原因，不再被运动暂停HUD的空error或旧recording提示覆盖。网页失焦期间可能无法及时看到提示，返回VR后查看当前状态。
+
+每帧sidecar的 `details.control_phase=input_pause`、`details.input_pause` 保存异常及恢复时序，暂停期间旧 `sdk_tool_command/reference_control` 清空，原始VR输入仅作诊断。
+后台先发现过期、runtime尚未发布锁定状态时，诊断标为 `reason=vr_input_unavailable,state=pending_runtime_guard`，不伪称停止已确认。
+
+使用：正常退出旧VR程序、重启原采集命令，刷新头显网页。无需更换数据集或修改OpenPI。
+如需恢复旧行为，在原 `--record-options` 中增加 `capture.continue_on_vr_pause=False`；此时位姿跳变是否续录仍由continue_on_spike独立决定。
+现场验收时真正开始一集，遇到短暂VR停更后核对episode不变、帧数继续增长，再松手重按恢复接管、完成保存；此修改不承诺消除VR停发或保证实机90Hz。

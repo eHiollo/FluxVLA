@@ -66,6 +66,9 @@ class RecordingSession:
         self.continue_on_spike = self.options.get('continue_on_spike', False)
         if type(self.continue_on_spike) is not bool:
             raise ValueError('capture.continue_on_spike must be boolean')
+        self.continue_on_vr_pause = self.options.get('continue_on_vr_pause', False)
+        if type(self.continue_on_vr_pause) is not bool:
+            raise ValueError('capture.continue_on_vr_pause must be boolean')
         self.sampling_mode = self.options.get('sampling_mode', 'background_30hz')
         if self.sampling_mode not in ('control_loop', 'background_30hz'):
             raise ValueError('capture.sampling_mode must be control_loop or background_30hz')
@@ -154,19 +157,46 @@ class RecordingSession:
     def can_sample(self):
         return not self.blocks_motion or self.capturing
 
-    def _recordable_spike_pause(self):
-        """Only an input spike may leave measured-data capture running.
+    def _recordable_input_pause(self, raw=None, now=None):
+        """VR availability is independent of measured training data validity.
 
         Motion remains locked by runtime; this never rearms or sends a target.
         Legacy storage and real controller/reset failures retain their guards.
         """
+        if (self.backend != 'lerobot' or self.blocks_motion
+                or getattr(self.runtime, '_dual_stop_failed', False)
+                or getattr(self.runtime, 'communication_pause', None)):
+            return False
         pause = getattr(self.runtime, 'input_pause_status', None)
-        return (self.backend == 'lerobot' and self.continue_on_spike
-                and isinstance(pause, dict)
-                and pause.get('reason') in ('spike_pending', 'spike_reanchor')
-                and not self.blocks_motion
-                and not getattr(self.runtime, '_dual_stop_failed', False)
-                and not getattr(self.runtime, 'communication_pause', None))
+        if isinstance(pause, dict):
+            if pause.get('state') == 'stop_unconfirmed':
+                return False
+            reason = pause.get('reason')
+            if reason in ('spike_pending', 'spike_reanchor'):
+                return self.continue_on_spike
+            return self.continue_on_vr_pause and reason in (
+                'vr_stream_stale', 'input_stale', 'stale_age', 'sample_gap',
+                'tracking_lost', 'invalid_sample', 'sequence_rollback')
+        # before_step and the background sampler can see stale input BEFORE
+        # runtime publishes its pause. Do not invalidate the episode in that gap.
+        return self.continue_on_vr_pause and self._vr_input_unavailable(raw, now)
+
+    def _vr_input_unavailable(self, raw=None, now=None):
+        raw = self.raw if raw is None else raw
+        now = time.monotonic() if now is None else now
+        if not isinstance(raw, dict) or set(raw) != {'left', 'right'}:
+            return True
+        for hand in raw.values():
+            if not isinstance(hand, dict):
+                return True
+            stamp = hand.get('xlevr.sample_receive_time_s')
+            age = now-stamp if isinstance(stamp, (int, float)) else hand.get('xlevr.sample_age_s')
+            if (isinstance(age, bool) or not isinstance(age, (int, float))
+                    or not math.isfinite(age) or not 0 <= age <= self.buttons.max_age_s):
+                return True
+            if hand.get('xlevr.enabled') and hand.get('xlevr.verification_tracking') is not True:
+                return True
+        return False
 
     def connect(self):
         if not self.button_check:
@@ -217,7 +247,7 @@ class RecordingSession:
         if not self.input_fresh:
             self.pending = None
             if self.reset_thread is not None: self.reset_cancel.set()
-            if (self.capturing or (self.reset_thread is not None and self._reset_return_state == 'recording')) and not self._recordable_spike_pause():
+            if (self.capturing or (self.reset_thread is not None and self._reset_return_state == 'recording')) and not self._recordable_input_pause():
                 self.fail('VR input stale; episode is incomplete')
         if self.pending and time.monotonic()-self.pending_at > self.options['confirmation_timeout_s']:
             self.pending = None; self.notice = 'Confirmation expired'
@@ -240,14 +270,14 @@ class RecordingSession:
         return self.blocks_motion or self.button_check
 
     def _assemble(self, now, *, frame=None, raw=None):
-        spike_pause = self._recordable_spike_pause()
-        if getattr(self.runtime, 'input_pause_status', None) is not None and not spike_pause:
+        input_pause = self._recordable_input_pause(raw, now)
+        if getattr(self.runtime, 'input_pause_status', None) is not None and not input_pause:
             raise ValueError('VR input paused; release controls and re-engage first')
         if raw is None:
             if not self.input_fresh and self.backend != 'lerobot':
                 raise ValueError('Waiting for fresh paired VR input')
             raw = self.raw
-        elif not spike_pause:
+        elif not input_pause:
             if set(raw) != {'left', 'right'}:
                 raise ValueError('Waiting for fresh paired VR input')
             for hand in raw.values():
@@ -255,6 +285,9 @@ class RecordingSession:
                       self.buttons.max_age_s, 'VR input')
                 if hand.get('xlevr.enabled') and hand.get('xlevr.verification_tracking') is not True:
                     raise ValueError('VR control requested without tracking')
+        if (getattr(self.runtime, '_dual_stop_failed', False)
+                or getattr(self.runtime, 'communication_pause', None)):
+            raise ValueError('Robot stop unconfirmed or controller communication failed')
         if frame is None: frame = self.runtime.last_frame
         if not frame or frame.get('has_error') is not False:
             raise ValueError('Robot feedback missing/faulted')
@@ -299,9 +332,11 @@ class RecordingSession:
                       raw_input=raw, sdk_tool_command=self.runtime.last_sdk_command,
                       reference_control=self.runtime.last_reference_result)
         detail['control_phase'] = ('m_init' if self.reset_thread is not None else
-                                   'input_pause' if spike_pause else 'teleop')
+                                   'input_pause' if input_pause else 'teleop')
         detail['input_pause'] = copy.deepcopy(getattr(self.runtime, 'input_pause_status', None))
-        if self.reset_thread is not None or spike_pause:
+        if input_pause and detail['input_pause'] is None:
+            detail['input_pause'] = dict(reason='vr_input_unavailable', state='pending_runtime_guard')
+        if self.reset_thread is not None or input_pause:
             # Old Cartesian targets aren't commands for reset or locked-input phases.
             detail['sdk_tool_command'] = None
             detail['reference_control'] = None
@@ -454,9 +489,9 @@ class RecordingSession:
         with self._sample_lock:
             self.pending = None
             self.ready_sample = None
-            if self._recordable_spike_pause():
+            if self._recordable_input_pause():
                 self.notice = 'input paused; recording' if self.capturing else 'input paused; release grips'
-                LOG.warning('VR位姿跳变：接管锁定，保留本集并继续采集有效实测数据：%s', message)
+                LOG.warning('VR输入暂停：保留本集并继续采集有效实测数据，运动保护由runtime处理：%s', message)
                 return
             if self.capturing or (self.future is not None and self.future_operation == 'starting'):
                 self._input_pause_invalid = message
@@ -479,6 +514,7 @@ class RecordingSession:
         with self._sample_lock:
             was_capturing = self.capturing
             self.error = message
+            self.notice = ''
             if was_capturing or (self.reset_thread is not None and self._reset_return_state == 'recording'):
                 self.state = 'failed'
                 if self.reset_thread is not None: self.reset_cancel.set()
@@ -765,7 +801,7 @@ class RecordingSession:
 
     def status(self):
         with self._sample_lock:
-            return dict(state=self.state, frames=self.frames, elapsed_s=round(self.elapsed,2),
+            return dict(state=self.state, recording_state=self.state, frames=self.frames, elapsed_s=round(self.elapsed,2),
                         capture_active=self.capturing,
                         sampling_mode='background_30hz' if self._background_sampling else 'control_loop',
                         episode=(self.writer.info['total_episodes']+1 if self.writer else 0),
@@ -871,6 +907,7 @@ class RecordingSession:
             pause = self.runtime.input_pause_hud()
             status.update({key: value for key, value in pause.items() if key != 'controls'})
             if self.state == 'failed':
+                status['error'] = self.error
                 status['hint'] += (' / INVALID EP: LEFT = REDO, RIGHT = CONFIRM'
                                    if self.workflow == 'lerobot' else ' / INVALID EPISODE: LEFT TO DISCARD')
             controls['prompt'] = pause['controls']['prompt']
@@ -879,7 +916,7 @@ class RecordingSession:
                 # Centering the menu stick is enough; moving an arm is optional.
                 controls['prompt'] = 'release grips; center sticks'
                 status['hint'] = 'retry pending'
-            if self.capturing and self._recordable_spike_pause():
+            if self.capturing and self._recordable_input_pause():
                 status['hint'] = 'input paused; recording'
             phase = status['phase']
         # Clock/frame counts stay rate limited; input gates and state transitions do not.

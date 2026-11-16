@@ -1568,3 +1568,12 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 核对09:41/09:42两轮延迟报告及逐包记录：有效位姿轮约68秒，RTT中位8.20ms、最大32.80ms，收包后首次读取最大14.95ms；两次超过250ms的长间隔在浏览器发包时间轴已存在，恢复包伴随XR可见/会话状态变化，不能归因为Thor处理旧包过慢。
 - 查明 `--check-record-buttons` 不启动相机、数据集writer或30Hz采样线程；context的 `recording=true` 仅表示加载录制配置。这轮不是采集资源竞争验收，纠正此前测试范围说明。
 - 在 `docs/a10_vr_frequency.md` 记录原始路径、统计、长间隔时刻和后续完整采集30/90Hz对照要求：必须真实开始一集并核对capture_active/frames，不能仅打开头显界面；不新增硬件操作，不改同事和用户现有未提交文件。
+
+
+### 2026-11-16：VR输入暂停期间保留同一集实测采集
+
+- 新增并默认开启capture.continue_on_vr_pause，LeRobot后端对VR断流/输入过期/跟踪失效保留同一集，覆盖主循环before_step和后台采样先于runtime锁定的顺序；保持原continue_on_spike兼容。
+- 机器人/夹爪/相机实测有效性检查不变；停止未确认、控制器故障、持续缺失实测数据仍阻止无效训练集发布。暂停帧保留原因、实测时间戳并清空旧下发目标；不自动开启新集或恢复接管。
+- 录制HUD增加独立recording_state并保留真实失败原因，修正failed集被旧“recording”提示覆盖；VR暂停续录为黄色短句。详见a10_vr_recording.md第20节。
+- 本次仅修改录制配置/录制协调/头显/相应测试及文档；现有CLI、坐标映射和其他未提交开发改动不纳入提交。未执行硬件动作。
+- 验证：198项Python离线回归通过，覆盖断流同集保存、后台30Hz持续写帧、runtime发布前采样、旧策略开关、真实设备故障和停止未确认不放行，以及原生LeRobot保存、接管恢复、夹爪和复位；头显Node回归、配置preview、git diff --check通过。测试日志 `/tmp/a10_vr_stream_recording_tests.log`，现场效果待验收。

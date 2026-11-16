@@ -124,6 +124,23 @@ class SpeedTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 robot.set_speed_override(40, expected_mode='Auto')
 
+    def test_matching_speed_is_read_only_even_when_follower_module_is_enabled(self):
+        with FakeController() as server:
+            server.jog_vel = 70
+            server.active, server.mode = True, 'Cart'
+            robot = server.operator(feedback_position_unit='mm')
+            rt, _ = runtime([], robot=robot, controller_speed_percent=70)
+            try:
+                with patch.object(robot, 'set_speed_override', side_effect=AssertionError('Redundant speed write')):
+                    rt.connect()
+                self.assertEqual(rt.speed_status['state'], 'confirmed')
+                self.assertTrue(rt.speed_status['already_set'])
+                self.assertIsNone(rt._speed_restore)
+                self.assertFalse(any(c.startswith('set_') for c in server.commands))
+            finally:
+                rt.close()
+            self.assertFalse(any(c.startswith('set_') for c in server.commands))
+
     def test_ack_without_readback_and_rejection_prevent_start(self):
         for reject in (True, False):
             with self.subTest(reject=reject), FakeController() as server:

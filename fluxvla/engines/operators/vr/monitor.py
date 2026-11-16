@@ -79,6 +79,13 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        sandbox = getattr(self.server, 'sandbox_view', None)
+        if self.path == '/api/vr-sandbox' and sandbox is not None:
+            self._sandbox_json(200, sandbox.snapshot())
+            return
+        if self.path == '/vr-sandbox.html' and sandbox is not None:
+            self.serve_file('web-ui/vr-sandbox.html', 'text/html; charset=utf-8')
+            return
         view = getattr(self.server, 'calibration_view', None)
         if self.path == '/api/calibration-view' and view is not None:
             import json
@@ -124,6 +131,37 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Not found")
 
+    def _sandbox_json(self, status, values):
+        import json
+        content = json.dumps(values, ensure_ascii=False, allow_nan=False).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_POST(self):
+        sandbox = getattr(self.server, 'sandbox_view', None)
+        if self.path != '/api/vr-sandbox/reset' or sandbox is None:
+            self.send_error(404, 'Not found')
+            return
+        import json
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 256:
+                raise ValueError('Invalid reset request length')
+            values = json.loads(self.rfile.read(length))
+            if not isinstance(values, dict) or set(values) != {'preset'}:
+                raise ValueError('Expected preset only')
+            result = sandbox.request_reset(values['preset'])
+        except (ValueError, TypeError) as error:
+            self._sandbox_json(400, dict(error=str(error)))
+        except RuntimeError as error:
+            self._sandbox_json(409, dict(error=str(error)))
+        else:
+            self._sandbox_json(202, result)
+
     def serve_file(self, filename: str, content_type: str):
         try:
             web_root = getattr(self.server, "web_root_path", ".")
@@ -154,12 +192,14 @@ class SimpleHTTPSServer:
         self.server_thread = None
         self.web_root_path = web_root_path
         self.calibration_view = None
+        self.sandbox_view = None
 
     async def start(self):
         self.httpd = ReuseHTTPServer((self.config.host_ip, self.config.https_port), SimpleAPIHandler)
         self.httpd.web_root_path = self.web_root_path
         self.httpd.config = self.config
         self.httpd.calibration_view = self.calibration_view
+        self.httpd.sandbox_view = self.sandbox_view
 
         if not self.config.ensure_ssl_certificates():
             raise RuntimeError("Cannot create VR TLS certificate")

@@ -63,12 +63,14 @@ class XLeVRDeltaEEMapper:
     max_vr_speed_m_s: float = 2.0
     spike_recovery_frames: int = 2
     compute_anchor_shadow: bool = True
+    anchor_translation_frame: str = "tool_anchor"
     motion_shaping_mode: str = "robot_controller"
     position_cutoff_hz: float = 5.0
     max_linear_speed_m_s: float = 0.25
     max_linear_accel_m_s2: float = 1.0
     engage_ramp_s: float = 0.35
     require_squeeze_to_move: bool = True
+    squeeze_translation_only: bool = False
     gripper_thumbstick_axis: str = "x"
     gripper_thumbstick_deadzone: float = 0.05
 
@@ -77,6 +79,8 @@ class XLeVRDeltaEEMapper:
     )
     # Optional translation-only mapping; rotation keeps axis_remap in SO(3).
     position_axis_remap: tuple[tuple[float, float, float], ...] | None = None
+    # Optional base-frame mapping, selected only for world-translation reference mode.
+    world_position_axis_remap: tuple[tuple[float, float, float], ...] | None = None
 
     _prev_position: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_orientation_quat: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -115,14 +119,27 @@ class XLeVRDeltaEEMapper:
     _anchor_shadow_last_transport_sequence: int = field(default=0, init=False, repr=False)
     _anchor_shadow_last_hand_pose: np.ndarray | None = field(default=None, init=False, repr=False)
 
+    _anchor_shadow_rotation_enabled: bool = field(default=True, init=False, repr=False)
+
     def __post_init__(self) -> None:
-        if self.position_axis_remap is not None:
-            matrix = np.asarray(self.position_axis_remap, dtype=float)
-            # Translation may swap two axes (det=-1); never use this for rotvecs.
-            if (matrix.shape != (3, 3) or not np.all(np.isfinite(matrix))
-                    or not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-6, rtol=0)):
-                raise ValueError('position_axis_remap must be a finite orthogonal 3x3 matrix')
-            self.position_axis_remap = tuple(tuple(row) for row in matrix.tolist())
+        if type(self.squeeze_translation_only) is not bool:
+            raise ValueError('squeeze_translation_only must be bool')
+        if self.squeeze_translation_only and (
+                self.position_control_mode != 'safe_frame_delta' or not self.compute_anchor_shadow):
+            raise ValueError('squeeze_translation_only requires safe_frame_delta and anchor output')
+        if self.anchor_translation_frame not in {"tool_anchor", "robot_base"}:
+            raise ValueError("anchor_translation_frame must be tool_anchor or robot_base")
+        if self.anchor_translation_frame == "robot_base" and (
+                self.position_control_mode != "safe_frame_delta" or not self.compute_anchor_shadow):
+            raise ValueError("robot_base translation requires safe_frame_delta and anchor output")
+        for name in ('position_axis_remap', 'world_position_axis_remap'):
+            if getattr(self, name) is not None:
+                matrix = np.asarray(getattr(self, name), dtype=float)
+                # Translation may swap two axes (det=-1); never use this for rotvecs.
+                if (matrix.shape != (3, 3) or not np.all(np.isfinite(matrix))
+                        or not np.allclose(matrix.T @ matrix, np.eye(3), atol=1e-6, rtol=0)):
+                    raise ValueError(f'{name} must be a finite orthogonal 3x3 matrix')
+                setattr(self, name, tuple(tuple(row) for row in matrix.tolist()))
         if self.position_control_mode not in {"safe_frame_delta", "legacy_frame_delta"}:
             raise ValueError(
                 "position_control_mode must be 'safe_frame_delta' or 'legacy_frame_delta'"
@@ -182,6 +199,8 @@ class XLeVRDeltaEEMapper:
 
     @property
     def _position_axes(self):
+        if self.anchor_translation_frame == 'robot_base' and self.world_position_axis_remap is not None:
+            return self.world_position_axis_remap
         return self.axis_remap if self.position_axis_remap is None else self.position_axis_remap
 
     @property
@@ -215,12 +234,14 @@ class XLeVRDeltaEEMapper:
             "schema_version": 1,
             "algorithm": "xlevr_a1_position_control",
             "anchor_shadow_enabled": self.compute_anchor_shadow,
+            "squeeze_translation_only": self.squeeze_translation_only,
             "anchor_shadow_session_id": (
                 self._anchor_shadow_session_id if self.compute_anchor_shadow else None
             ),
             "anchor_shadow_active": self._anchor_shadow_active,
             "anchor_shadow_status": "inactive",
             "position_control_mode": self.position_control_mode,
+            "translation_frame": self.anchor_translation_frame,
             "position_axis_remap": np.asarray(self._position_axes, dtype=float).tolist(),
             "rotation_axis_remap": np.asarray(self.axis_remap, dtype=float).tolist(),
             "motion_shaping_mode": self.motion_shaping_mode,
@@ -409,12 +430,21 @@ class XLeVRDeltaEEMapper:
             translation_final = self._anchor_shadow_last_translation_ee_m.copy()
             rotation_final = self._anchor_shadow_last_rotation_ee_rad.copy()
         else:
+            # Cache the button mode with the accepted pose; a duplicate cannot
+            # unlock rotation using mutated raw button/trigger fields.
+            self._anchor_shadow_rotation_enabled = not (
+                self.squeeze_translation_only
+                and self._current_diagnostics.get('effective_squeeze', False)
+                and not self._fine_trigger_active(self._current_diagnostics['raw_trigger']))
             self._anchor_shadow_last_hand_pose = np.concatenate((position_vr_m, quat)).copy()
-            displacement_anchor_vr = delta_position_body(
-                self._anchor_shadow_position_vr_m,
-                position_vr_m,
-                self._anchor_shadow_quat,
-            )
+            if self.anchor_translation_frame == "robot_base":
+                displacement_anchor_vr = position_vr_m - self._anchor_shadow_position_vr_m
+            else:
+                displacement_anchor_vr = delta_position_body(
+                    self._anchor_shadow_position_vr_m,
+                    position_vr_m,
+                    self._anchor_shadow_quat,
+                )
             translation_ee = remap_position(
                 displacement_anchor_vr * self.vr_to_robot_scale * self._anchor_shadow_pos_scale,
                 self._position_axes,
@@ -436,6 +466,7 @@ class XLeVRDeltaEEMapper:
                 "anchor_shadow_protocol": "SET_EE_ANCHOR/v1",
                 "anchor_shadow_transmitted": False,
                 "anchor_shadow_active": True,
+                "rotation_enabled": self._anchor_shadow_rotation_enabled,
                 "anchor_shadow_status": status,
                 "anchor_shadow_id": self._anchor_shadow_id,
                 "anchor_shadow_anchor_sample_sequence": self._anchor_shadow_sample_sequence,
@@ -444,7 +475,11 @@ class XLeVRDeltaEEMapper:
                 "anchor_shadow_quat_xyzw": self._anchor_shadow_quat.tolist(),
                 "anchor_shadow_pos_scale": self._anchor_shadow_pos_scale,
                 "anchor_shadow_angle_scale": self._anchor_shadow_angle_scale,
-                "anchor_shadow_translation_ee_m": translation_final.tolist(),
+                "anchor_shadow_translation_frame": self.anchor_translation_frame,
+                "anchor_shadow_translation_m": translation_final.tolist(),
+                # Legacy field is tool-local only; never mislabel a base displacement.
+                "anchor_shadow_translation_ee_m": (translation_final.tolist()
+                    if self.anchor_translation_frame == "tool_anchor" else None),
                 "anchor_shadow_rotation_ee_rad": rotation_final.tolist(),
                 "anchor_shadow_offset_6d": np.concatenate(
                     (translation_final, rotation_final)
@@ -466,6 +501,10 @@ class XLeVRDeltaEEMapper:
             "offset": [float(value) for value in offset],
             "gripper": float(output.get("gripper.pos", 0.0)),
         }
+        if self.anchor_translation_frame == "robot_base":
+            output["_xlevr.anchor_command"]["translation_frame"] = "robot_base"
+        if self.squeeze_translation_only:
+            output['_xlevr.anchor_command']['rotation_enabled'] = self._anchor_shadow_rotation_enabled
         if self._anchor_shadow_active:
             # Absolute mapping consumes guarded poses, before body-frame remap.
             # Duplicate sequences reuse this cache, even if raw payload changes.
@@ -883,6 +922,8 @@ class XLeVRDeltaEEMapper:
         buttons: dict,
     ) -> RobotAction:
         output = self._disabled_arm_action(gripper, trigger, thumbstick, buttons)
+        if self.squeeze_translation_only and not self._anchor_shadow_rotation_enabled:
+            delta_rotvec = (0., 0., 0.)
         output.update(
             {
                 "ee.enabled": enabled,

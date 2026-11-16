@@ -84,6 +84,10 @@ class A10ProtocolError(ValueError):
     """A malformed or incompatible controller message."""
 
 
+class A10NotReadyError(RuntimeError):
+    """A valid feedback state is temporarily unsuitable for a new takeover."""
+
+
 class A10ControllerError(RuntimeError):
     """The controller rejected a command or reported a fault."""
 
@@ -1400,6 +1404,17 @@ class A10Operator(BaseOperator):
             return _set_controller_speed(self._connection, self.get_state, percent,
                                          expected_mode, self.timeout_s, expected_percent)
 
+    def ensure_tool_coordinate(self):
+        """Skip a redundant Tool command; real coordinate changes retain all checks."""
+        with self._io_lock:
+            self._require_motion()
+            state = self.get_state()
+            if state.has_error:
+                raise A10ControllerError('Controller reports a fault')
+            if state.raw['ret_context']['motion_msg'].get('jog_coordinate') == 'Tool':
+                return state
+            return self.set_tool_coordinate()
+
     def set_tool_coordinate(self):
         """Explicitly select Tool jog coordinates and verify feedback; no target sent."""
         return self.set_jog_coordinate('Tool')
@@ -1445,9 +1460,9 @@ class A10Operator(BaseOperator):
             if state.has_error:
                 raise A10ControllerError('Controller reports a fault')
             if state.follower_active is not False:
-                raise RuntimeError('Stop the follower before changing jog coordinates')
+                raise A10NotReadyError('Stop the follower before changing jog coordinates')
             if state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped':
-                raise RuntimeError('Coordinate change requires confirmed Stopped feedback')
+                raise A10NotReadyError('Coordinate change requires confirmed Stopped feedback')
             self._connection.request(f'set_jog_coordinate --{coordinate.lower()}')
             deadline = time.monotonic() + self.timeout_s
             while time.monotonic() < deadline:
@@ -1483,12 +1498,12 @@ class A10Operator(BaseOperator):
             if state.has_error:
                 raise A10ControllerError('Controller reports a fault')
             if state.follower_active is not False:
-                raise RuntimeError('Follower is active or its state is unknown; refusing takeover')
+                raise A10NotReadyError('Follower is active or its state is unknown; refusing takeover')
             if not self._has_model_feedback(state, feedback_mode):
                 raise A10ProtocolError('Follower start requires joint and TCP feedback')
             info = state.raw['ret_context'].get('robot_msg', {})
             if info.get('activate') != 'Enabled' or info.get('motion') != 'Stopped':
-                raise RuntimeError(
+                raise A10NotReadyError(
                     'Follower start requires Enabled and Stopped feedback; '
                     f'activate={info.get("activate")}, motion={info.get("motion")}, '
                     f'follower_active={state.follower_active}. '
@@ -1529,6 +1544,25 @@ class A10Operator(BaseOperator):
                         self._connection.close()
                 self._confirmed_active = False
                 raise
+
+    def request_stop_follower(self):
+        """Revoke outgoing targets and send stop once, without state/ACK queries."""
+        self._traj_stop_event.set()
+        with self._io_lock:
+            self._sdk_tool_adapter = self._sdk_tool_adapters = None
+            self._confirmed_active = self._start_confirmed = False
+            self._require_motion(allow_cancelled=True)
+            if not self._started_here:
+                return dict(requested=False, confirmed=False)
+            if self.shared_control:
+                result = self._connection.call('stop_request')
+            else:
+                self._connection.send_command('stop_follower')
+                result = dict(requested=True, confirmed=False)
+            self._started_here = False
+            self._follower_mode = None
+            self.last_stop_confirmed = False
+            return result
 
     def stop_follower(self):
         self._traj_stop_event.set()

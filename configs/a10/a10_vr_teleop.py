@@ -42,7 +42,7 @@ teleop = dict(
                             # Keep migrated VR certificates separate from the
                             # main checkout's pre-existing local TLS identity.
                             tls_directory=str(_root / 'work_dirs/a10/vr/tls_vr')),
-               mapping={'pos_scale': 0.9,
+               mapping={'pos_scale': 1.8,
  'angle_scale': 1.3,
  'vr_to_robot_scale': 1.0,
  'fine_trigger_threshold': 0.5,

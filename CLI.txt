@@ -23,15 +23,6 @@
     双臂（192.168.0.150）：
     python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
 
-    修改机器人 IP：在 shell 前加 --host 新IP，覆盖配置中的 operator.host。
-    不带 --config 时默认单臂配置 configs/a10/a10_operator.py。
-    切换单臂/双臂使用 --config；每个配置的 init_position 对应这台机器人。
-
-    控制台执行动作时，可直接输入：
-    stop
-    取消当前和停止前排队的命令，停止本地下发并请求退出 follower；控制台保留。
-    stop 只有收到 inactive + Stopped 反馈才报告机器人停止成功；它不是硬件急停。
-
  终端三：启动机器人控制
     python scripts/inference.py \
   --config configs/a10/a10_remote_inference.py
@@ -122,15 +113,18 @@ python scripts/teleoperate.py \
   --config configs/a10/a10_dual_arm_vr_teleop.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --record-options \
-    record.root=/home/robot/VLA/FluxVLA/datasets/dual_20261113\
+    record.root=/home/robot/VLA/FluxVLA_90hz/datasets/dual_90hz_test \
     record.resume=True \
     record.recover=True \
+  --measure-vr-latency \
   --cfg-options \
     teleop.record_controller=False \
     teleop.vr_only=False \
     teleop.observe_only=False \
     teleop.operator.allow_motion=True \
     teleop.zx_grippers.enabled=True \
+    teleop.fps=90 \
+    teleop.feedback_poll_hz=30 \
     teleop.input.mapping.pos_scale=1.2 \
     teleop.input.mapping.angle_scale=0.8 \
     teleop.input.mapping.fine_scale_factor=0.6
@@ -210,3 +204,12 @@ python scripts/teleoperate.py \
 # 控制台接管/回位后恢复VR：控制台先输入 stop_follower，双手松开侧键，再按侧键接管。
 # 单独关闭查询控制台不影响VR；最后一个客户端退出约5秒后服务自动退出。
 # 服务日志：work_dirs/a10/shared_control/service.log
+
+
+世界坐标系启动遥操作
+cd /home/robot/VLA/FluxVLA_90hz
+python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop_world_translation.py
+
+vr图形化测试
+cd /home/robot/VLA/FluxVLA_90hz
+python scripts/preview_vr_mapping.py

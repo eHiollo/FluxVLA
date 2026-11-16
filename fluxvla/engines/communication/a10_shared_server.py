@@ -47,11 +47,13 @@ class SharedControl:
         self._status_lock = self._control_lock if self.status is self.control else threading.RLock()
         self.owner = None
         self.revoked = set()
+        self._feedback_independent = set()
         self.preempted = set()
         self.recording_owner = None
         self.console_operation = None
         self.console_operation_depth = 0
         self.stopped = set()
+        self.stop_requests = set()
         self._speed_restore_allowed = set()
         self.recorder = None
         self._snapshot_lock = threading.Lock()
@@ -106,8 +108,10 @@ class SharedControl:
             else:
                 if self._poll_stop.is_set():
                     raise RuntimeError('Shared feedback service is closing')
+                # An explicit subscription restart may follow a fresh successful
+                # GET. Keep ownership revoked, but let read-only polling run again.
+                self._poll_error = None
                 if not self._poll_rates:
-                    self._poll_error = None
                     self._poll_count = 0
                     self._poll_started = time.monotonic()
                 self._poll_rates[session_id] = float(hz)
@@ -153,7 +157,7 @@ class SharedControl:
                 # Commands may hold target_lock while querying a separate status
                 # socket. Release status_lock before invalidating ownership.
                 with self._target_lock:
-                    if self.owner is not None:
+                    if self.owner is not None and self.owner not in self._feedback_independent:
                         self.revoked.add(self.owner)
                 self.note('feedback_poll_failed', error=str(failure))
             # Rate means query start period, not GET latency plus a fixed sleep.
@@ -262,7 +266,9 @@ class SharedControl:
             self._speed_restore_allowed.discard(owner)
         self.note('owner_stopped', session_id=owner, reason=reason, confirmed=True)
 
-    def claim(self, session_id, role):
+    def claim(self, session_id, role, *, require_feedback=True):
+        if type(require_feedback) is not bool:
+            raise ValueError('require_feedback must be bool')
         if self.console_operation not in (None, session_id):
             error = ControlTransferredError if role == 'teleop' else PermissionError
             raise error('Console command is still running')
@@ -282,9 +288,33 @@ class SharedControl:
         self.revoked.discard(session_id)
         self.preempted.discard(session_id)
         self.stopped.discard(session_id)
+        self.stop_requests.discard(session_id)
         self._speed_restore_allowed.clear()
         self.owner = session_id
+        if require_feedback:
+            self._feedback_independent.discard(session_id)
+        else:
+            self._feedback_independent.add(session_id)
         self.note('owner_acquired', session_id=session_id, role=role)
+
+    def request_stop(self, session_id):
+        """No controller result/state reads. Revoke targets before serializing WS send."""
+        with self._target_lock:
+            if session_id in self.stop_requests and self.owner != session_id:
+                return dict(requested=True, confirmed=False)
+            if self.owner != session_id:
+                raise PermissionError('This session does not own the follower')
+            self.revoked.add(session_id)
+        with self._control_lock, self._target_lock:
+            if self.owner != session_id:
+                raise ControlTransferredError('Control changed; no stop sent to the new owner')
+            # Do not reconnect or replay on a failed send.
+            self.control.send_command('stop_follower')
+            self.owner = None
+            self.stop_requests.add(session_id)
+            self._speed_restore_allowed.discard(session_id)
+            self.note('owner_stop_requested', session_id=session_id, confirmed=False)
+        return dict(requested=True, confirmed=False)
 
     def lease_status(self, session_id):
         return dict(owns=self.owner == session_id, stopped_by_service=session_id in self.stopped,
@@ -296,6 +326,8 @@ class SharedControl:
         if role not in ('console', 'inference', 'teleop'):
             raise ValueError('Shared client role must be console, inference or teleop')
         op = request['op']
+        if op == 'stop_request':
+            return self.request_stop(session_id)
         if op == 'feedback_poll':
             return self.configure_feedback_poll(session_id, request.get('hz'))
         if op == 'feedback_snapshot':
@@ -344,7 +376,7 @@ class SharedControl:
             try:
                 with self._poll_lock:
                     feedback_error = self._poll_error
-                if feedback_error is not None:
+                if feedback_error is not None and session_id not in self._feedback_independent:
                     raise feedback_error
                 if self.owner != session_id or session_id in self.revoked:
                     raise ControlTransferredError('Control was transferred to the console; no target sent')
@@ -389,13 +421,20 @@ class SharedControl:
                         if self.console_operation_depth == 0:
                             self.console_operation = None
                 elif request['operation'] == 'acquire':
-                    self.claim(session_id, role)
+                    self.claim(session_id, role, require_feedback=request.get('require_feedback', True))
                 elif request['operation'] == 'acknowledge':
-                    if self.owner is not None or self.console_operation is not None:
+                    if (self.console_operation is not None or (self.owner is not None
+                            and self.owner != session_id and self.owner not in self.revoked)):
                         raise PermissionError('Another session still owns control')
                     state = _controller_state(self.read_state())
-                    if state.follower_active is not False:
+                    if (state.follower_active is not False or state.has_error
+                            or state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped'):
                         raise PermissionError('Follower stop is not confirmed')
+                    if self.owner is not None:
+                        # A failed transport can leave a revoked, now-inactive
+                        # lease behind. Release metadata only; no stop is replayed.
+                        self.stopped.add(self.owner)
+                        self.owner = None
                     self.preempted.discard(session_id)
                     self.revoked.discard(session_id)
                 elif request['operation'] == 'prepare_command':
@@ -450,6 +489,7 @@ class SharedControl:
     def disconnected(self, session_id):
         self.configure_feedback_poll(session_id, None)
         with self._control_lock, self._target_lock:
+            self._feedback_independent.discard(session_id)
             if self.console_operation == session_id:
                 self.console_operation = None
                 self.console_operation_depth = 0

@@ -134,8 +134,12 @@ def main(argv=None):
               f'目录={record_cfg["record"]["root"]}，右手功能键={runtime.recording.buttons.button}；'
               f'只读按键检查={args.check_record_buttons}')
     if args.preview:
+        continuous_feedback = getattr(runtime, 'continuous_feedback', True)
+        query_hz = cfg.teleop.get('feedback_poll_hz') if (continuous_feedback or args.record_config) else None
+        query_description = f'{query_hz}Hz' if query_hz is not None else '关闭'
         print(f'配置有效：vr_only={cfg.teleop.vr_only}，observe_only={runtime.observe_only}，'
-              f'控制目标={cfg.teleop.get("fps", 30)}Hz，独立状态查询={cfg.teleop.get("feedback_poll_hz")}Hz，'
+              f'控制目标={cfg.teleop.get("fps", 30)}Hz，独立状态查询={query_description}，'
+              f'continuous_feedback={continuous_feedback}，'
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
               f'record_controller={runtime.record_controller}，measure_vr_latency={args.measure_vr_latency}，'
               f'zx_grippers={getattr(runtime, "zx_grippers_enabled", False)}，'

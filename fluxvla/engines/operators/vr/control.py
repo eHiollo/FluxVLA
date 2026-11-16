@@ -4,7 +4,8 @@ Anchor composition and the speed-only governor follow A10_new 97feb31,
 ``a10_anchor_protocol.cpp``. Velocity clamp/slew follow ``a10_vr_vel_plan.cpp``.
 The optional acceleration stage is a frontend reference experiment, not the
 controller's 500 Hz feedback/IK loop. Hardware IO stays in vr.runtime (stage 3).
-All poses: base-frame xyz metres + quaternion xyzw; offsets: tool xyz + rotvec.
+All poses: base-frame xyz metres + quaternion xyzw. Offsets use tool xyz by
+default, or explicitly tagged base xyz; rotations remain tool-local rotvecs.
 """
 
 from dataclasses import dataclass
@@ -171,6 +172,8 @@ class AnchorState:
         actual = pose(actual)
         if not isinstance(command, dict) or type(command.get('active')) is not bool:
             raise ValueError('anchor command requires boolean active')
+        if type(command.get('rotation_enabled', True)) is not bool:
+            raise ValueError('rotation_enabled must be bool')
         session = command.get('session_id')
         if not isinstance(session, str) or not session:
             raise ValueError('session_id must be a nonempty string')
@@ -202,7 +205,20 @@ class AnchorState:
         return 'anchored' if new_anchor else 'updated'
 
     def _make_target(self, command, actual, offset, new_anchor):
+        if command.get("translation_frame", "tool_anchor") != "tool_anchor":
+            raise ValueError("anchor_relative requires tool_anchor translation")
         return compose_offset(actual if new_anchor else self.robot_anchor, offset)
+
+
+class WorldTranslationAnchorState(AnchorState):
+    """Base-frame displacement with unchanged tool-local rotation offsets."""
+
+    def _make_target(self, command, actual, offset, new_anchor):
+        if command.get("translation_frame") != "robot_base":
+            raise ValueError("world translation requires robot_base translation")
+        anchor = actual if new_anchor else self.robot_anchor
+        rotation = Rotation.from_quat(anchor[3:]) * Rotation.from_rotvec(offset[3:])
+        return np.r_[anchor[:3] + offset[:3], rotation.as_quat()]
 
 
 class CalibratedAnchorState(AnchorState):
@@ -353,14 +369,14 @@ class VRPoseController:
 
     def __init__(self, config=None, *, pose_mapping='anchor_relative', pose_calibration=None):
         self.config = config or ReferenceConfig()
-        if pose_mapping not in ('anchor_relative', 'calibrated_absolute'):
-            raise ValueError('pose_mapping must be anchor_relative or calibrated_absolute')
+        if pose_mapping not in ('anchor_relative', 'calibrated_absolute', 'world_translation_local_rotation'):
+            raise ValueError(f'Unknown pose_mapping: {pose_mapping}')
         if pose_calibration is not None and not isinstance(pose_calibration, dict):
             raise ValueError('pose_calibration must be a dictionary')
         if pose_mapping == 'calibrated_absolute' and pose_calibration is None:
             raise ValueError('calibrated_absolute requires explicit pose_calibration')
-        if self.config.rotation_follow_mode == 'incremental_velocity' and pose_mapping != 'anchor_relative':
-            raise ValueError('incremental_velocity requires anchor_relative pose mapping')
+        if self.config.rotation_follow_mode == 'incremental_velocity' and pose_mapping == 'calibrated_absolute':
+            raise ValueError('incremental_velocity requires anchor_relative or world_translation_local_rotation pose mapping')
         self.pose_mapping = pose_mapping
         # Own calibration data so caller edits cannot change a running mapping.
         self.pose_calibration = (None if pose_calibration is None else
@@ -378,6 +394,7 @@ class VRPoseController:
         self._release_previous_feedback_time_s = None
         self._reanchor_translation = np.zeros(3)
         self._reanchor_rotation = Rotation.identity()
+        self._rotation_enabled = True
         self._rotation_previous_target = None
         self._rotation_sample_elapsed_s = 0.
         self.rotation_input_base_rad_s = np.zeros(3)
@@ -385,8 +402,11 @@ class VRPoseController:
         self._command_tracking_limit_exceeded = False
 
     def _new_anchor(self):
-        return (CalibratedAnchorState(self.pose_calibration)
-                if self.pose_mapping == 'calibrated_absolute' else AnchorState())
+        if self.pose_mapping == 'calibrated_absolute':
+            return CalibratedAnchorState(self.pose_calibration)
+        if self.pose_mapping == 'world_translation_local_rotation':
+            return WorldTranslationAnchorState()
+        return AnchorState()
 
     def validate_command(self, command, actual):
         """Validate using the selected mapping before starting any follower."""
@@ -421,6 +441,7 @@ class VRPoseController:
                     linear_velocity_m_s=self.linear_velocity.tolist(),
                     angular_velocity_rad_s=self.angular_velocity.tolist(),
                     rotation_follow_mode=self.config.rotation_follow_mode,
+                    rotation_enabled=self._rotation_enabled,
                     rotation_input_base_rad_s=self.rotation_input_base_rad_s.tolist(),
                     rotation_input_stationary=(None if self.config.rotation_follow_mode == 'anchor' else
                                                bool(np.linalg.norm(self.rotation_input_base_rad_s) == 0.)),
@@ -477,6 +498,7 @@ class VRPoseController:
                   'control_gap' if dt_s > self.config.max_dt_s else
                   'feedback_stale' if feedback_age_s > self.config.max_feedback_age_s else None)
         packet = None
+        rotation_was_enabled = self._rotation_enabled
         self.input_age_s += dt_s
         if command is not None and reason is None:
             # Reject older packets. Accept an equal-sequence release: existing
@@ -491,6 +513,8 @@ class VRPoseController:
                 packet = 'duplicate' if key == self.anchor.key and seq == self.anchor.sequence else 'stale'
             else:
                 packet = self.anchor.update(command, actual)
+                if packet in ('anchored', 'updated'):
+                    self._rotation_enabled = command.get('rotation_enabled', True)
                 self.input_age_s = sample_age_s
                 if packet == 'anchored':
                     # Keep the measured clutch anchor, but carry its existing
@@ -522,11 +546,24 @@ class VRPoseController:
             return self._result('fault', stop=True, packet=packet)
         if not self.anchor.active:
             return self._result('inactive', packet=packet)
+        if not self._rotation_enabled or not rotation_was_enabled:
+            # Lock the current command orientation, not the measured lagging pose.
+            # On unlock, rebase once so hand rotation made during the lock is lost.
+            held = Rotation.from_quat(self.command_pose[3:])
+            self._reanchor_rotation = held * Rotation.from_quat(self.anchor.target[3:]).inv()
+            self._rotation_previous_target = held
+            self._rotation_sample_elapsed_s = 0.
+            self.rotation_input_base_rad_s.fill(0.)
+            self.rotation_backlog_discarded_rad = 0.
+            self.angular_velocity.fill(0.)
+            self.governor.reference[3:] = self.command_pose[3:]
         tracking_target = np.r_[self.anchor.target[:3] + self._reanchor_translation,
                                 (self._reanchor_rotation * Rotation.from_quat(self.anchor.target[3:])).as_quat()]
         angular_input = None
         governor_target = tracking_target
-        if self.config.rotation_follow_mode == 'incremental_velocity':
+        if not self._rotation_enabled:
+            angular_input = np.zeros(3)
+        elif self.config.rotation_follow_mode == 'incremental_velocity':
             angular_input, governor_target = self._incremental_rotation(packet, tracking_target, dt_s)
         state = self.governor.step(governor_target, actual, dt_s)
         if state == 'fault':
@@ -684,10 +721,10 @@ def replay_main(argv=None):
     parser.add_argument('--no-acceleration-limit', action='store_true', help='关闭新增的前端加速度整形作对照')
     parser.add_argument('--max-reference-lead-m', type=float, help='可选平移 reference 超前上限（米）')
     parser.add_argument('--max-reference-lead-rad', type=float, help='可选姿态 reference 超前上限（弧度）')
-    parser.add_argument('--pose-mapping', choices=['anchor_relative', 'calibrated_absolute'],
+    parser.add_argument('--pose-mapping', choices=['anchor_relative', 'calibrated_absolute', 'world_translation_local_rotation'],
                         default='anchor_relative', help='目标映射方式，默认保留原锚点相对映射')
     parser.add_argument('--pose-calibration', type=Path,
-                        help='新模式的标定 JSON，含 vr_to_robot_quat_xyzw 和 hand_to_tool_quat_xyzw')
+                        help='calibrated_absolute 专用标定 JSON；世界平移模式无需标定')
     args = parser.parse_args(argv)
     if not math.isfinite(args.fps) or args.fps <= 0 or (args.max_steps is not None and args.max_steps <= 0):
         parser.error('fps 和 max-steps 必须为正数')
@@ -713,6 +750,8 @@ def replay_main(argv=None):
             offset = [min(index / 30., 1.) * .02, 0., 0., 0., 0., min(index / 30., 1.) * .1]
             command = dict(active=active, session_id='offline-demo', anchor_id=1,
                            sample_sequence=index, offset=offset, gripper=0.)
+            if args.pose_mapping == 'world_translation_local_rotation':
+                command['translation_frame'] = 'robot_base'
             command.update(hand_pose_vr=[*offset[:3], *Rotation.from_rotvec(offset[3:]).as_quat()],
                            position_scale=1.)
             yield dict(mapped_action={'_xlevr.anchor_command': command},

@@ -45,6 +45,7 @@ class VRInput:
         self._connected = False
         self._vr_event_handler: VREventHandler | None = None
         self.calibration_view = None
+        self.sandbox_view = None
         self.measure_latency = False
         self.latency = None
 
@@ -99,6 +100,7 @@ class VRInput:
         while time.time() < deadline:
             if self._vr_monitor.initialize():
                 self._vr_monitor.https_server.calibration_view = self.calibration_view
+                self._vr_monitor.https_server.sandbox_view = self.sandbox_view
                 if self.measure_latency:
                     from .latency import VRLatencyRecorder
                     self.latency = VRLatencyRecorder(
@@ -155,6 +157,8 @@ class VRInput:
             host = get_local_ip()
         https_port = self._vr_monitor.config.https_port
         guide = (
+            '  VR测试台：侧键只操作虚拟夹爪，不连接机械臂、夹爪或相机'
+            if self.sandbox_view is not None else
             '  只读标定验证：手柄转动只改变网页目标；侧键仅记录平移锚点，不控制机械臂或夹爪'
             if self.calibration_view is not None else
             '  双臂：左/右侧键分别接管左/右臂；松开仅对应臂减速保持；Ctrl+C 结束\n'

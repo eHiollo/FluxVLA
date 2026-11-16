@@ -302,7 +302,8 @@ class VRTeleopRuntime:
                  control_mode='delta', reference_options=None, observe_only=False,
                  pose_mapping='anchor_relative', pose_calibration=None,
                  controller_speed_percent=None, cartesian_adapter='legacy_anchor',
-                 record_controller=False, keep_session_on_query_error=False):
+                 record_controller=False, keep_session_on_query_error=False, confirm_stop=True,
+                 resilient_takeover=False):
         if cartesian_adapter not in ('legacy_anchor', 'sdk_tool_cumulative'):
             raise ValueError('Unknown cartesian_adapter')
         if cartesian_adapter == 'sdk_tool_cumulative':
@@ -315,6 +316,13 @@ class VRTeleopRuntime:
         if record_controller and (robot is None or not (execute or observe_only) or not diagnostics_path):
             raise ValueError('record_controller requires live/observe feedback and a diagnostics_path')
         self.record_controller = record_controller
+        if type(confirm_stop) is not bool:
+            raise ValueError('confirm_stop must be bool')
+        self.confirm_stop = confirm_stop
+        if type(resilient_takeover) is not bool:
+            raise ValueError('resilient_takeover must be bool')
+        self.resilient_takeover = resilient_takeover
+        self._takeover_wait_reason = None
         if type(keep_session_on_query_error) is not bool:
             raise ValueError('keep_session_on_query_error must be bool')
         self.keep_session_on_query_error = keep_session_on_query_error
@@ -334,10 +342,10 @@ class VRTeleopRuntime:
             raise ValueError('execute must be bool')
         if control_mode not in ('delta', 'reference'):
             raise ValueError('control_mode must be delta or reference')
-        if pose_mapping not in ('anchor_relative', 'calibrated_absolute'):
-            raise ValueError('pose_mapping must be anchor_relative or calibrated_absolute')
-        if pose_mapping == 'calibrated_absolute' and control_mode != 'reference':
-            raise ValueError('calibrated_absolute requires control_mode=reference')
+        if pose_mapping not in ('anchor_relative', 'calibrated_absolute', 'world_translation_local_rotation'):
+            raise ValueError(f'Unknown pose_mapping: {pose_mapping}')
+        if pose_mapping != 'anchor_relative' and control_mode != 'reference':
+            raise ValueError('Selected pose_mapping requires control_mode=reference')
         if type(observe_only) is not bool:
             raise ValueError('observe_only must be bool')
         if observe_only and (execute or control_mode != 'reference' or robot is None or gripper is not None):
@@ -381,6 +389,8 @@ class VRTeleopRuntime:
                     or getattr(mapper, 'motion_shaping_mode', None) != 'robot_controller'
                     or not getattr(mapper, 'compute_anchor_shadow', False)):
                 raise ValueError('reference mode requires safe_frame_delta, anchor output, and mapper shaping bypass')
+            mapper.anchor_translation_frame = ('robot_base'
+                if pose_mapping == 'world_translation_local_rotation' else 'tool_anchor')
             self.reference_control = VRPoseController(
                 ReferenceConfig(**dict(reference_options or {})),
                 pose_mapping=pose_mapping, pose_calibration=pose_calibration)
@@ -480,6 +490,11 @@ class VRTeleopRuntime:
             return
         try:
             original = self.robot.get_speed_override()
+            if original['percent'] == self.controller_speed_percent:
+                self.speed_status.update(original=original, state='confirmed',
+                                         confirmed=dict(original), already_set=True)
+                self._speed_event()
+                return
             self.speed_status.update(original=original, state='setting')
             # A timed-out write may already have applied: retain restoration intent.
             if original['percent'] != self.controller_speed_percent:
@@ -496,6 +511,11 @@ class VRTeleopRuntime:
     def _restore_speed_override(self):
         original, self._speed_restore = self._speed_restore, None
         if original is None:
+            return
+        if (not self.confirm_stop and self.last_stop_status
+                and not self.last_stop_status.get('reported_stopped')):
+            self.speed_status['state'] = 'restore_skipped_stop_unconfirmed'
+            self._speed_event()
             return
         try:
             # Never reconnect or overwrite a different mode/operator's new setting.
@@ -788,8 +808,9 @@ class VRTeleopRuntime:
                                                  transmitted=False)
                 logging.getLogger(__name__).error(
                     '控制器查询失败，VR界面保留，已暂停新目标；停止确认=%s。'
-                    '请在现场确认停止，Ctrl+C退出后重新连接。',
-                    self.communication_pause['stop_confirmed'])
+                    '%s',
+                    self.communication_pause['stop_confirmed'],
+                    '请在现场确认停止，Ctrl+C退出后重新连接。')
                 if self.teleoperator is not None:
                     try:
                         self.teleoperator.send_feedback(dict(
@@ -903,7 +924,7 @@ class VRTeleopRuntime:
         return action
 
     def _stop_reference(self):
-        """Stop this session once, then confirm reported Stopped separately."""
+        """Stop targets once; optionally wait for native inactive/Stopped feedback."""
         if self.observe_only or not self.execute:
             return
         pending = self._started_follower or self.robot.follower_stop_pending
@@ -912,12 +933,18 @@ class VRTeleopRuntime:
         self._reference_stop_attempted = True
         self.last_stop_status = dict(requested=True, mode_inactive=False, reported_stopped=False)
         try:
-            self._timed_call('stop_request_s', self.robot.stop_follower)
-            self._started_follower = False
-            self.last_stop_status['mode_inactive'] = True
-            self._timed_call('stop_confirm_s', self.robot.wait_stopped)
-            self.last_stop_status['reported_stopped'] = True
-            logging.getLogger(__name__).info('参考跟随停止确认：inactive + Stopped')
+            if self.confirm_stop:
+                self._timed_call('stop_request_s', self.robot.stop_follower)
+                self._started_follower = False
+                self.last_stop_status['mode_inactive'] = True
+                self._timed_call('stop_confirm_s', self.robot.wait_stopped)
+                self.last_stop_status['reported_stopped'] = True
+                logging.getLogger(__name__).info('参考跟随停止确认：inactive + Stopped')
+            else:
+                self._timed_call('stop_request_s', self.robot.request_stop_follower)
+                self._started_follower = False
+                self.last_stop_status['state'] = 'stop_requested'
+                logging.getLogger(__name__).info('已发送停止跟随请求，不等待执行结果或停止回读')
         except BaseException as exc:
             self.last_stop_status['error'] = f'{type(exc).__name__}: {exc}'
             logging.getLogger(__name__).error(
@@ -1169,12 +1196,14 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     """
 
     def __init__(self, vr, robot=None, *, gripper=None, zx_grippers=None,
-                 input_recovery_stable_s=.5, stop_on_both_release=True, feedback_poll_hz=None, **settings):
+                 input_recovery_stable_s=.5, stop_on_both_release=True, feedback_poll_hz=None,
+                 continuous_feedback=True, **settings):
         from .control import VRPoseController
         if (not getattr(vr, 'is_dual', False) or settings.get('control_mode') != 'reference'
-                or settings.get('pose_mapping', 'anchor_relative') != 'anchor_relative'
+                or settings.get('pose_mapping', 'anchor_relative') not in (
+                    'anchor_relative', 'world_translation_local_rotation')
                 or gripper is not None):
-            raise ValueError('Dual VR requires both hands, reference and anchor_relative; use zx_grippers for dual USB devices')
+            raise ValueError('Dual VR requires both hands, reference and a relative pose mapping; use zx_grippers for dual USB devices')
         self.arm_names = tuple(vr.hand_to_arm.values())
         if robot is not None and (not getattr(robot, 'is_multi_arm', False)
                                   or set(robot.arm_names) != set(self.arm_names)):
@@ -1183,6 +1212,17 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         if type(stop_on_both_release) is not bool:
             raise ValueError('stop_on_both_release must be bool')
         self.stop_on_both_release = stop_on_both_release
+        if type(continuous_feedback) is not bool:
+            raise ValueError('continuous_feedback must be bool')
+        self.continuous_feedback = continuous_feedback
+        self._sent_reference_poses = None
+        self._last_target_send_s = None
+        if not continuous_feedback:
+            cfg = self.reference_control.config
+            if (self.observe_only or self.cartesian_adapter != 'sdk_tool_cumulative'
+                    or cfg.enforce_tracking_error_limits or cfg.max_reference_lead_m is not None
+                    or cfg.max_reference_lead_rad is not None):
+                raise ValueError('Command-only control requires SDK cumulative mode without measured tracking/lead limits')
         if feedback_poll_hz is not None and (isinstance(feedback_poll_hz, bool)
                 or not isinstance(feedback_poll_hz, (float, int))
                 or not math.isfinite(feedback_poll_hz) or not 1 <= feedback_poll_hz <= 90):
@@ -1191,8 +1231,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._feedback_polling = False
         if not self.reference_control.config.limit_acceleration:
             raise ValueError('Dual release requires acceleration limiting')
+        for mapper in vr.mappers.values():
+            mapper.anchor_translation_frame = self.mapper.anchor_translation_frame
         self._arms = {arm: dict(hand=hand, mapper=vr.mappers[hand],
-                               control=VRPoseController(self.reference_control.config),
+                               control=VRPoseController(self.reference_control.config,
+                                                       pose_mapping=self.pose_mapping),
                                state='holding', key=None, target=None)
                       for hand, arm in vr.hand_to_arm.items()}
         self._dual_time = None
@@ -1240,9 +1283,14 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
     def connect(self):
         try:
             super().connect()
-            if self.robot is not None and self.feedback_poll_hz is not None:
+            # A command-only session subscribes to measured feedback only for recording.
+            if (self.robot is not None and self.feedback_poll_hz is not None
+                    and (self.continuous_feedback or getattr(self, 'recording', None) is not None)):
                 self.robot.start_feedback_polling(self.feedback_poll_hz)
-                self._feedback_polling = True
+                self._feedback_polling = self.continuous_feedback
+            if not self.continuous_feedback:
+                logging.getLogger(__name__).info(
+                    '遥操作仅发送增量目标：不读取持续反馈；位置使用本地零点，朝向取接管反馈。录制单独读取实际反馈。')
             config = self.reference_control.config
             logging.getLogger(__name__).info(
                 '双臂旋转模式=%s，角速度=%srad/s，加速度=%srad/s²，制动=%srad/s²；'
@@ -1250,9 +1298,13 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 config.rotation_follow_mode, config.max_angular_speed_rad_s,
                 config.max_angular_accel_rad_s2,
                 config.max_angular_brake_rad_s2 or config.max_angular_accel_rad_s2,
-                '停止并确认' if self.stop_on_both_release else '减速保持',
+                (('停止并确认' if self.confirm_stop else '仅发送停止请求')
+                 if self.stop_on_both_release else '减速保持'),
                 '保留界面/暂停新目标' if self.keep_session_on_query_error else '退出',
                 '超差停止' if config.enforce_tracking_error_limits else '仅记录')
+            if any(mapper.squeeze_translation_only for mapper in self.teleoperator.mappers.values()):
+                logging.getLogger(__name__).info(
+                    '侧键=仅XYZ平移/姿态锁定；前扳机=平移+局部旋转/精调；同时按下以前扳机为准。')
             for channel in self._zx_channels.values():
                 channel.connect()
             faults = self._gripper_faults()
@@ -1425,7 +1477,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             try:
                 self._stop_reference()
                 # Also confirm an idle/pre-start fault; no session-owned follower may exist yet.
-                if not self.last_stop_status or self.last_stop_status.get('reported_stopped') is not True:
+                if self.confirm_stop and (not self.last_stop_status or self.last_stop_status.get('reported_stopped') is not True):
                     self.robot.wait_stopped()
                 # Stop confirmation queries fresh state. The memory cache may
                 # still contain a pre-stop active frame; wait for its next update.
@@ -1444,7 +1496,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     return
                 raise
         self._input_pause.update({key: diagnostics.get(key) for key in ('vr_input_speed_m_s', 'sample_dt_s')})
-        self._input_pause['stopped'] = True
+        self._input_pause['stopped'] = not self.execute or self.confirm_stop
         if error.reason == 'feedback_stale':
             self._input_pause['state'] = 'feedback_wait'
         self._dual_time = None
@@ -1452,7 +1504,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self.teleoperator.reset_reference()
         self._pause_result()
         logging.getLogger(__name__).warning(
-            'VR已停止并锁定接管：%s；双手松开并回中，输入稳定后重新按侧键接管。诊断=%s',
+            'VR已停发目标并锁定接管：%s；双手松开并回中，输入稳定后重新按侧键接管。诊断=%s',
             error, error.details)
 
     def _pause_input_stable(self, raw, now):
@@ -1500,31 +1552,41 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             self._input_pause.update(state='stop_unconfirmed', stable_s=0.)
             self._pause_result()
             return
-        try:
-            self._checked_frame(require_active=False)  # Real faults retain their existing handling.
-        except _VRFeedbackStale:
-            self._wait_for_feedback()
-            return
         now = time.monotonic()
-        stamp = self.last_frame['received_monotonic_s']
-        if self._feedback_resume_after_s is not None and stamp <= self._feedback_resume_after_s:
-            self._wait_for_feedback()
-            return
-        feedback_recovery = self._input_pause['reason'] == 'feedback_stale'
-        if feedback_recovery and (self.last_frame.get('follower_active') is not False
-                or self.last_frame.get('motion') != 'Stopped'
-                or self.last_frame.get('activation') != 'Enabled'):
-            self._wait_for_feedback()
-            return
-        if self.execute and self.last_frame.get('follower_active') is not False:
-            raise RuntimeError('Follower restarted while VR input is paused')
-        feedback_updated = self._pause_feedback_stamp is None or stamp > self._pause_feedback_stamp
-        if self._pause_feedback_stamp is not None and (
-                stamp < self._pause_feedback_stamp or stamp-self._pause_feedback_stamp > self.max_feedback_age_s):
-            self._pause_stable_since = None
-            self._input_pause.update(state='stabilizing', stable_s=0.)
-        if feedback_updated:
-            self._pause_feedback_stamp = stamp
+        feedback_recovery = False
+        feedback_updated = True
+        if self.continuous_feedback:
+            try:
+                self._checked_frame(require_active=False)  # Real faults retain their existing handling.
+            except _VRFeedbackStale:
+                self._wait_for_feedback()
+                return
+            stamp = self.last_frame['received_monotonic_s']
+            if self._feedback_resume_after_s is not None and stamp <= self._feedback_resume_after_s:
+                self._wait_for_feedback()
+                return
+            feedback_recovery = self._input_pause['reason'] == 'feedback_stale'
+            if feedback_recovery and (self.last_frame.get('follower_active') is not False
+                    or self.last_frame.get('motion') != 'Stopped'
+                    or self.last_frame.get('activation') != 'Enabled'):
+                self._wait_for_feedback()
+                return
+            if self.execute and not self.confirm_stop:
+                # No extra stop query: the existing feedback cache may update later.
+                if (self.last_frame.get('follower_active') is not False
+                        or self.last_frame.get('motion') != 'Stopped'):
+                    self._wait_for_feedback()
+                    return
+                self._input_pause['stopped'] = True
+            if self.execute and self.last_frame.get('follower_active') is not False:
+                raise RuntimeError('Follower restarted while VR input is paused')
+            feedback_updated = self._pause_feedback_stamp is None or stamp > self._pause_feedback_stamp
+            if self._pause_feedback_stamp is not None and (
+                    stamp < self._pause_feedback_stamp or stamp-self._pause_feedback_stamp > self.max_feedback_age_s):
+                self._pause_stable_since = None
+                self._input_pause.update(state='stabilizing', stable_s=0.)
+            if feedback_updated:
+                self._pause_feedback_stamp = stamp
         valid, updated = self._pause_input_stable(raw, now)
         grips, neutral = [], True
         for sample in raw.values():
@@ -1570,6 +1632,11 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
 
     def _checked_frame(self, *, require_active, force_refresh=False):
         from .control import pose
+        if (not self.continuous_feedback and not force_refresh and self._dual_time is not None):
+            if self._sent_reference_poses is None:
+                raise RuntimeError('No successfully sent reference is available')
+            # These are local references, never labelled/published as measured feedback.
+            return {name: value.copy() for name, value in self._sent_reference_poses.items()}
         read = (self.robot.get_cached_frame if self._feedback_polling and not force_refresh
                 else self.robot.get_frame)
         frame = self._timed_call('robot_feedback_s', read)
@@ -1608,6 +1675,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             raise
         finally:
             self._dual_time = None
+            self._sent_reference_poses = None
+            self._last_target_send_s = None
             self._dual_require_release = True
             self.teleoperator.reset_reference()
 
@@ -1623,6 +1692,10 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                         for name, target in targets.items()}
             self._timed_call('target_send_s', self.robot.send_eepose, relative)
             self.last_relative_target = relative
+        if not self.continuous_feedback:
+            self._sent_reference_poses = {name: value.copy() for name, value in targets.items()}
+            self._last_target_send_s = time.monotonic()
+            self.last_reference_result.update(reference_source='last_sent_target', reference_origin='local_zero')
         self.last_reference_result['transmitted'] = True
 
     def _input_state(self, raw, action):
@@ -1658,6 +1731,21 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                     raise RuntimeError(f'Dual VR {arm}: mapper_input_rejected ({reason})')
         return requested, fresh
 
+    def _wait_for_takeover(self, reason):
+        """Temporarily not ready is an idle UI state, not an exception or retry."""
+        self._dual_require_release = True
+        self.teleoperator.reset_reference()
+        self.last_reference_result = dict(state='await_controller_ready', reason=reason,
+                                         arms={}, transmitted=False)
+        if reason != self._takeover_wait_reason:
+            self._takeover_wait_reason = reason
+            logging.getLogger(__name__).warning('暂不可接管：%s；松开侧键，状态恢复后重新按下。', reason)
+            try:
+                self.teleoperator.send_feedback(dict(type='hud', phase='input_paused',
+                    hint='CONTROLLER NOT READY - RELEASE GRIPS AND RETRY', error=reason))
+            except Exception:
+                logging.getLogger(__name__).warning('接管状态提示发送失败', exc_info=True)
+
     def _step_arms(self, raw, action):
         if not self.execute and not self.observe_only:
             return action  # VR-only maps both hands, never fabricates feedback.
@@ -1680,6 +1768,10 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             self.last_reference_result = dict(state='release_required', arms={})
             return action
         requested, fresh = self._input_state(raw, action)
+        if (not self.continuous_feedback and self._dual_time is None
+                and not any(requested[n] and action[n].get('ee.enabled') for n in self.arm_names)):
+            self.last_reference_result = dict(state='idle', arms={}, transmitted=False)
+            return action
         poses = self._checked_frame(require_active=self.execute and self._started_follower)
         if self._dual_time is None:
             starters = [name for name in self.arm_names if requested[name]
@@ -1687,6 +1779,13 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             if not starters:
                 self.last_reference_result = dict(state='idle', arms={})
                 return action
+            if self.execute and self.resilient_takeover:
+                frame = self.last_frame
+                if (frame.get('follower_active') is not False or frame.get('motion') != 'Stopped'
+                        or frame.get('activation') != 'Enabled'):
+                    self._wait_for_takeover(
+                        f"activate={frame.get('activation')}, motion={frame.get('motion')}, follower={frame.get('follower_active')}")
+                    return action
             for name in starters:
                 self._arms[name]['control'].validate_command(
                     action[name]['_xlevr.anchor_command'], poses[name])
@@ -1694,10 +1793,25 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 self._reference_stop_attempted = False
                 self.last_stop_status = None
                 if not self._started_follower:
-                    self.robot.set_tool_coordinate()
-                    self.robot.start_follower('cartesian')
+                    from ..a10_operator import A10NotReadyError
+                    try:
+                        if self.resilient_takeover:
+                            self.robot.ensure_tool_coordinate()
+                        else:
+                            self.robot.set_tool_coordinate()
+                        self.robot.start_follower('cartesian')
+                    except A10NotReadyError as exc:
+                        if not self.resilient_takeover or self.robot.follower_stop_pending:
+                            raise
+                        self._wait_for_takeover(str(exc))
+                        return action
+                self._takeover_wait_reason = None
                 self._started_follower = True
                 poses = self._checked_frame(require_active=True, force_refresh=True)
+            if not self.continuous_feedback:
+                # The absolute position cancels in the cumulative SDK adapter.
+                # Keep the measured orientation for base-to-tool conversion only.
+                poses = {name: np.r_[np.zeros(3), value[3:]] for name, value in poses.items()}
             targets = {}
             for name, context in self._arms.items():
                 context.update(state='holding', key=None, target=poses[name].copy())
@@ -1726,7 +1840,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 self._dual_time = None
                 self._dual_require_release = True
                 self.teleoperator.reset_reference()
-            self.last_reference_result['state'] = 'stopped'
+            self.last_reference_result['state'] = 'stopped' if self.confirm_stop else 'stop_requested'
             return action
         now = time.monotonic()
         dt = now - self._dual_time
@@ -1737,7 +1851,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             raise _VRInputPause(self.arm_names[0], 'control_gap', details=dict(
                 control_gap_s=dt, max_control_gap_s=self.reference_control.config.max_dt_s,
                 io_timing_s=dict(self.last_io_timing)))
-        feedback_age = now - self.last_frame['received_monotonic_s']
+        feedback_age = now - self.last_frame['received_monotonic_s'] if self.continuous_feedback else 0.
         targets, results = {}, {}
         for name, context in self._arms.items():
             control = context['control']
@@ -1783,8 +1897,19 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 result['relative_target'] = None  # Wire rows are cumulative 321, not relative poses.
             context['target'] = target.copy()
         # Validate BOTH arms first: never transmit a partially valid group.
-        if self.execute:
+        # After the explicitly configured soft release, a stationary endpoint
+        # need not be resent. The native session stays owned until fault/exit.
+        unchanged_hold = (not self.continuous_feedback and not any(requested.values())
+            and self._sent_reference_poses is not None
+            and all(np.linalg.norm(c['control'].linear_velocity) < 1e-10
+                    and np.linalg.norm(c['control'].angular_velocity) < 1e-10
+                    and np.allclose(targets[name], self._sent_reference_poses[name], rtol=0., atol=1e-12)
+                    for name, c in self._arms.items()))
+        if self.execute and not unchanged_hold:
             self._send_dual_targets(targets)
+        elif unchanged_hold:
+            self.last_reference_result.update(reference_source='last_sent_target', reference_origin='local_zero',
+                                             hold_transmission_suppressed=True)
         if not any(requested.values()):
             self.last_reference_result['state'] = (
                 'holding' if all(r['state'] == 'holding' for r in results.values()) else 'releasing')

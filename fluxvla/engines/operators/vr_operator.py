@@ -110,11 +110,18 @@ class VROperator(BaseTeleoperator):
             self.last_raw = self.input.get_hand_actions()
             self.last_action = {}
             for hand, raw in self.last_raw.items():
-                # In dual mode only the side key engages an arm. The front
-                # trigger changes the scale while squeezed, never takes over.
                 squeezed = bool(raw.get('xlevr.grip_active') or
                                  raw.get('xlevr.buttons', {}).get('squeeze'))
-                raw['xlevr.enabled'] = squeezed
+                mapper = self.mappers[hand]
+                # Original dual profiles keep their side-key-only clutch.
+                # Translation-lock profiles explicitly add front-trigger takeover.
+                try:
+                    trigger = float(raw.get('xlevr.trigger', 0.))
+                except (TypeError, ValueError):
+                    trigger = float('nan')
+                trigger_takeover = (mapper.squeeze_translation_only and math.isfinite(trigger)
+                                    and trigger >= mapper.fine_trigger_threshold)
+                raw['xlevr.enabled'] = squeezed or trigger_takeover
                 mapped = self.mappers[hand](raw)
                 # Thumbsticks remain independent of the arm clutch. Each raw
                 # sample keeps its own freshness; no arm-name-based USB routing.

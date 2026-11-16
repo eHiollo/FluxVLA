@@ -1,5 +1,6 @@
 """Actual native LeRobot IO with synthetic RGB/feedback only; no device access."""
 import json
+import multiprocessing
 from pathlib import Path
 import tempfile
 import threading
@@ -14,6 +15,19 @@ from fluxvla.datasets.a10_recording_io import export_openpi_dataset, validate_da
 from fluxvla.datasets.lerobot_episode_writer import LeRobotEpisodeWriter
 from test_vr_recording import SessionTests
 from test_vr_dual_runtime import DualRuntimeTest
+
+
+_previous_start_method = None
+
+
+def setUpModule():
+    global _previous_start_method
+    _previous_start_method = multiprocessing.get_start_method(allow_none=True)
+    multiprocessing.set_start_method('spawn', force=True)
+
+
+def tearDownModule():
+    multiprocessing.set_start_method(_previous_start_method, force=True)
 
 
 CAMERAS = {n: dict(width=64, height=64) for n in get_schema('a10_dual_v1').cameras}
@@ -72,6 +86,40 @@ class NativeWriterTests(unittest.TestCase):
         finally:
             ds.finalize()
 
+    def test_recording_entrypoint_selects_spawn_before_runtime_construction(self):
+        from scripts.teleoperate import main
+        root = Path(__file__).resolve().parents[1]
+        args = ['--config', str(root/'configs/a10/a10_dual_arm_vr_teleop_world_translation.py'),
+                '--record-config', str(root/'configs/a10/a10_dual_arm_record.py')]
+        class ConstructionReached(Exception): pass
+        for flags, configure in (([], True), (['--preview'], False), (['--check-record-buttons'], False)):
+            events = []
+            def construct(_):
+                events.append('runtime'); raise ConstructionReached()
+            with self.subTest(flags=flags), \
+                    patch('multiprocessing.set_start_method', side_effect=lambda *a, **kw: events.append((a, kw))), \
+                    patch('scripts.teleoperate.build_runtime', side_effect=construct):
+                with self.assertRaises(ConstructionReached): main(args+flags)
+            self.assertEqual(events, [(('spawn',), {'force': True}), 'runtime'] if configure else ['runtime'])
+
+    def test_native_dataset_and_image_writer_are_reused_until_final_close(self):
+        writer = self.writer()
+        dataset, image_writer = writer.dataset, writer.dataset.image_writer
+        with patch.object(dataset, 'finalize', wraps=dataset.finalize) as finalize, \
+             patch.object(dataset, 'stop_image_writer', wraps=dataset.stop_image_writer) as stop_images, \
+             patch.object(dataset, 'save_episode', wraps=dataset.save_episode) as save:
+            for episode in range(3):
+                writer.start(f'task {episode}'); self.frames(writer)
+                self.assertEqual(writer.save(), episode)
+                self.assertIs(writer.dataset, dataset)
+                self.assertIs(writer.dataset.image_writer, image_writer)
+            self.assertEqual(save.call_args_list, [unittest.mock.call()]*3)
+            finalize.assert_not_called(); stop_images.assert_not_called()
+            writer.close(); writer.close()
+            finalize.assert_called_once(); stop_images.assert_called_once()
+        report = validate_dataset(self.root)
+        self.assertEqual((report['episodes'], report['frames']), (3, 12))
+
     def test_unfinished_episode_is_preserved_and_can_be_archived_without_publishing(self):
         writer = self.writer()
         writer.start('unfinished'); self.frames(writer); writer.close()
@@ -115,9 +163,17 @@ class NativeWriterTests(unittest.TestCase):
 
 
 class NativeSessionTests(SessionTests):
+    save_timeout_s = 60
+
+    def settle(self):
+        if self.session.future:
+            self.session.future.result(timeout=60)
+        self.session._poll_future()
+
     def test_native_90hz_controls_preserve_30hz_dataset_with_slow_feedback(self):
         self.use_native_writer()
         SessionTests.test_90hz_controls_and_independent_30hz_samples_with_slow_feedback(self)
+        self.session.close()  # Native Parquet footers are committed at session end.
         import pyarrow.parquet as pq
         table = pq.read_table(next((self.root/'data').rglob('*.parquet')))
         timestamps = table.column('timestamp').to_numpy()

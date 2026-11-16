@@ -9,6 +9,12 @@ from mmengine import Config, DictAction
 from fluxvla.engines.operators.vr.runtime import build_runtime
 
 
+def _configure_recording_workers():
+    """Native LeRobot uses process workers; never fork live device threads."""
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
@@ -110,6 +116,15 @@ def main(argv=None):
     if args.check_record_buttons:
         cfg.teleop.update(vr_only=True, observe_only=False)
         cfg.teleop.zx_grippers.enabled = False
+    record_cfg = None
+    if args.record_config:
+        record_config = Config.fromfile(str(args.record_config))
+        if args.record_options:
+            record_config.merge_from_dict(args.record_options)
+        record_cfg = record_config.to_dict()
+        if (record_cfg['record'].get('backend', 'legacy') == 'lerobot'
+                and not args.preview and not args.check_record_buttons):
+            _configure_recording_workers()
     runtime = build_runtime(cfg.teleop)
     runtime.vr.measure_latency = args.measure_vr_latency
     runtime.vr.latency_context = dict(recording=bool(args.record_config),
@@ -118,9 +133,6 @@ def main(argv=None):
         record_controller=runtime.record_controller)
     if args.record_config:
         from fluxvla.engines.operators.vr.recording import RecordingSession
-        record_config = Config.fromfile(str(args.record_config))
-        if args.record_options: record_config.merge_from_dict(args.record_options)
-        record_cfg = record_config.to_dict()
         if record_cfg['record'].get('fps', 30) != 30:
             parser.error('双臂数据录制要求record.fps=30')
         if (record_cfg.get('capture', {}).get('sampling_mode', 'background_30hz') == 'control_loop'

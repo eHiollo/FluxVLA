@@ -71,6 +71,51 @@ class LeRobotWorkflowTests(SessionTests):
             self.session._poll_reset()
             move.assert_called_once()
 
+    def test_reset_restored_follower_stops_before_save_and_automatic_next(self):
+        self.start()
+        events = []
+        def restored(robot, **kwargs):
+            events.append('m_init_restored_cartesian')
+            robot.follower_stop_pending = True
+        def stopped():
+            events.append('stop')
+            self.robot.follower_stop_pending = False
+        def confirmed():
+            self.assertFalse(self.robot.follower_stop_pending)
+            events.append('confirmed')
+        self.robot.stop_follower.side_effect = stopped
+        self.robot.wait_stopped.side_effect = confirmed
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=restored):
+            self.session.command('up'); self.session.command('up')
+            self.session.reset_thread.join(1.)
+            self.session._poll_reset()
+        self.assertEqual(events, ['m_init_restored_cartesian', 'stop', 'confirmed'])
+        self.assertFalse(self.runtime._started_follower)
+        self.assertIsNone(self.runtime._dual_time)
+        self.assertTrue(self.runtime._dual_require_release)
+        self.assertEqual(self.session.state, 'recording')
+        self.right(); self.right(); self.settle(); self.automatic_next()
+        self.assertEqual(self.writer.info['total_episodes'], 1)
+        self.assertEqual(self.session.state, 'recording')
+        self.assertFalse(self.runtime._started_follower)
+
+    def test_reset_restored_follower_stop_failure_locks_motion(self):
+        self.start()
+        def restored(robot, **kwargs):
+            robot.follower_stop_pending = True
+        self.robot.stop_follower.side_effect = TimeoutError('restored follower stop unconfirmed')
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=restored):
+            self.session.command('up'); self.session.command('up')
+            self.session.reset_thread.join(1.)
+            self.session._poll_reset()
+        self.assertEqual(self.session.state, 'reset_failed')
+        self.assertTrue(self.session.blocks_motion)
+        self.assertIn('stop unconfirmed', self.session.error)
+        self.robot.wait_stopped.assert_not_called()
+        self.session.command('save')
+        self.assertIsNone(self.session.future)
+        self.assertEqual(self.writer.info['total_episodes'], 0)
+
     def test_m_init_then_recenter_and_right_can_start_without_releasing_held_A(self):
         self.update(modifier=True)
         self.update(modifier=True, y=-1.)

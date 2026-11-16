@@ -760,8 +760,12 @@ class RecordingSession:
             from ..kaanh_commands.m_init import move_to_init
             if self.reset_cancel.is_set(): raise InterruptedError('Reset cancelled before motion')
             move_to_init(robot, cancel_event=self.reset_cancel)
-            if not robot.follower_stop_pending:
-                robot.wait_stopped()
+            # Console m_init restores its original follower. Recording instead
+            # hands control back through a new VR anchor/session; stop the
+            # restored follower before clearing the old local reference state.
+            if robot.follower_stop_pending:
+                robot.stop_follower()
+            robot.wait_stopped()
         except Exception as exc:
             error = str(exc)
             try: robot.stop_all_actions()

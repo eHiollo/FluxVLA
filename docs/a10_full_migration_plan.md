@@ -1589,3 +1589,10 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 以recording分支bf97d26与90Hz分支d05a595为输入，在临时工作树整合；共同历史不重复，保留双臂推理、原生LeRobot录制、90Hz后台反馈、世界坐标遥操作和图形化测试台。
 - 按用户最新要求，CLI原样采用90Hz工作区最新版本，不重排或混入旧CLI；主目录原CLI和三个分支均有备份。数据/权重/日志保持原位置，90Hz工作树保留供现场验收。
 - 保留最新参数；修正旧双手方向回归中写死0.9倍率的测试预期。VR385项及6个入口预览通过；旧m_init测试的6处失败已在合并前源提交复现，不修改归位逻辑。完整测试、备份、本地TLS和执行期间新增但未纳入的保存优化见 `docs/a10_branch_integration_20261116.md`。
+
+### 2026-11-16：修复录制归位后无法重新接管的问题
+
+- 现场日志 `work_dirs/a10/vr/dual_world_translation_diagnostics.jsonl` 显示：15:24:00归位结束时控制器仍为Cart/Running/Enabled；15:25:50保存完成、15:25:52第二集开始后，27次接管被 `await_controller_ready` 拒绝。手柄有效输入仍收到，第二集有效实测采样仍继续；不是保存关闭了VR或控制器报警。
+- 原因：通用m_init结束时恢复调用前已开启的笛卡尔跟随，录制入口却清空本地锚点；新锚点流程要求inactive + Stopped，因此卡在接管条件。仅修正录制入口的复位工作线程：通用m_init返回后，停止其恢复的跟随并确认停止，再交回VR；下一次松手重新按键时正常建立新会话和累计增量编码。
+- 保留控制台m_init恢复原状态的行为、自动下一集、原始数据与用户CLI；停止失败仍进入reset_failed并锁住运动，不自动接管已有跟随。等待在后台复位线程执行，未finish的本集继续录实测数据。
+- 验证：录制工作流/世界坐标遥操28项、VR录制/双臂runtime/原生LeRobot124项离线测试通过，覆盖复位恢复跟随、停止交接、保存后自动下一集与停止失败不放行；`git diff --check`通过。测试记录 `/tmp/a10_record_reset_handoff_tests.log`、`/tmp/a10_record_reset_handoff_regression.log`。未发送实机指令，需正常退出旧进程、重启原录制命令后现场验收。

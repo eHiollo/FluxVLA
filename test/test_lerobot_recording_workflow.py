@@ -66,7 +66,7 @@ class LeRobotWorkflowTests(SessionTests):
 
     def reset_arms(self):
         with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init') as move:
-            self.session.command('up'); self.session.command('up')
+            self.session.command('up')
             self.session.reset_thread.join(1.)
             self.session._poll_reset()
             move.assert_called_once()
@@ -118,12 +118,11 @@ class LeRobotWorkflowTests(SessionTests):
 
     def test_m_init_then_recenter_and_right_can_start_without_releasing_held_A(self):
         self.update(modifier=True)
-        self.update(modifier=True, y=-1.)
-        self.update(modifier=True)
-        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init'):
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init') as move:
             self.update(modifier=True, y=-1.)
             self.session.reset_thread.join(1.)
             self.session._poll_reset()
+            move.assert_called_once()
         self.assertEqual(self.session.state, 'idle')
         self.update(modifier=True)  # A never released; only stick recentered.
         self.update(modifier=True, x=1.)
@@ -158,9 +157,9 @@ class LeRobotWorkflowTests(SessionTests):
                                      for n, a in frame['arms'].items()})
         with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init', side_effect=moving):
             self.session.command('up')
-            self.assertEqual(self.session.state, 'recording')
-            self.assertTrue(self.session.capturing)  # Confirmation does not finish the episode.
-            self.session.command('up'); self.assertTrue(entered.wait(1.))
+            self.assertEqual(self.session.state, 'resetting')
+            self.assertTrue(self.session.capturing)
+            self.assertTrue(entered.wait(1.))
             try:
                 self.assertTrue(self.session.blocks_motion)
                 self.assertTrue(self.session.capturing)
@@ -242,15 +241,20 @@ class LeRobotWorkflowTests(SessionTests):
         self.assertIn('cancelled', self.session.error)
         self.assertEqual(self.writer.info['total_episodes'], 0)
 
-    def test_reset_rejected_or_confirmation_expired_does_not_finish_episode(self):
+    def test_single_reset_requires_release_and_held_direction_does_not_repeat(self):
         self.start(); self.update(grip=True)
         self.session.command('up')
         self.assertEqual(self.session.state, 'recording')
         self.assertIsNone(self.session.pending)
-        self.update(); self.session.command('up')
-        self.session.pending_at -= 20.
         self.update()
-        self.assertIsNone(self.session.pending)
+        with patch('fluxvla.engines.operators.kaanh_commands.m_init.move_to_init') as move:
+            self.update(modifier=True)
+            self.update(modifier=True, y=-1.)
+            self.session.reset_thread.join(1.)
+            self.session._poll_reset()
+            for _ in range(3): self.update(modifier=True, y=-1.)
+            move.assert_called_once()
+            self.assertIsNone(self.session.pending)
         self.assertEqual(self.session.state, 'recording')
 
     def test_disabled_gripper_with_real_feedback_can_record_without_automatic_enable(self):

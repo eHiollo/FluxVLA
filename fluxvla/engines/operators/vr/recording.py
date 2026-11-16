@@ -730,9 +730,6 @@ class RecordingSession:
             if (self.state not in ('idle', 'recording', 'review') or not self._released()
                     or getattr(self.runtime, 'input_pause_status', None) is not None):
                 self.notice = 'Release BOTH grips/triggers and resolve faults before m_init'; return
-            if self.pending != 'reset':
-                self.pending = 'reset'; self.pending_at = time.monotonic()
-                self.notice = 'CONFIRM RESET: recenter then repeat UP'; return
             self.pending = None
             self._reset_return_state = self.state
             self._start_reset()

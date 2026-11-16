@@ -1649,3 +1649,8 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 发现SDK设备序列号与USB身份使用不同字段，已通过asic_serial_number精确对应原左右绑定，无需更换配置身份。两腕JSON未给手动白平衡值，仅关闭自动白平衡。
 - 已安装pyrealsense2 2.59.2.11152；三路同时读取通过，全部指定基础参数回读一致，报告 `/tmp/a10_camera_controls_hardware.json`。57项相机/预设/录制离线测试通过，记录 `/tmp/a10_camera_controls_tests.log`。仅操作相机。
 - 当前工作区设备文件正在从a10_devices.py重命名为a10_dual_devices.py，本次同时在当前文件设置JSON绑定，提交仅将绑定增量写入已跟踪的原配置；其他配置重构及CLI继续保留为未提交工作。
+
+
+### 2026-11-16：左右腕手动白平衡统一3500
+
+- 在左腕.json、右腕.json中增加controls-depth-white-balance-manual=3500，保持自动白平衡关闭。已分别读取两台D405，白平衡回读均为3500、自动开关均为0；现有启动加载逻辑直接生效，无需代码改动。

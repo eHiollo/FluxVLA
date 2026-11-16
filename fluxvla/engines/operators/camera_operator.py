@@ -6,6 +6,9 @@ HWC uint8 RGB; policy resizing belongs to the dataset transform, not capture.
 
 import threading
 import time
+import json
+import logging
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -13,6 +16,64 @@ import numpy as np
 
 # Some USB controllers cannot keep two video streams open simultaneously.
 _USB_CAPTURE_LOCK = threading.Lock()
+_REALSENSE_SETTINGS_LOCK = threading.Lock()
+
+
+def _realsense_device(settings, preset):
+    try:
+        import pyrealsense2 as rs
+    except ImportError as exc:
+        raise RuntimeError('RealSense JSON requires pyrealsense2 in the capture environment') from exc
+    serial = settings.get('identity', {}).get('serial')
+    if not serial:
+        raise ValueError('RealSense JSON requires identity.serial')
+    context = rs.context()
+    # USB descriptors used by by-id may expose ASIC serials, while recent SDKs
+    # expose the device serial as serial_number. Both must select one device.
+    matches = [d for d in context.query_devices() if any(
+        d.supports(key) and d.get_info(key) == serial for key in
+        (rs.camera_info.serial_number, rs.camera_info.asic_serial_number))]
+    if len(matches) != 1:
+        raise RuntimeError(f'RealSense serial {serial}: expected exactly one device')
+    device = matches[0]
+    expected = preset.get('device', {}).get('name', '')
+    actual = device.get_info(rs.camera_info.name)
+    if not expected or not actual.casefold().endswith(expected.casefold()):
+        raise ValueError(f'RealSense preset model mismatch: {expected!r} vs {actual!r}')
+    return rs, context, device
+
+
+def _apply_realsense_options(rs, device, preset):
+    """Apply only RGB exposure, gain and white balance; ignore advanced presets."""
+    values = preset['parameters']
+    color = any(k.startswith('controls-color-') for k in values)
+    prefix = 'color' if color else 'depth'
+    sensor = device.first_color_sensor() if color else device.first_depth_sensor()
+    exposure_auto = 'controls-color-autoexposure-auto' if color else 'controls-autoexposure-auto'
+    wb_auto = f'controls-{prefix}-white-balance-auto'
+    automatic = str(values.get(exposure_auto, 'False')).casefold() == 'true'
+    automatic_wb = str(values.get(wb_auto, 'False')).casefold() == 'true'
+    controls = [(exposure_auto, 'enable_auto_exposure'), (wb_auto, 'enable_auto_white_balance')]
+    if not automatic:
+        controls += [('controls-color-autoexposure-manual' if color else 'controls-autoexposure-manual', 'exposure'),
+                     (f'controls-{prefix}-gain', 'gain')]
+    if not automatic_wb:
+        controls.append((f'controls-{prefix}-white-balance-manual', 'white_balance'))
+    report = {}
+    for key, name in controls:
+        if key not in values:
+            continue
+        option = getattr(rs.option, name)
+        if not sensor.supports(option):
+            raise RuntimeError(f'RealSense does not support preset control {key}')
+        value = str(values[key])
+        requested = float(value.casefold() == 'true') if value.casefold() in ('true', 'false') else float(value)
+        sensor.set_option(option, requested)
+        actual = sensor.get_option(option)
+        if abs(actual-requested) > max(1e-5, sensor.get_option_range(option).step / 2):
+            raise RuntimeError(f'RealSense {key}: requested {requested}, read back {actual}')
+        report[key] = dict(requested=requested, actual=actual)
+    return report
 
 
 class RGBCamera:
@@ -30,6 +91,25 @@ class RGBCamera:
         self._lock = threading.RLock()
 
     def _open(self):
+        path = self.settings.get('realsense_json')
+        if path:
+            # Reload on every open/reopen, not on every frame. Serial binding
+            # prevents a D405 preset from being applied to the other camera.
+            with _REALSENSE_SETTINGS_LOCK:
+                preset = json.loads(Path(path).read_text(encoding='utf-8'))
+                rs, context, device = _realsense_device(self.settings, preset)
+                capture = self._open_capture()
+                try:
+                    self.last_settings_report = _apply_realsense_options(rs, device, preset)
+                except Exception:
+                    capture.release()
+                    raise
+                logging.getLogger(__name__).info('RealSense %s loaded %s; verified=%s',
+                    self.settings['identity']['serial'], path, self.last_settings_report)
+                return capture
+        return self._open_capture()
+
+    def _open_capture(self):
         source = self.settings['device']
         if isinstance(source, str) and source.isdigit():
             source = int(source)

@@ -12,3 +12,6 @@ pyarrow>=21,<26
 
 # Device-check camera JPEGs and labeled overview.
 pillow
+
+# Apply RealSense Viewer presets to serial-bound cameras at startup.
+pyrealsense2==2.59.2.11152

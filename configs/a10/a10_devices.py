@@ -17,21 +17,27 @@ left/right 按手柄和物理机械臂命名，不是 A10Operator 的内部字�
 # 外部相机换口后运行 python scripts/a10_devices.py --update，按序列号找回彩色接口。
 # 三路同时读取各95帧，640x480 RGB / 约30Hz；未启用深度、IMU或硬件同步。
 # rotate_180=False 保留原始画面方向，安装方向待现场预览确认。
+from pathlib import Path
+_preset_dir = Path('{{fileDirname}}')
+
 cameras = dict(
     base_0_rgb=dict(
         identity=dict(model='D435i', serial='262923065199', usb_interface='03', video_index=0),
         device='/dev/v4l/by-path/platform-a80aa10000.usb-usb-0:2.4:1.3-video-index0',
         width=640, height=480, fps=30, rotate_180=False,
+        realsense_json=str(_preset_dir / '外部.json'),
     ),
     left_wrist_0_rgb=dict(
         identity=dict(model='D405', serial='255323070485', usb_interface='00', video_index=4),
         device='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_255323070485-video-index4',
         width=640, height=480, fps=30, rotate_180=False,
+        realsense_json=str(_preset_dir / '左腕.json'),
     ),
     right_wrist_0_rgb=dict(
         identity=dict(model='D405', serial='255323070551', usb_interface='00', video_index=4),
         device='/dev/v4l/by-id/usb-Intel_R__RealSense_TM__Depth_Camera_405_Intel_R__RealSense_TM__Depth_Camera_405_255323070551-video-index4',
         width=640, height=480, fps=30, rotate_180=True,
+        realsense_json=str(_preset_dir / '右腕.json'),
     ),
 )
 

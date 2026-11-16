@@ -1641,3 +1641,11 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 增加备份、原生保存、文件收尾耗时；总计时覆盖备份阶段。保持原生三路并行编码、编码参数和每集保存边界。只操作临时合成数据，未改写现场数据集或操作设备。
 - 本次不纳入用户CLI、配置重命名及其他会话未提交内容。
 - 验证：2项新增真实LeRobot快照/失败回滚测试与3项连续多集、失败重录、启动清理回归通过；diff检查通过。测试日志 `/tmp/a10_metadata_backup_tests.log`、`/tmp/a10_metadata_backup_regression.log`。需重启采集程序加载新保存逻辑。
+
+
+### 2026-11-16：三路相机启动时读取JSON中的基础图像参数
+
+- 按用户收紧后的范围，只写曝光、增益、白平衡及相应自动开关；每次打开/重连重新读取三个Viewer JSON，SDK按序列号或ASIC序列号唯一匹配并读回核对。保持OpenCV RGB采集及640×480/30Hz/旋转配置，不导入完整高级预设。
+- 发现SDK设备序列号与USB身份使用不同字段，已通过asic_serial_number精确对应原左右绑定，无需更换配置身份。两腕JSON未给手动白平衡值，仅关闭自动白平衡。
+- 已安装pyrealsense2 2.59.2.11152；三路同时读取通过，全部指定基础参数回读一致，报告 `/tmp/a10_camera_controls_hardware.json`。57项相机/预设/录制离线测试通过，记录 `/tmp/a10_camera_controls_tests.log`。仅操作相机。
+- 当前工作区设备文件正在从a10_devices.py重命名为a10_dual_devices.py，本次同时在当前文件设置JSON绑定，提交仅将绑定增量写入已跟踪的原配置；其他配置重构及CLI继续保留为未提交工作。

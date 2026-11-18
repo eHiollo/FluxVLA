@@ -2,6 +2,7 @@
 
 当前双臂 VR 统一使用 `a10_dual_vr.py`：世界坐标平移、手柄局部旋转，90Hz控制；录制独立30Hz。
 运行命令见 [CLI.txt](../../CLI.txt)，映射与会话行为见 [世界坐标说明](../../docs/a10_vr_world_translation.md)。
+数据集 v3 → v2.1 导出、视频模式和断点继续见 [数据转换说明](../../docs/a10_dataset_conversion.md)。
 
 ## 参数应该改在哪里
 

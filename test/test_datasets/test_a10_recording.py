@@ -220,7 +220,10 @@ class RecordingTest(unittest.TestCase):
         for name in CAMERAS: info['features'][f'observation.images.{name}']['info']['video.codec']='av1'
         info_path.write_text(json.dumps(info))
         validate_dataset(self.root)
-        export_openpi_dataset(self.root,self.base/'from_av1')
+        report = export_openpi_dataset(self.root,self.base/'from_av1')
+        self.assertEqual(report['copied'], 4)
+        output_info = json.loads((self.base/'from_av1/meta/info.json').read_text())
+        self.assertEqual(output_info['features']['observation.images.top']['info']['video.codec'], 'av1')
         self.assertEqual(validate_dataset(self.base/'from_av1')['frames'],8)
 
 

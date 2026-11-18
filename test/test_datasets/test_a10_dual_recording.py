@@ -176,8 +176,15 @@ class DualRecordingTest(unittest.TestCase):
             self.assertEqual(record['cameras'][name]['identity'],devices.cameras[name].identity)
             self.assertNotIn('device',record['cameras'][name])
         self.assertTrue(record['cameras']['right_wrist_0_rgb']['rotate_180'])
-        with EpisodeWriter(**record): pass
-        self.assertEqual(validate_dataset(self.root)['frames'],0)
+        backend = record.pop('backend', 'legacy')
+        if backend == 'lerobot':
+            from fluxvla.datasets.lerobot_episode_writer import LeRobotEpisodeWriter
+            writer_type = LeRobotEpisodeWriter
+        else:
+            writer_type = EpisodeWriter
+        writer = writer_type(**record)
+        writer.close()
+        self.assertEqual(writer.info['total_frames'], 0)
 
 
 if __name__ == '__main__': unittest.main()

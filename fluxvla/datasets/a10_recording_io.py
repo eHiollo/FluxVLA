@@ -2,18 +2,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import copy
 import fcntl
-from fractions import Fraction
 import json
-import os
 from pathlib import Path
-import shutil
-import tempfile
 
 import av
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .episode_writer import (
@@ -110,22 +106,31 @@ def video_segment(root, info, ep, key):
     return safe_path(root, info['video_path'].format(**args)), start, end
 
 
-def video_index(path):
+def video_index(path, *, progress=None):
     with av.open(str(path)) as video:
         stream = video.streams.video[0]
         dimensions = (stream.height, stream.width, 3)
         codec = stream.codec_context.name
-        timestamps = np.array([float(f.pts*f.time_base) for f in video.decode(video=0)])
+        stream.thread_type = 'AUTO'
+        stream.codec_context.thread_count = 4
+        timestamps = []
+        for frame in video.decode(video=0):
+            if frame.pts is None or frame.time_base is None:
+                raise ValueError(f'Missing video timestamp: {path}')
+            timestamps.append(float(frame.pts * frame.time_base))
+            if progress is not None and len(timestamps) % 300 == 0:
+                progress(dict(path=str(path), frames=len(timestamps), total_frames=stream.frames))
+        timestamps = np.asarray(timestamps)
     if not len(timestamps) or not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) <= 0):
         raise ValueError(f'Invalid video timestamps: {path}')
     return timestamps, dimensions, codec
 
 
-def validate_dataset(root, *, check_videos=True, _locked=False):
-    """Validate every episode; check_videos=False is for quick resume only."""
+def validate_dataset(root, *, check_videos=True, _locked=False, progress=None):
+    """Validate every episode; optionally decode videos for frame/timestamp checks."""
     if not _locked:
         with dataset_read_lock(root):
-            return validate_dataset(root, check_videos=check_videos, _locked=True)
+            return validate_dataset(root, check_videos=check_videos, _locked=True, progress=progress)
     root = Path(root)
     if (root / '.recording/active').exists():
         raise ValueError('Unfinished recording/commit exists; recover it before validation')
@@ -152,12 +157,14 @@ def validate_dataset(root, *, check_videos=True, _locked=False):
     videos = {}; cached_path = None; table = None; total = 0; data_counts = {}
     for ep in episodes:
         eid, count = ep['episode_index'], ep['length']
+        if progress is not None:
+            progress(dict(episode=eid, total_episodes=len(episodes)))
         if count < 2: raise ValueError(f'Episode {eid} has fewer than two frames')
         path = data_path(root, info, ep)
         if path != cached_path:
             table = pq.read_table(path); cached_path = path
         data_counts[path] = table.num_rows
-        rows = [r for r in table.to_pylist() if r['episode_index'] == eid]
+        rows = table.filter(pc.equal(table['episode_index'], eid)).to_pylist()
         if len(rows) != count or set(table.column_names) != set(table_schema(spec.name).names):
             raise ValueError(f'Episode {eid}: data columns/frame count mismatch')
         for field in table_schema(spec.name):
@@ -196,7 +203,10 @@ def validate_dataset(root, *, check_videos=True, _locked=False):
             if not path.is_file() or not np.isfinite([start,end]).all() or start < 0 or abs(end-start-count/30) > 1e-4:
                 raise ValueError(f'Episode {eid}: video path/duration mismatch')
             if check_videos:
-                if path not in videos: videos[path] = video_index(path)
+                if path not in videos:
+                    if progress is not None:
+                        progress(dict(path=str(path), frames=0))
+                    videos[path] = video_index(path, progress=progress)
                 stamps, dimensions, codec = videos[path]
                 segment = stamps[(stamps >= start-1e-5) & (stamps < end-1e-5)]
                 if len(segment) != count or not np.allclose(segment-start, np.arange(count)/30, atol=1e-4, rtol=0):
@@ -219,87 +229,7 @@ def validate_dataset(root, *, check_videos=True, _locked=False):
                 videos_checked=check_videos, synthetic=(root/'SIMULATED_DATA.json').exists())
 
 
-def export_openpi_dataset(source, destination):
-    """Never alter source or overwrite destination; publish a verified v2.1 copy."""
-    source, destination = Path(source).resolve(), Path(destination).resolve()
-    if destination == source or destination.is_relative_to(source) or source.is_relative_to(destination):
-        raise ValueError('Export source/destination must be separate directories')
-    if destination.exists(): raise FileExistsError(destination)
-    with dataset_read_lock(source):
-        validate_dataset(source, _locked=True)
-        info, episodes, tasks = load_v3(source)
-        if info['codebase_version'] != 'v3.0' or not episodes:
-            raise ValueError('Export requires a nonempty v3.0 dataset')
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        stage = Path(tempfile.mkdtemp(prefix=f'.{destination.name}-export-', dir=destination.parent))
-        try:
-            result = _export(source, stage, info, episodes, tasks)
-            validate_dataset(stage)
-            # No destination is replaced, including one created while exporting.
-            if destination.exists(): raise FileExistsError(destination)
-            for path in stage.rglob('*'):
-                if path.is_file():
-                    with path.open('rb') as stream: os.fsync(stream.fileno())
-            stage.rename(destination); sync_dir(destination.parent)
-            return result
-        except BaseException:
-            shutil.rmtree(stage)
-            raise
-
-
-def _export(source, stage, info, episodes, tasks):
-    spec = checked_schema(source, info); aliases = spec.image_aliases
-    out = copy.deepcopy(info)
-    out.update(codebase_version='v2.1', total_videos=len(episodes)*len(spec.cameras),
-               total_chunks=(len(episodes)+999)//1000,
-               data_path='data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet',
-               video_path='videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4', chunks_size=1000)
-    for old, new in aliases.items():
-        out['features'][new] = out['features'].pop(old)
-        # Uniform output codec, also when the original v3 video contains several episodes.
-        out['features'][new]['info']['video.codec'] = 'h264'
-        out['features'][new]['info']['video.pix_fmt'] = 'yuv420p'
-    all_stats = []; summaries = []
-    for ep in episodes:
-        eid = ep['episode_index']
-        rows = [r for r in pq.read_table(data_path(source,info,ep)).to_pylist() if r['episode_index']==eid]
-        path = data_path(stage,out,ep); path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(pa.Table.from_pylist(rows,schema=table_schema(spec.name)),path)
-        statistics = episode_stats(ep)
-        for old, new in aliases.items():
-            path, start, end = video_segment(source,info,ep,old)
-            target, _, _ = video_segment(stage,out,ep,new); target.parent.mkdir(parents=True,exist_ok=True)
-            # Decode sequentially: seeking in merged clips can land on the wrong keyframe.
-            with av.open(str(path)) as src, av.open(str(target),'w') as dst:
-                stream = dst.add_stream('libx264',rate=30)
-                stream.height, stream.width = out['features'][new]['shape'][:2]
-                stream.pix_fmt='yuv420p'; stream.options={'crf':'18','preset':'ultrafast'}
-                count=0
-                for frame in src.decode(video=0):
-                    stamp=float(frame.pts*frame.time_base)
-                    if stamp < start-1e-5: continue
-                    if stamp >= end-1e-5: break
-                    frame = av.VideoFrame.from_ndarray(frame.to_ndarray(format='rgb24'),format='rgb24')
-                    frame.pts=count; frame.time_base=Fraction(1,30); count+=1
-                    for packet in stream.encode(frame): dst.mux(packet)
-                for packet in stream.encode(): dst.mux(packet)
-            if count != ep['length']: raise ValueError('Export video frame count mismatch')
-            statistics[new]=statistics.pop(old)
-        all_stats.append(statistics)
-        summaries.append(dict(episode_index=eid,length=ep['length'],tasks=ep['tasks']))
-    json_write(stage/'meta/info.json',out)
-    write_jsonl(stage/'meta/episodes.jsonl',summaries)
-    write_jsonl(stage/'meta/tasks.jsonl',[dict(task_index=k,task=v) for k,v in tasks.items()])
-    write_jsonl(stage/'meta/episodes_stats.jsonl',[dict(episode_index=i,stats=s) for i,s in enumerate(all_stats)])
-    json_write(stage/'meta/stats.json',aggregate_stats(all_stats))
-    json_write(stage/'meta/export_manifest.json',dict(source=str(source),schema=spec.name,camera_aliases=aliases,
-        action_source=spec.contract()['action_source'], action_time_offset_frames=0 if spec.dual else None,
-        training_actions='observation.state', raw_action_preserved=True,
-        video='Reencoded H.264 per episode; source image statistics retained. Recompute OpenPI norm stats.'))
-    for rel in ('SIMULATED_DATA.json','meta/recording_contract.json','meta/xlevr_diagnostics'):
-        src=source/rel
-        target_rel = 'meta/source_recording_contract.json' if rel == 'meta/recording_contract.json' else rel
-        dst=stage/target_rel
-        if src.is_dir(): shutil.copytree(src,dst)
-        elif src.is_file(): dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
-    return dict(schema=spec.name,episodes=len(episodes),frames=info['total_frames'],version='v2.1')
+def export_openpi_dataset(source, destination, *, video_mode='auto', resume=False, progress=None):
+    """Export a verified v2.1 copy; see a10_dataset_export for resumable staging."""
+    from .a10_dataset_export import export_openpi_dataset as export
+    return export(source, destination, video_mode=video_mode, resume=resume, progress=progress)

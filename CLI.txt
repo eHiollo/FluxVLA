@@ -1,215 +1,142 @@
-终端一：启动加速模型服务
+A10 常用命令（在 /home/robot/VLA/FluxVLA 运行）
 
-    cd /home/robot/VLA/FluxVLA
-    source /home/robot/miniforge3/etc/profile.d/conda.sh
-    conda activate fluxvla
-
-    python -m fluxvla.engines.runners.serving.serve \
-    --config configs/a10/a10_openpi_inference.py \
-    --from-config \
-    --acceleration on \
-    --dtype fp32 \
-    --host 127.0.0.1 \
-    --port 5555
-
-
- 终端二：启动机器人控制台
-    启动kaanhbin程序
-    conda activate fluxvla
-
-    单臂（192.168.0.125；与推理共享连接）：
-    python scripts/a10_control.py --config configs/a10/a10_operator.py --shared
-
-    双臂（192.168.0.150）：
-    python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
-
- 终端三：启动机器人控制
-    python scripts/inference.py \
-  --config configs/a10/a10_remote_inference.py
-
-
-双臂 VR（kaanh_follower 独立开发目录；.150 控制器）
-
-cd /home/robot/VLA/FluxVLA_follower
+cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 
-先看双手输入，不连接机械臂：
+配置分工：
+  机械臂连接、ID、归位：configs/a10/a10_dual_arm_operator.py
+  相机、夹爪身份与接口：configs/a10/a10_dual_devices.py
+  VR 输入、映射、手感、会话：configs/a10/a10_dual_vr.py
+  数据录制：configs/a10/a10_dual_arm_record.py
+  完整配置索引：configs/a10/README.md
 
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
+一、双臂 VR：世界坐标平移 + 局部旋转
 
-只检查配置：
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --preview
+只检查配置，不启动服务或连接设备：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --preview
 
-只读机器人反馈，同时查看 VR 目标（不启动跟随、不下发运动）：
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --observe
+只看手柄输入，不连接机械臂或夹爪（会启动 VR 服务）：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py \
+  --cfg-options teleop.vr_only=True
 
-实机双臂 VR（现场先确认两臂已使能且停止，退出占用 5999 的控制台）：
+只读机器人反馈，不启动跟随、不发送运动：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --observe
+
+实机遥操作（默认实机 + 两只知行夹爪，不自动使能或归位）：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py
+
+默认90Hz控制；侧键只平移，前扳机允许局部旋转；松键减速保持会话。
+控制器高频日志默认关闭，本地 JSONL 诊断保持开启。
+清理控制器日志容量后，如需控制器诊断记录，显式加 --record-controller。
+
+临时调整手感（不改配置默认值）：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py \
+  --cfg-options teleop.input.mapping.pos_scale=1.2 \
+    teleop.input.mapping.angle_scale=0.8 teleop.input.mapping.fine_scale_factor=0.6
+
+夹爪默认电机速度50%、目标变化速率4500 raw/s、最大领先900 raw。
+临时降低夹爪参数示例：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py \
+  --cfg-options teleop.zx_grippers.devices.left.speed=15 \
+    teleop.zx_grippers.devices.right.speed=15 \
+    teleop.zx_grippers.target_rate_raw_s=3000 teleop.zx_grippers.max_lead_raw=600
+
+图形化映射测试台：
+python scripts/preview_vr_mapping.py
+
+二、双臂数据录制：独立30Hz真实反馈和三相机采样
+
+续录现有数据集（新建时改用新目录并去掉 record.resume=True）：
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True
+  --config configs/a10/a10_dual_vr.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --record-options \
+    record.root=datasets/cloth_folding_04 \
+    'capture.task=Fold the clothes' \
+    record.resume=True
 
 
+已有数据可继续使用原绝对路径，例如：
+  record.root=/home/robot/VLA/FluxVLA_90hz/datasets/dual_90hz_test record.resume=True
+更换配置入口不会移动原数据。检查控制延迟可另加 --measure-vr-latency。
 
-====单臂 VR（旧控制器 192.168.0.125 + 老 USB 夹爪）====
+只检查录制按键和VR延迟，不连接机器人、相机或夹爪：
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py \
+  --record-config configs/a10/a10_dual_arm_record.py \
+  --check-record-buttons --measure-vr-latency
 
-python scripts/teleoperate.py \
-  --config configs/a10/a10_vr_teleop_legacy_gripper.py \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.control_mode=reference \
-    teleop.cartesian_adapter=sdk_tool_cumulative \
-    teleop.pose_mapping=anchor_relative \
-    teleop.operator.host=192.168.0.125 \
-    teleop.operator.allow_motion=True \
-    teleop.operator.feedback_position_unit=mm \
-    teleop.input.network.host_ip=0.0.0.0 \
-    teleop.controller_speed_percent=50 \
+三、双臂控制台与设备检查
+
+控制台与VR默认复用本地共享连接，先开哪个都可以：
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
+
+控制台接管/回位后恢复VR：控制台输入 stop_follower，双手松键、摇杆回中，再按侧键接管。
+共享服务日志：work_dirs/a10/shared_control/service.log
+
+查看设备身份与接口匹配：
+python scripts/a10_devices.py
+
+三相机拍照：
+python scripts/a10_devices.py --snapshot
+
+换USB口后更新连接路径（自动备份；不改身份序列号）：
+python scripts/a10_devices.py --update
+
+只读夹爪状态：
+python scripts/a10_devices.py --check-grippers
+
+VR网络诊断（将IP换成当前头显地址）：
+python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
+
+现场确认后清除夹爪报警（串口如有变化，以设备配置为准）：
+python fluxvla/engines/operators/zx_gripper.py \
+  --port /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_5c9323064b6eef11a2c4e7c2c169b110-if00-port0 \
+  --id 1 --reset-alarm --state --max-position-raw 9000
+python fluxvla/engines/operators/zx_gripper.py \
+  --port /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0EMMMM-if00-port0 \
+  --id 1 --reset-alarm --state --max-position-raw 9000
+
+四、双臂训练与推理
+
+训练配置：configs/pi05/pi05_paligemma_a10_dual_fold_10steps.py
+数据、统计、基础权重环境变量及训练命令见 docs/a10_dual_fold.md。
+这是十步训练适配配置，运行训练前按该说明设置实际资源路径。
+
+FluxVLA模型服务（独立终端）：
+python -m fluxvla.engines.runners.serving.serve \
+  --config configs/a10/a10_dual_fold_inference.py \
+  --from-config --dtype fp32 --host 127.0.0.1 --port 5556
+
+FluxVLA双臂客户端（默认preview，不连接设备或模型服务）：
+python scripts/inference.py --config configs/a10/a10_dual_fold_inference.py
+
+OpenPI双臂客户端（默认preview；服务在OpenPI侧启动）：
+python scripts/inference.py --config configs/a10/a10_dual_openpi_remote.py
+
+实机只读和运动模式分别为 inference.mode=read_only / motion，详见 docs/a10_dual_fold.md。
+
+五、旧单臂
+
+双臂VR只使用 configs/a10/a10_dual_vr.py，两个旧双臂配置文件已删除。
+
+旧单臂控制台：
+python scripts/a10_control.py --config configs/a10/a10_single_operator.py --shared
+
+旧单臂VR + 老USB夹爪（默认VR-only，以下显式开启实机）：
+python scripts/teleoperate.py --config configs/a10/a10_single_vr.py \
+  --cfg-options teleop.vr_only=False teleop.observe_only=False \
+    teleop.control_mode=reference teleop.cartesian_adapter=sdk_tool_cumulative \
+    teleop.pose_mapping=anchor_relative teleop.operator.allow_motion=True \
+    teleop.input.network.host_ip=0.0.0.0 teleop.controller_speed_percent=50 \
     teleop.reference_options.max_linear_speed_m_s=0.08 \
     teleop.reference_options.max_angular_speed_rad_s=0.6 \
     teleop.reference_options.max_reference_lead_m=0.03 \
     teleop.reference_options.max_reference_lead_rad=0.30
 
-换模式：
-teleop.pose_mapping=calibrated_absolute/anchor_relative
-teleop.cartesian_adapter=legacy_anchor/sdk_tool_cumulative
+旧单臂加速模型服务（独立终端）：
+python -m fluxvla.engines.runners.serving.serve \
+  --config configs/a10/a10_single_openpi_inference.py \
+  --from-config --acceleration on --dtype fp32 --host 127.0.0.1 --port 5555
 
-
-
-====双臂VR遥操作=====：
-python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py
-# 默认：实机双臂 + 两只知行夹爪 + 控制器高频记录。
-
-
-#参数调整
-python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-controller \
-  --cfg-options \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True \
-    teleop.controller_speed_percent=70 \
-    teleop.reference_options.max_linear_speed_m_s=0.17 \
-    teleop.reference_options.max_angular_speed_rad_s=1.1 \
-    teleop.reference_options.max_linear_accel_m_s2=1.0 \
-    teleop.reference_options.max_angular_accel_rad_s2=3.0 \
-    teleop.reference_options.position_gain=10.0 \
-    teleop.reference_options.rotation_gain=16.0 \
-    teleop.reference_options.max_reference_lead_m=0.03 \
-    teleop.reference_options.max_reference_lead_rad=0.3
-
-====数据录制====
-cd /home/robot/VLA/FluxVLA
-conda activate fluxvla
-
-# 新分支：原生LeRobot采集；首次用新目录。后续同目录续录加 record.resume=True。
-# 意外退出后归档未保存片段再续录：同时加 record.recover=True；保存中断须检查，不能自动修复。
-python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-config configs/a10/a10_dual_arm_record.py \
-  --record-options \
-    record.root=/home/robot/VLA/FluxVLA_90hz/datasets/dual_90hz_test \
-    record.resume=True \
-    record.recover=True \
-  --measure-vr-latency \
-  --cfg-options \
-    teleop.record_controller=False \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True \
-    teleop.zx_grippers.enabled=True \
-    teleop.fps=90 \
-    teleop.feedback_poll_hz=30 \
-    teleop.input.mapping.pos_scale=1.2 \
-    teleop.input.mapping.angle_scale=0.8 \
-    teleop.input.mapping.fine_scale_factor=0.6
-
-
-  record.resume=True \
-  record.recover=True \
- --measure-vr-latency \
-
- # 清除右夹爪报警
- python fluxvla/engines/operators/zx_gripper.py \
-  --port /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_5c9323064b6eef11a2c4e7c2c169b110-if00-port0 \
-  --id 1 --reset-alarm --state --max-position-raw 9000
-
-# 左夹爪报警
-python fluxvla/engines/operators/zx_gripper.py \
-  --port /dev/serial/by-id/usb-FTDI_FT231X_USB_UART_DU0EMMMM-if00-port0 \
-  --id 1 --reset-alarm --state --max-position-raw 9000
-
-
-# 检查VR延迟
-python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-config configs/a10/a10_dual_arm_record.py \
-  --check-record-buttons \
-  --measure-vr-latency
-
-
-python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
-
-
-
-# 夹爪参数
-python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
-  --record-controller \
-  --cfg-options \
-    teleop.zx_grippers.devices.left.speed=15 \
-    teleop.zx_grippers.devices.right.speed=15 \
-    teleop.zx_grippers.target_rate_raw_s=3000 \
-    teleop.zx_grippers.max_lead_raw=600 \
-    teleop.vr_only=False \
-    teleop.observe_only=False \
-    teleop.operator.allow_motion=True \
-    teleop.zx_grippers.enabled=True
-
-
-teleop.zx_grippers.target_rate_raw_s=3000 \
-
-====设备检查====
-换 USB 插口时，identity.serial 序列号保持不动，只需更新连接路径：
-- 相机：更新 device。
-- 夹爪：更新 port。
-
-# 查看设备ID、当前节点和匹配状态
-python scripts/a10_devices.py
-
-#显示照片
-python scripts/a10_devices.py --snapshot
-
-# 换USB口后提示“路径需更新”时执行，自动备份配置
-python scripts/a10_devices.py --update
-
-# 额外查询夹爪状态，只读、不发送动作
-python scripts/a10_devices.py --check-grippers
-
-
-====双臂控制台与VR同时打开（默认共享连接，先开哪个都可以）====
-# 终端一：查询不打断VR；控制命令接管，VR窗口保留
-python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
-
-# 终端二：沿用已调好的默认参数
-python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py
-# 默认：实机双臂 + 两只知行夹爪 + 控制器高频记录。
-
-# 控制台接管/回位后恢复VR：控制台先输入 stop_follower，双手松开侧键，再按侧键接管。
-# 单独关闭查询控制台不影响VR；最后一个客户端退出约5秒后服务自动退出。
-# 服务日志：work_dirs/a10/shared_control/service.log
-
-
-世界坐标系启动遥操作
-cd /home/robot/VLA/FluxVLA_90hz
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop_world_translation.py
-
-vr图形化测试
-cd /home/robot/VLA/FluxVLA_90hz
-python scripts/preview_vr_mapping.py
+旧单臂推理客户端：
+python scripts/inference.py --config configs/a10/a10_single_remote_inference.py

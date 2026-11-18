@@ -1,5 +1,7 @@
 # 双臂遥操作：控制90Hz，采集30Hz
 
+> 当前入口：`configs/a10/a10_dual_vr.py`，配置分工见[配置索引](../configs/a10/README.md)，运行命令见[CLI.txt](../CLI.txt)。下文保留当时的接入/开发记录，旧路径和双臂默认行为以当前入口为准。当前世界坐标方案控制不持续GET；仅录制订阅30Hz真实反馈，首次或异常后接管仍检查状态。
+
 2026-11-13，开发分支 `kaanh_vr_90hz`，工作目录 `/home/robot/VLA/FluxVLA_90hz`。
 主目录的分支和同事未提交修改不受本次开发影响。
 
@@ -117,7 +119,7 @@ reference按照实际控制时间推进，控制器内的电机闭环并不靠�
 cd /home/robot/VLA/FluxVLA_90hz
 conda activate fluxvla
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --record-config configs/a10/a10_dual_arm_record.py --preview
 ```
 
@@ -126,7 +128,7 @@ python scripts/teleoperate.py \
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --record-options record.root=datasets/a10_dual_90hz_trial \
   --cfg-options teleop.record_controller=False

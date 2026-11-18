@@ -1,5 +1,7 @@
 # A10 现场接入操作说明
 
+> 当前入口：`configs/a10/a10_dual_vr.py`，配置分工见[配置索引](../configs/a10/README.md)，运行命令见[CLI.txt](../CLI.txt)。下文保留当时的接入/开发记录，旧路径和双臂默认行为以当前入口为准。
+
 2026-10-26 整合说明：旧单臂推理与共享控制台保持兼容，双臂配置控制台默认直连。
 原 VR 证书独立保存在 `work_dirs/a10/vr/tls_vr`；主目录旧证书和现场配置未覆盖。
 本次是代码与离线验证整合，不代表双臂或 VR 实机已验收。
@@ -104,7 +106,7 @@ follower_cart
 
 
 **VR 当前入口**：在 `/home/robot/VLA/FluxVLA` 使用
-`python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py`。
+`python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py`。
 默认 VR-only；详细配置和新布局见 [VR 说明](a10_vr_operator.md)。
 下文 `projects/a10` 相关命令为历史流程，不作为新 VR 遥操作入口。
 
@@ -122,7 +124,7 @@ VR 使用与迁移进度见 [VR 遥操作说明](a10_vr_operator.md)。工作目
 模型服务已启动后直接执行：
 
 ```bash
-python scripts/inference.py --config configs/a10/a10_remote_inference.py
+python scripts/inference.py --config configs/a10/a10_single_remote_inference.py
 ```
 
 控制台已打开时，直接使用上述推理命令即可同时使用，无需配置参数。
@@ -135,7 +137,7 @@ python scripts/inference.py --config configs/a10/a10_remote_inference.py
 默认 `inference.controller_speed_percent=None`，保留现场倍率。需要指定本次运行倍率时：
 
 ```bash
-python scripts/inference.py --config configs/a10/a10_remote_inference.py \
+python scripts/inference.py --config configs/a10/a10_single_remote_inference.py \
   --cfg-options inference.controller_speed_percent=25
 ```
 
@@ -164,7 +166,7 @@ python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py
+  --config configs/a10/a10_dual_vr.py
 ```
 
 - 控制台输入 `get`、`joints` 只查询，不打断 VR。
@@ -194,7 +196,7 @@ python scripts/a10_control.py shell
 已有共享服务时自动复用，不会再连接一份机器人。模型服务保持原启动方式；推理客户端仍使用：
 
 ```bash
-python scripts/inference.py --config configs/a10/a10_remote_inference.py
+python scripts/inference.py --config configs/a10/a10_single_remote_inference.py
 ```
 
 - 查询不会抢占动作控制权；`--read-only shell` 仍禁止控制指令。
@@ -360,8 +362,8 @@ conda activate fluxvla
 
 | 文件 | 用途 |
 | --- | --- |
-| `configs/a10/a10_openpi_inference.py` | 本机加载原来训练好的模型，并连接相机、夹爪、follower |
-| `configs/a10/a10_remote_inference.py` | 本机接设备，通过 FluxVLA ZMQ 服务请求模型动作 |
+| `configs/a10/a10_single_openpi_inference.py` | 本机加载原来训练好的模型，并连接相机、夹爪、follower |
+| `configs/a10/a10_single_remote_inference.py` | 本机接设备，通过 FluxVLA ZMQ 服务请求模型动作 |
 
 两种方式都使用 `A10InferenceRunner → A10Operator`，不调用旧 `projects/a10` 推理循环，也不启动原 OpenPI 服务。模型名称有 OpenPI 是因为权重来自那里，运行使用 FluxVLA 原生模型。
 
@@ -405,7 +407,7 @@ python scripts/a10_log_summary.py work_dirs/a10/inference_logs/实际的_client�
 ### 原生 RTC 训练 50000 步模型
 
 新模型位于 `checkpoints/FluxVLA-A10-RTC-50k/`，专用配置是
-`configs/a10/a10_rtc_inference.py`。它严格加载 812 个原生权重张量（LoRA
+`configs/a10/a10_single_rtc_inference.py`。它严格加载 812 个原生权重张量（LoRA
 已合并，不再注入），使用随包 tokenizer、PIL 缩放、训练配置中的
 `mean_std` 状态/动作归一化，并将前六维关节 delta 还原为绝对目标；
 夹爪仍为毫米绝对值。不能直接替换旧 OpenPI 加载器的权重目录。
@@ -414,11 +416,11 @@ python scripts/a10_log_summary.py work_dirs/a10/inference_logs/实际的_client�
 
 ```bash
 python -m fluxvla.engines.runners.serving.serve \
-  --config configs/a10/a10_rtc_inference.py \
+  --config configs/a10/a10_single_rtc_inference.py \
   --from-config --dtype fp32 --acceleration off --host 127.0.0.1 --port 5555
 ```
 
-机器人端继续使用 `python scripts/inference.py --config configs/a10/a10_remote_inference.py`。
+机器人端继续使用 `python scripts/inference.py --config configs/a10/a10_single_remote_inference.py`。
 客户端默认任务已同步为训练指令：抓水瓶、放入旁边盒子、关盖并回到初始位置。
 设备、执行步数及限值保留现场配置。OpenPI 配置现默认加载 `checkpoints/a10_openpi_40000/`；90000 权重仍保留作比较。40000 来自 OpenPI 的 `checkpoints/pi05_a10_finetune/40000`，已验证 811 个参数严格加载、数值有限且统计文件与源一致；该 checkpoint 未保存历史任务指令，不能将当前代码默认 prompt 当作已验证的训练记录。
 
@@ -430,7 +432,7 @@ python -m fluxvla.engines.runners.serving.serve \
 
 ### 推理加速开关（2026-10-15）
 
-为比较推理效果，`a10_openpi_inference.py` 默认使用普通 PyTorch
+为比较推理效果，`a10_single_openpi_inference.py` 默认使用普通 PyTorch
 `PI05FlowMatching`。启动入口支持 `--acceleration off`（普通 PyTorch）和
 `--acceleration on`（原生 Triton + CUDA Graph，BF16 融合内核）。省略开关
 时使用配置默认值。两条路径使用同一份 checkpoint、归一化统计和 tokenizer，
@@ -441,20 +443,20 @@ python -m fluxvla.engines.runners.serving.serve \
 ```bash
 # 普通 PyTorch FP32，用于本轮效果对比
 python -m fluxvla.engines.runners.serving.serve \
-  --config configs/a10/a10_openpi_inference.py \
+  --config configs/a10/a10_single_openpi_inference.py \
   --from-config --dtype fp32 --acceleration off --host 127.0.0.1 --port 5555
 
 # Triton + CUDA Graph；--dtype fp32 关闭外层 autocast，融合内核仍为 BF16
 python -m fluxvla.engines.runners.serving.serve \
-  --config configs/a10/a10_openpi_inference.py \
+  --config configs/a10/a10_single_openpi_inference.py \
   --from-config --dtype fp32 --acceleration on --host 127.0.0.1 --port 5555
 ```
 
 服务启动打印实际模型类型：`PI05FlowMatching` 为普通路径，
 `A10PI05FlowMatchingInference` 为加速路径。机器人端仍运行
-`python scripts/inference.py --config configs/a10/a10_remote_inference.py`，
+`python scripts/inference.py --config configs/a10/a10_single_remote_inference.py`，
 不要把加速开关加到远程客户端，它不能切换已运行的服务。
-本机推理可使用 `python scripts/inference.py --config configs/a10/a10_openpi_inference.py --acceleration off`（或 `on`）。
+本机推理可使用 `python scripts/inference.py --config configs/a10/a10_single_openpi_inference.py --acceleration off`（或 `on`）。
 
 普通路径通常更慢，可能拉长动作块之间的等待；关闭加速不等于修复动作衔接。
 首次加速预测仍包含内核准备和图录制。历史加速耗时与数值对照见迁移记录，
@@ -464,7 +466,7 @@ python -m fluxvla.engines.runners.serving.serve \
 
 ```bash
 python -m fluxvla.engines.runners.serving.serve \
-  --config configs/a10/a10_openpi_inference.py \
+  --config configs/a10/a10_single_openpi_inference.py \
   --from-config --dtype fp32 --host 127.0.0.1 --port 5555
 ```
 
@@ -478,7 +480,7 @@ python -m fluxvla.engines.runners.serving.serve \
 
 ```bash
 python scripts/inference.py \
-  --config configs/a10/a10_openpi_inference.py \
+  --config configs/a10/a10_single_openpi_inference.py \
   --cfg-options inference.operator.host=192.168.0.125 \
     inference.dry_run=True inference.operator.allow_motion=False
 ```
@@ -487,7 +489,7 @@ python scripts/inference.py \
 
 ```bash
 python scripts/inference.py \
-  --config configs/a10/a10_remote_inference.py \
+  --config configs/a10/a10_single_remote_inference.py \
   --cfg-options inference.operator.host=192.168.0.125 \
     inference.dry_run=True inference.operator.allow_motion=False
 ```
@@ -531,7 +533,7 @@ Ctrl+C 请求停止当前会话的 follower 并关闭资源；`p` + Enter 在当
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/inference.py \
-  --config configs/a10/a10_remote_inference.py \
+  --config configs/a10/a10_single_remote_inference.py \
   --cfg-options \
     inference.operator.host=192.168.0.125 \
     inference.operator.allow_motion=False \
@@ -578,10 +580,10 @@ conda activate fluxvla-thor
 cd /home/robot/VLA/FluxVLA
 git branch --show-current
 python -m fluxvla.projects.a10 doctor
-cp -n configs/a10/site.example.yaml configs/a10/site.local.yaml
+cp -n configs/a10/a10_single_site.example.yaml configs/a10/a10_single_site.local.yaml
 ```
 
-分支应为 `kaanh`。`cp -n` 保留已有站点文件；编辑 `site.local.yaml` 后会自动加载，它已被 Git 忽略。模板中的相机名是占位符，地址是回环地址，须按现场修改。
+分支应为 `kaanh`。`cp -n` 保留已有站点文件；编辑 `a10_single_site.local.yaml` 后会自动加载，它已被 Git 忽略。模板中的相机名是占位符，地址是回环地址，须按现场修改。
 
 | 字段 | 应填写什么 |
 | --- | --- |
@@ -637,7 +639,7 @@ python -m fluxvla.projects.a10 teleop --vr-only --execute
 
 先看终端打印的页面地址。若是 `https://127.0.0.1:8443`，服务只允许电脑本机访问，头显不能连接。原 XLeVR 默认监听 `0.0.0.0`，而平台共享默认值是回环地址，因此需要设置站点地址。
 
-用 `ip -brief address` 查出这台电脑当前的局域网地址，在 `configs/a10/site.local.yaml` 中加入或修改下面两行，然后重启 `teleop --vr-only --execute`：
+用 `ip -brief address` 查出这台电脑当前的局域网地址，在 `configs/a10/a10_single_site.local.yaml` 中加入或修改下面两行，然后重启 `teleop --vr-only --execute`：
 
 ```yaml
 vr_server:

@@ -184,7 +184,7 @@ FluxVLA 的接口发送目标，底层运动规划与执行由控制器负责。
 | `serve.py`、`replay.py`、`bridge.py`、`hardware_check.py` | 旧服务、回放、推理桥接和现场检查 |
 | `teleop.py` | 已停用的旧遥操作入口，会提示新命令 |
 
-`configs/a10/pi05_a10_finetune.py` 目前仍调用这里的 `training.build_config()`。
+`configs/a10/pi05_a10_single_finetune.py` 目前仍调用这里的 `training.build_config()`。
 后续功能应接入原生结构；清理旧目录前，需要逐条替换这些历史依赖。
 
 ## 4. 配置、工具和测试的子目录
@@ -201,8 +201,8 @@ FluxVLA 的接口发送目标，底层运动规划与执行由控制器负责。
 | `pi05/fluxbisim/`、`gr00tn15/fluxbisim/` | 对应模型在 FluxBiSim 中使用的配置 |
 
 模型配置子目录名不等于当前正在使用的功能，需要看启动命令的 `--config`。
-A10 里先看三份：`a10_vr_teleop.py`、`a10_openpi_inference.py`、`a10_remote_inference.py`。
-`project.yaml`、`site.example.yaml` 服务于历史流程，不会自动影响新 VR Python 配置。
+A10 里先看三份：`a10_single_vr_base.py`、`a10_single_openpi_inference.py`、`a10_single_remote_inference.py`。
+`a10_single_project.yaml`、`a10_single_site.example.yaml` 服务于历史流程，不会自动影响新 VR Python 配置。
 
 ### 工具 `tools/`
 
@@ -245,13 +245,13 @@ A10 里先看三份：`a10_vr_teleop.py`、`a10_openpi_inference.py`、`a10_remo
 ```bash
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py --preview
 ```
 
 实际顺序是：
 
 1. [scripts/teleoperate.py](../scripts/teleoperate.py) 读取配置和终端覆盖参数。
-2. [a10_vr_teleop.py](../configs/a10/a10_vr_teleop.py) 提供网络、映射、设备和限值。
+2. [a10_single_vr_base.py](../configs/a10/a10_single_vr_base.py) 提供网络、映射、设备和限值。
 3. [vr/runtime.py](../fluxvla/engines/operators/vr/runtime.py) 的 `build_runtime()` 构建输入和所需设备，默认 VR-only 不构建机器人。
 4. [vr_operator.py](../fluxvla/engines/operators/vr_operator.py) 组合输入与 mapper，提供映射动作和事件。
 5. 正式运行时，`runtime.run()` 循环调用这些接口；只有显式开启且通过检查，才调用 [A10Operator](../fluxvla/engines/operators/a10_operator.py) 发送目标。
@@ -264,7 +264,7 @@ JSONL 是逐行 JSON 日志，可用于排查输入，但不是完整的可训�
 ### 5.2 模型推理：谁决定动作、谁负责发送
 
 ```text
-scripts/inference.py + configs/a10/a10_openpi_inference.py
+scripts/inference.py + configs/a10/a10_single_openpi_inference.py
         ↓
 A10InferenceRunner：取观测、调用模型、检查并执行动作块
         ↓
@@ -281,7 +281,7 @@ A10Operator：逐帧发送关节目标与夹爪指令，读取反馈
 以上短路径都是 `fluxvla/` 下的代码路径。
 VR 当前发送末端位姿，模型推理发送关节目标；它们不是同一种七维数据。
 
-远程推理时，客户端使用 `a10_remote_inference.py`，把观测发到模型服务；
+远程推理时，客户端使用 `a10_single_remote_inference.py`，把观测发到模型服务；
 服务通常由 `python -m fluxvla.engines.runners.serving.serve` 启动。
 服务使用本地模型配置加载权重，返回预测动作，机器人客户端再负责检查和执行。
 只启动模型服务不会自动让机械臂运动。推理资料见 [现场说明](a10_onsite_guide.md)。
@@ -305,7 +305,7 @@ A10 训练配置目前还有第 3.5 节的历史依赖，使用前先核对配�
 
 | 想做的事 | 优先查看 |
 | --- | --- |
-| 换 VR 网页地址、端口或运行频率 | `configs/a10/a10_vr_teleop.py` |
+| 换 VR 网页地址、端口或运行频率 | `configs/a10/a10_single_vr_base.py` |
 | 调整手柄缩放、精调、死区 | 同一配置中的 mapping，再看 `operators/vr/mapper.py` |
 | 修改握键、保持、目标锚点或退出流程 | `operators/vr/runtime.py` |
 | 修改网页或头显显示 | `operators/vr/web-ui/`、`hud.py` 和反馈调用处 |

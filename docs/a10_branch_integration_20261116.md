@@ -1,5 +1,7 @@
 # 2026-11-16：录制与90Hz开发统一到kaanh_follower
 
+> 当前入口：`configs/a10/a10_dual_vr.py`，配置分工见[配置索引](../configs/a10/README.md)，运行命令见[CLI.txt](../CLI.txt)。下文保留当时的接入/开发记录，旧路径和双臂默认行为以当前入口为准。
+
 ## 合并范围
 
 - 目标：`kaanh_follower`，合并前为 `d3d093a`。

@@ -1,20 +1,22 @@
 # 90 Hz 世界坐标平移与局部坐标旋转
 
-在 FluxVLA_90hz 仓库中运行：
+在 `/home/robot/VLA/FluxVLA` 中激活 `fluxvla` 环境后运行：
 
 ```bash
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop_world_translation.py --preview
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --preview
 ```
 
-去掉 `--preview` 即沿用原双臂配置的实机和夹爪设置启动。
+去掉 `--preview` 即启动实机双臂和夹爪。
 当前独立配置默认关闭控制器高频记录（record_controller=False），避免控制器 runtime log 容量上限阻止启动；本地 JSONL 诊断继续记录。
 管理控制器日志容量后，可用 --cfg-options teleop.record_controller=True 显式恢复高频记录。
 数据集录制仍使用原有的 `--record-config` / `--record-options` 参数。
-原入口 `configs/a10/a10_dual_arm_vr_teleop.py` 保留原控制方式。
+旧双臂和旧世界坐标转接文件已删除，双臂VR统一使用 `a10_dual_vr.py`。
+机械臂连接与ID在 `a10_dual_arm_operator.py`，相机与夹爪身份在 `a10_dual_devices.py`；
+VR映射、手感和会话参数统一在 `a10_dual_vr.py`。完整分工见[配置索引](../configs/a10/README.md)。
 新入口不自动使能或回初始位；接管时读取状态和末端朝向；位置参考使用本地零点，测试台虚拟位姿不作为实机绝对目标。
 
 新配置选择 `pose_mapping='world_translation_local_rotation'`，控制 90 Hz；只有附带录制时订阅 30 Hz 反馈，
-继承全部运动参数与左右手绑定；新增世界平移专用的每手轴矩阵，局部旋转不变。
+运动参数与左右手绑定统一在 `a10_dual_vr.py` 维护；每手轴矩阵只作用于世界平移，局部旋转不变。
 不读取或要求 VR 标定文件，也不改变 VR 网页和机器人协议。
 
 每侧按侧键时分别记录手位置与本地参考位姿。跟随会话位置从本地零点开始：
@@ -72,14 +74,14 @@ python -m unittest discover -s test -p 'test_vr_world_translation.py' -v
 VR 断流、输入异常、发送失败、退出/Ctrl+C 仍请求停止跟随。
 `confirm_stop=False` 表示仅发送 stop_follower，不等待执行结果或额外回读 inactive/Stopped；
 日志记为 stop_requested，不把发送成功当作停止确认。
-退出时尚无停止确认则不自动恢复控制器倍率。原配置的松键停止逻辑保持不变。
+退出时尚无停止确认则不自动恢复控制器倍率。其他控制模式仍支持松键停止逻辑，当前双臂入口采用本页配置。
 
 ## 控制与录制反馈解耦
 
 新配置设置 `continuous_feedback=False`，接管后 90 Hz 控制只推进并发送增量目标，
 不用持续 GET，也不检查后台反馈缓存的年龄。成功发送前不会更新本地参考；
 原始实际反馈与接收时间保持原样，不把指令位置伪装成实测位置。
-原配置保留 `continuous_feedback=True` 的反馈约束路径。
+运行时仍支持 `continuous_feedback=True` 的反馈约束路径；当前入口默认关闭。
 
 不带 `--record-config` 时不订阅后台 GET；带录制配置时继续订阅 30 Hz 实际反馈，
 用于真实关节状态和数据记录。新配置通过 `operator.shared_control.require_feedback=False`
@@ -106,4 +108,4 @@ VR 断流、输入异常、循环超时、目标发送失败仍停发目标；�
 切回旋转时重设旋转参考，不追赶锁定期间的手柄旋转。
 只重设旋转参考，不重设平移锚点，也不重启整组跟随；另一只手互不影响。
 内部锚点指令用 `rotation_enabled` 传递模式，不改变机器人 UDP 协议。
-原配置默认 `squeeze_translation_only=False`，保留原侧键行为。
+旧单臂配置继续沿用原侧键行为；当前双臂入口启用仅平移侧键。

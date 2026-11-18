@@ -33,7 +33,7 @@ VR 原始输入 → mapper.py → control.py → runtime.py → A10Operator → 
 | `test/test_vr_control.py` | C++ 数值对照及前端适配测试 |
 | `test/data/vr_control/` | 原 C++ 参考结果、生成工具及无 SDK 的 C++ 对照入口 |
 
-不依赖 `projects/a10`。既有配置 `configs/a10/a10_vr_teleop.py` 保持原控制模式；
+不依赖 `projects/a10`。既有配置 `configs/a10/a10_single_vr_base.py` 保持原控制模式；
 阶段 3 的新模式需显式选择，未把原配置静默切换成新算法。
 
 ## 二、阶段 1：功能与接口对照
@@ -226,7 +226,7 @@ reference 模式要求 mapper 输出 safe_frame_delta 锚点包并绕过原输�
 仅检查控制器状态，不启动 VR、相机、夹爪，不要求预先猜测位姿单位：
 
 ```bash
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py \
   --inspect-controller --samples 5 \
   --report work_dirs/a10/vr/reference_migration/controller_readonly.json \
   --cfg-options teleop.operator.host=192.168.0.125
@@ -241,7 +241,7 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
 ```bash
 # 将 YOUR_PC_IP 替换为电脑局域网地址，VERIFIED_UNIT 替换为已核对的 mm 或 m。
 # 先保留 --preview 检查；准备接头显、只读观察时再去掉 --preview。
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py \
   --observe --preview \
   --cfg-options teleop.operator.host=192.168.0.125 \
     teleop.operator.feedback_position_unit=VERIFIED_UNIT \
@@ -394,7 +394,7 @@ PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
 - `runtime.py`：接入 `pose_mapping` / `pose_calibration`，新方式只允许 `control_mode=reference`。
   开始 follower 前先按所选映射校验命令；第一包实际位姿保持、启动后重新取新鲜样本、停止确认
   沿用原流程。JSONL 增加模式和标定，目标结果也记录映射名。
-- `a10_vr_teleop.py`：`anchor_relative` 仍是默认；两个标定值默认 `None`。
+- `a10_single_vr_base.py`：`anchor_relative` 仍是默认；两个标定值默认 `None`。
   新方式缺少有效标定即报错；旧方式忽略标定，可只改模式参数切换，不必删除已有标定值。
 - 回放 CLI 增加 `--pose-mapping` / `--pose-calibration`，不连接设备；拒绝把缺少已校验手柄
   字段的旧锚点日志直接解释为新模式，拒绝以不同标定冒充原日志的同一次回放。
@@ -448,7 +448,7 @@ PYTHONPATH=/home/robot/VLA/FluxVLA_vr/test \
 - 原 LeRobot `quaternion_utils.py` 已定义 `AXIS_REMAP_VR_TO_ROBOT`：局部 X/Y 交换，Z 反向。
   新模式右乘项使用其逆旋转，得到 xyzw 四元数
   `[0.7071067811865475, 0.7071067811865475, 0, 0]`；已写入
-  `a10_vr_teleop.py` 的 `hand_to_tool_quat_xyzw` 默认值。
+  `a10_single_vr_base.py` 的 `hand_to_tool_quat_xyzw` 默认值。
 - 该值复用原手柄/末端局部轴约定，不冒充现场物理测量。`vr_to_robot_quat_xyzw` 继续为
   `None`，缺少它时新模式仍明确报错；原默认模式不变。
 - 修正之前“两个值都要现场重新测量”的说明：沿用已知局部轴约定时，只需一次有意识的

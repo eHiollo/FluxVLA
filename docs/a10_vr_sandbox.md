@@ -6,7 +6,7 @@
 python scripts/preview_vr_mapping.py
 ```
 
-默认读取 `configs/a10/a10_dual_arm_vr_teleop_world_translation.py` 的 VR 输入、
+默认读取 `configs/a10/a10_dual_vr.py` 的 VR 输入、
 左右绑定和参考控制参数，固定以 90 Hz 计算。即使配置包含实机与夹爪设置，
 测试台也不会构造机器人 runtime、机器人 operator、夹爪或相机，不读姿态标定文件。
 只启动 VR HTTPS/WebSocket 服务，虚拟反馈为上一周期虚拟指令，不是实机或动力学仿真。

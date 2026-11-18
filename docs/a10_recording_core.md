@@ -32,7 +32,7 @@
 |---|---|
 | `fluxvla/datasets/episode_writer.py` | 开始一集、逐帧写入、保存、丢弃、续录与恢复 |
 | `fluxvla/datasets/a10_recording_io.py` | 离线校验、v3到v2.1格式转换 |
-| `configs/a10/a10_record.py` | 输出位置、分辨率、30Hz、队列大小等配置 |
+| `configs/a10/a10_single_record.py` | 输出位置、分辨率、30Hz、队列大小等配置 |
 | `scripts/validate_a10_dataset.py` | 终端检查数据集 |
 | `scripts/export_a10_openpi_dataset.py` | 终端导出 OpenPI 数据集 |
 | `test/test_datasets/test_a10_recording.py` | 本地模拟数据测试 |
@@ -65,7 +65,7 @@ a10_record/
 from mmengine import Config
 from fluxvla.datasets.episode_writer import EpisodeWriter
 
-cfg = Config.fromfile('configs/a10/a10_record.py')
+cfg = Config.fromfile('configs/a10/a10_single_record.py')
 with EpisodeWriter(**cfg.record) as writer:
     writer.start('Pick up the water bottle')
     # 在采集循环中，每次提供一组完整数据：

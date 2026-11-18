@@ -55,7 +55,7 @@ resolved config 和 `dataset_statistics.json`。仅使用 adapter 时仍需要�
 | `configs/a10/a10_dual_openpi_remote.py` | OpenPI WebSocket | `127.0.0.1:8001` |
 | `configs/a10/a10_dual_fold_inference.py` | FluxVLA原生ZMQ | `127.0.0.1:5556` |
 
-两份配置继承现有 `a10_dual_arm_operator.py` 和 `a10_devices.py`，不复制设备绑定。
+两份配置继承现有 `a10_dual_arm_operator.py` 和 `a10_dual_devices.py`，不复制设备绑定。
 模型差异在 `inference_model`、`inference.dataset`、`inference.denormalize_action`
 声明；控制和通信在 `inference` 声明。公共组件支持单双臂状态维度、相机顺序、统计名、
 mean/std或quantile归一化及关节增量掩码，旧单臂配置的默认行为保持兼容。

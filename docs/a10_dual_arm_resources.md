@@ -100,10 +100,10 @@
 
 | 配置入口 | 当前用途 | 与新任务的关系 |
 | --- | --- | --- |
-| [a10_vr_teleop.py](../configs/a10/a10_vr_teleop.py) | 当前原生 VR 配置；默认 VR-only、30Hz、单右臂、`control_mode='delta'` | 可查当前输入／设备配置；尚无双臂与知行配置 |
-| [a10_openpi_inference.py](../configs/a10/a10_openpi_inference.py) | 本地模型加载及单臂推理；默认 `dry_run=True`、`allow_motion=False` | 记录现有模型与设备约定，不是双臂任务配置 |
-| [a10_remote_inference.py](../configs/a10/a10_remote_inference.py) | 机器人侧请求 ZMQ 模型服务 | 默认模型服务 `127.0.0.1:5555`；不是 follower 地址 |
-| [project.yaml](../configs/a10/project.yaml) | 历史 `projects/a10` 工程配置，包含旧 TCP follower 等参数 | 保留参考；不能只修改它就改变当前原生 VR 流程 |
+| [a10_single_vr_base.py](../configs/a10/a10_single_vr_base.py) | 当前原生 VR 配置；默认 VR-only、30Hz、单右臂、`control_mode='delta'` | 可查当前输入／设备配置；尚无双臂与知行配置 |
+| [a10_single_openpi_inference.py](../configs/a10/a10_single_openpi_inference.py) | 本地模型加载及单臂推理；默认 `dry_run=True`、`allow_motion=False` | 记录现有模型与设备约定，不是双臂任务配置 |
+| [a10_single_remote_inference.py](../configs/a10/a10_single_remote_inference.py) | 机器人侧请求 ZMQ 模型服务 | 默认模型服务 `127.0.0.1:5555`；不是 follower 地址 |
+| [a10_single_project.yaml](../configs/a10/a10_single_project.yaml) | 历史 `projects/a10` 工程配置，包含旧 TCP follower 等参数 | 保留参考；不能只修改它就改变当前原生 VR 流程 |
 | [requirements-a10.txt](../requirements-a10.txt) | A10 扩展依赖清单 | 已列 WebSocket、串口等依赖，不表示知行协议已经实现 |
 
 当前原生 A10 接口的端口约定：WebSocket 命令 `5999`、监视 `5888`、末端 UDP `9998`、关节 UDP `9999`。

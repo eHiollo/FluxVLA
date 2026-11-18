@@ -1,5 +1,7 @@
 # 双臂 VR 数据采集：手柄、头显与终端
 
+当前双臂遥操作入口为 `configs/a10/a10_dual_vr.py`；机械臂、设备、VR及录制配置分工见[配置索引](../configs/a10/README.md)。旧双臂转接文件已删除，启动命令统一使用新入口。
+
 本工作树 `kaanh_vr_90hz` 的最新变化：双臂控制目标90Hz、后台采集30Hz、控制器查询独立30Hz。
 本页后文 `control_loop` 默认描述为历史记录；本分支默认 `background_30hz`。
 运行目录、实测结果与新数据目录要求见 [频率改造说明](a10_vr_frequency.md)。
@@ -12,7 +14,7 @@
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --check-record-buttons
 ```
@@ -32,7 +34,7 @@ python scripts/teleoperate.py \
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --cfg-options \
     teleop.record_controller=False \
@@ -180,7 +182,7 @@ python scripts/teleoperate.py \
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --record-config configs/a10/a10_dual_arm_record.py \
   --check-record-buttons \
   --measure-vr-latency
@@ -234,7 +236,7 @@ P95表示95%的样本不超过该值。每项最多保留最近100000个样本�
 
 若正在录制，本集会停止采样并标记为`failed`，不能保存为正常训练样本；后台尚在开始录制时发生异常也会保留该失效标记。可用右A+左摇杆左、回中后再次向左确认丢弃。重新接管且处理完异常集后，再向右开始新集，避免把暂停前后拼成连续数据。暂停期间不能开始新集或执行`m_init`；已保存的集保留。
 
-默认稳定时长写在`configs/a10/a10_dual_arm_vr_teleop.py`的`input_recovery_stable_s=.5`，也可在原命令的`--cfg-options`后设置`teleop.input_recovery_stable_s=1.0`，支持0.5～5秒。现有启动命令可以继续使用；更新后需**刷新头显网页**加载红/黄状态标题。较旧网页没有有效追踪字段时无法通过恢复门槛。
+默认稳定时长写在`configs/a10/a10_dual_vr.py`的`input_recovery_stable_s=.5`，也可在原命令的`--cfg-options`后设置`teleop.input_recovery_stable_s=1.0`，支持0.5～5秒。现有启动命令可以继续使用；更新后需**刷新头显网页**加载红/黄状态标题。较旧网页没有有效追踪字段时无法通过恢复门槛。
 
 控制器故障、机器人反馈/通信异常、夹爪故障、停止未确认、未知映射故障或参考轨迹保护仍按原故障流程退出，不进入这种恢复流程。`--observe`只读模式也不声称已经停止实机。这次改动保留原2m/s手柄位置速度保护和原运动参数。
 

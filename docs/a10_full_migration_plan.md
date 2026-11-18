@@ -70,7 +70,7 @@ SSH 只读核查补充：工控机安装 KAANH／ARIS 2.5.7，已有编译后的
 
 ## 配置规则
 
-`configs/a10/project.yaml` 保存可共享的流程参数。站点私有值使用 `configs/a10/site.local.yaml` 覆盖，后者不提交。运行时保存解析后的配置及 FluxVLA 提交版本。设备名优先改成 `/dev/v4l/by-id/...`，避免 USB 插拔导致相机编号互换。录制相机定义为 `base_0_rgb` 和 `right_wrist_0_rgb`，模型训练目标从未来 `observation.state` 取得；录制的 8 维末端增量动作保留在数据中供诊断，不当作 PI0.5 的 7 维关节目标。
+`configs/a10/a10_single_project.yaml` 保存可共享的流程参数。站点私有值使用 `configs/a10/a10_single_site.local.yaml` 覆盖，后者不提交。运行时保存解析后的配置及 FluxVLA 提交版本。设备名优先改成 `/dev/v4l/by-id/...`，避免 USB 插拔导致相机编号互换。录制相机定义为 `base_0_rgb` 和 `right_wrist_0_rgb`，模型训练目标从未来 `observation.state` 取得；录制的 8 维末端增量动作保留在数据中供诊断，不当作 PI0.5 的 7 维关节目标。
 
 ## 调整后的迁移顺序与验收
 
@@ -105,7 +105,7 @@ SSH 只读核查补充：工控机安装 KAANH／ARIS 2.5.7，已有编译后的
 
 ### 2026-10-08：统一配置、入口及录制命令接入
 
-- 新增 `configs/a10/project.yaml`，集中描述仓库路径、机器人地址、两路相机、VR、数据、模型和推理参数；`site.local.yaml` 可覆盖站点值且已加入 `.gitignore`。
+- 新增 `configs/a10/a10_single_project.yaml`，集中描述仓库路径、机器人地址、两路相机、VR、数据、模型和推理参数；`a10_single_site.local.yaml` 可覆盖站点值且已加入 `.gitignore`。
 - 新增 `python -m fluxvla.projects.a10` 统一入口。`doctor` 只读检查环境；`teleop` 和 `record` 调用 LeRobot 自有 Python 环境，保留 XLeVR 的输入保护与诊断旁路；`validate` 调用已有的数据检查脚本。训练、服务、回放和实机子命令也已定义，待对应模块代码完成后验收。
 - 默认展示即将执行的完整命令，`--execute` 才启动；每次实际启动保存解析配置、SHA256 和五个仓库的提交编号。录制已有数据集时必须显式使用 `--resume`，避免误覆盖。
 - 验证：`doctor` 的路径检查和 LeRobot 依赖检查通过，`record --episodes 1`、`teleop --vr-only` 的命令预览成功。又用 LeRobot 自己的 Draccus 解析器解析实际录制参数，确认两路相机、30 Hz 和 `robot_controller` 模式正确。LeRobot 使用 `/home/robot/miniforge3/envs/lerobot/bin/python`；原 `.venv` 缺少运行依赖。尚未启动 VR 服务或实机录制，需现场确认相机实体设备与地址。
@@ -113,7 +113,7 @@ SSH 只读核查补充：工控机安装 KAANH／ARIS 2.5.7，已有编译后的
 
 ### 2026-10-08：A10 原生训练配置与统计
 
-- 新增 `configs/a10/pi05_a10_finetune.py` 与 `fluxvla/projects/a10/training.py`。模型结构沿用 FluxVLA 的 PI0.5 实现，A10 参数从统一 YAML 读取。原生 FluxVLA 流程按用户确认的目标设为未来 30 步；尚未确认的 OpenPI h30 权重仍单独处理。
+- 新增 `configs/a10/pi05_a10_single_finetune.py` 与 `fluxvla/projects/a10/training.py`。模型结构沿用 FluxVLA 的 PI0.5 实现，A10 参数从统一 YAML 读取。原生 FluxVLA 流程按用户确认的目标设为未来 30 步；尚未确认的 OpenPI h30 权重仍单独处理。
 - 数据管道使用 `ParquetDatasetV3`，两路相机放到模型的 base、空 left、right 三个图像位置；训练动作取未来 `observation.state`，前六轴减去当前关节位置，夹爪维度原样保留。
 - 给统计工具增加 `a10` 变换定义及 LeRobot v3 数据源支持。实际遍历 35 集后，得到 `a10.proprio` 和 `a10.action` 各 7 维统计量；模型动作窗口为 30，起点偏移为 1。训练入口会在工作目录保存统计量和解析配置。
 - 已从 FluxVLA 官方固定提交 `04b5d94d6aebf23ce15b89443df08501740f2868` 开始下载 PI0.5 基础模型（模型文件约 14.5 GB），统一配置指向 `checkpoints/pi05_base/`。下载完成后再做短训。
@@ -155,7 +155,7 @@ python -m fluxvla.projects.a10 replay --samples 3
 python -m fluxvla.projects.a10 infer --cycles 1
 ```
 
-进行实际录制或实机推理前，现场人员须先核对相机实体、A10 地址、夹爪范围和关节单步范围；这些站点参数填写在 `configs/a10/site.local.yaml`，并在核对后将 `robot.allow_motion` 设为 `true`。已有数据集续录需加 `record --resume`。同一时刻只运行一个 XLeVR 实例。
+进行实际录制或实机推理前，现场人员须先核对相机实体、A10 地址、夹爪范围和关节单步范围；这些站点参数填写在 `configs/a10/a10_single_site.local.yaml`，并在核对后将 `robot.allow_motion` 设为 `true`。已有数据集续录需加 `record --resume`。同一时刻只运行一个 XLeVR 实例。
 
 ### 2026-10-08：单平台内迁第一批实现
 
@@ -197,7 +197,7 @@ python -m fluxvla.projects.a10 infer --cycles 1
 - `replay --samples 3 --execute` 从平台自有真实数据的第 0、20,011、36,652 行（episode 0、17、34；覆盖两个任务）读取状态与两路 RGB 图像。实际模型三次均返回有限的 `30×7` 动作，客户端退出码 0；过程中未打开机器人 TCP。
 - 报告：`work_dirs/a10/replays/20261008_163245/report.json`；日志：`work_dirs/a10/replay_native.log`、`work_dirs/a10/serve_native.log`。已通过该测试服务的 kill 接口关闭服务。
 - 动作质量尚未验收：仅两步短训的预测中，第一个样本首动作的夹爪约为 -1.22 mm，超出当前物理 0–100 mm 范围。离线检查保留原输出用于诊断；不能把这些流程验证权重拿来直接控制机器人。实机桥接已有站点范围拒绝逻辑，后续仍须正式训练与现场验证。
-- 复现命令如下。此次端口及超时覆盖保存在 `/tmp/fluxvla_a10_offline_site.yaml`，只包含本机 host、端口 5568 和 timeout_s=120；长期配置可放入不提交的 `configs/a10/site.local.yaml`。
+- 复现命令如下。此次端口及超时覆盖保存在 `/tmp/fluxvla_a10_offline_site.yaml`，只包含本机 host、端口 5568 和 timeout_s=120；长期配置可放入不提交的 `configs/a10/a10_single_site.local.yaml`。
 
 ```bash
 # 激活 fluxvla-thor 并进入 FluxVLA；两条命令分别运行在两个终端
@@ -234,7 +234,7 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 ### 2026-10-08：下一阶段小任务 2——站点模板与现场操作说明
 
 - 小任务 1 已提交为 `9a92f6b`（`feat(a10): add bounded onsite hardware checks`）。后续继续采用独立小任务完成、更新本文、提交 commit 的顺序。
-- 新增 `configs/a10/site.example.yaml`，可复制为 Git 忽略的 `site.local.yaml`。模板保留运动关闭、未确认限值为空、相机路径占位以及回环网络地址，避免把本机临时设备身份写入共享配置。
+- 新增 `configs/a10/a10_single_site.example.yaml`，可复制为 Git 忽略的 `a10_single_site.local.yaml`。模板保留运动关闭、未确认限值为空、相机路径占位以及回环网络地址，避免把本机临时设备身份写入共享配置。
 - 新增 `docs/a10_onsite_guide.md`，按环境／配置、相机快照、只读状态、VR-only、短集录制、验收记录顺序说明，并解释吞吐测量与真实录制帧率的区别，以及 VR 末端增量与模型关节批次的不同检查边界。
 - 验证：模板通过统一配置加载，正确继承 640×480 相机尺寸且运动保持关闭；文档中的 8 条 CLI 命令通过参数解析；硬件检查、VR-only、录制的 3 项命令预览通过，并用 mock 确认没有启动子进程。`git diff --check` 通过。
 - 本轮已完成可独立推进的现场接入准备。真实设备验证按用户最新要求延期；不改动机械臂和 OpenPI 同事的开发环境。正式训练的数据／任务划分与效果评估仍待后续安排，两步检查权重不作为实机控制权重。
@@ -244,13 +244,13 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 ### 2026-10-08：修复 FluxVLA VR 无法从头显连接
 
 - 用户反馈旧 LeRobot `--vr-only` 能连接，FluxVLA 不能。排查发现原 XLeVR 默认绑定 `0.0.0.0`；平台配置绑定 `127.0.0.1`，且没有站点覆盖文件。头显无法通过电脑局域网地址访问只监听回环的服务，这是已确认的配置问题。
-- 创建本机 `configs/a10/site.local.yaml`，仅将 `vr_server.host_ip` 设置为当前无线网卡的 `192.168.110.119`。该文件继续由 Git 忽略；共享默认配置和机器人运动设置未改变。换网络／IP 后需更新此站点值。
+- 创建本机 `configs/a10/a10_single_site.local.yaml`，仅将 `vr_server.host_ip` 设置为当前无线网卡的 `192.168.110.119`。该文件继续由 Git 忽略；共享默认配置和机器人运动设置未改变。换网络／IP 后需更新此站点值。
 - `doctor` 增加 VR 页面及 WebSocket 端口显示，并在回环配置时提示头显不能通过局域网连接；VR 启动输出也增加此提示和首次使用本地证书的说明。操作文档补充专门排查步骤。
 - 用真实统一入口启动 `teleop --vr-only --execute`：两个端口均绑定本机局域网地址；通过该地址访问首页、配置脚本、业务 JS、样式及配置 API，全部 HTTP 200；WSS 握手通过，发送 75 个模拟手柄包后，服务终端显示 `ee.enabled=true`。报告：`work_dirs/a10/vr_lan_fix_report.json`，服务日志：`work_dirs/a10/vr_lan_fix.log`。
 - 平台原生相机／录制／HTTPS+WSS 的 3 项回归测试全部通过，日志：`work_dirs/a10/vr_lan_fix_tests.log`。网络检查是在本机经局域网接口完成，测试客户端接受了本地自签名证书；实际头显浏览器的信任和 WebXR 行为仍需用户重试确认。
 - 测试只启动 VR-only，没有连接机械臂。测试服务完成后退出，用户可重新运行原命令。
 
-详细操作见 [现场接入操作说明](a10_onsite_guide.md)，站点模板为 `configs/a10/site.example.yaml`。
+详细操作见 [现场接入操作说明](a10_onsite_guide.md)，站点模板为 `configs/a10/a10_single_site.example.yaml`。
 
 现场接入准备已恢复，实机验证按用户最新要求暂缓。后续配合现场人员，从下面的第一项开始：
 
@@ -545,7 +545,7 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 ### 2026-10-15：主目录迁回——备份与资源归位
 
 - 用户批准将已跑通的 integration 工作区迁回原目录；检查发现最新加速推理修改尚未提交，先备份，待用户确认已提交后以 `b98edd2` 为迁入基准。原目录现已切换到 `kaanh_follower`，完整保留 Git 历史。
-- 原目录 19 个 VR 开发文件保存为 `backup/vr-before-consolidation-20261015` 分支提交 `e9e4b93`；原 `vr` 分支指针保持。附件 `robot.7z`、PDF 和 `configs/a10/site.local.yaml` 保留在原目录。
+- 原目录 19 个 VR 开发文件保存为 `backup/vr-before-consolidation-20261015` 分支提交 `e9e4b93`；原 `vr` 分支指针保持。附件 `robot.7z`、PDF 和 `configs/a10/a10_single_site.local.yaml` 保留在原目录。
 - 备份目录为 `/home/robot/VLA/.fluxvla_backups/20261015_consolidation`：含原修改 binary patch、原未跟踪文件压缩包、新推理修改快照、本地配置、资源核对清单及工作区信息。Git 标签 `backup/integration-before-consolidation-20261015` 指向 `cf2fb0b`，`backup/integration-latest-before-consolidation-20261015` 指向 `b98edd2`，`backup/follower-old-20261015` 指向 `f8e2985`，可恢复早期 detached 版本。
 - 已核对约 13.4GB 模型文件及 metadata/统计文件一致、三个本机 CUDA 扩展一致；补齐 tokenizer，使用本地硬链接保留文件，无需重新下载。原数据集和基础权重保留。integration 推理日志归档至 `work_dirs/a10/archive/20261015_consolidation/a10_inference.log`。
 - 现场说明的执行路径统一为 `/home/robot/VLA/FluxVLA`。现有 Conda `fluxvla` 的 editable 安装已经指向该目录，无需重装依赖。后续先进行本机回环和模型推理验证，通过后再清理三个旧工作区。
@@ -555,7 +555,7 @@ python -m fluxvla.projects.a10 train --steps 2 --work-dir work_dirs/a10/smoke_tr
 
 - 迁回与操作路径说明提交为 `50eccb6`。在 `/home/robot/VLA/FluxVLA` 使用现有 `fluxvla` 环境验证：通信编解码/本机回环 39 项通过，相机/夹爪/控制台/轨迹集成模拟 63 项通过，runner 和 OpenPI 适配共 21 项发现、20 项通过、1 项真实模型测试默认跳过；随后单独启用该真实 GPU 测试并通过，合计 123 个不同测试通过。
 - 真实权重验证加载 811 个参数、成功录制 Triton CUDA Graph；本地推理和实际序列化 ZMQ 收发均得到有限的 `(30,7)` 动作，固定噪声下结果一致。完整验证日志为 `work_dirs/a10/migration/20261015/gpu_zmq.log`，模拟设备测试日志为同目录 `device_tests.log`。GPU 单项用时约 72 秒，包含首次加载和图录制，不是稳定推理耗时。
-- 配置验证确认 `a10_openpi_inference.py`、`a10_remote_inference.py` 解析正常，模型、统计和 tokenizer 路径存在，默认 dry_run=True、allow_motion=False；Python 实际导入 `/home/robot/VLA/FluxVLA/fluxvla/__init__.py`。全部验证为本机测试和合成观测，不连接控制器、相机或夹爪，不发送实机动作。
+- 配置验证确认 `a10_single_openpi_inference.py`、`a10_single_remote_inference.py` 解析正常，模型、统计和 tokenizer 路径存在，默认 dry_run=True、allow_motion=False；Python 实际导入 `/home/robot/VLA/FluxVLA/fluxvla/__init__.py`。全部验证为本机测试和合成观测，不连接控制器、相机或夹爪，不发送实机动作。
 - 清理前再次确认三个旧工作区均无未提交代码，非缓存忽略文件全部保留且资源无指向旧目录的符号链接。通过 `git worktree remove` 正常移除 `FluxVLA_integration`、`FluxVLA_follower`、`FluxVLA_runner`，未使用强制删除；现在 `git worktree list` 只保留主目录 `kaanh_follower`。
 - 保留 `kaanh_a10_runner`、`vr`、VR 备份分支和全部备份标签；`lerobot`、`openpi`、`A10_new`、`XLeRobot` 不在此次清理范围。原附件仍保留为未跟踪文件。备份目录内 `cleanup-results.json` 保存三次移除的成功结果。
 - 后续模型服务和机器人客户端先执行 `cd /home/robot/VLA/FluxVLA`，再 `conda activate fluxvla`，其余启动参数沿用已验证的配置。旧目录里的终端需重新 cd，IDE 重新打开主目录；重新启动服务以保证加载当前代码。
@@ -575,7 +575,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 按用户要求，从最新 `kaanh_follower`（`efcdb2f`）创建 `kaanh_follower_vr`；VR 后续开发统一在新分支，仍使用主目录，不新建独立工作区。本次工作对话统一提交一个中文 commit，此后沿用每次对话一次提交的约定。
 - 来源为 `backup/vr-before-consolidation-20261015`（`e9e4b93`）。选择性迁入 `VROperator`、teleop 组装入口、VR 输入关闭修复、按键说明、VR 专项测试及文档；没有合入来源提交中的旧 OpenPI 服务／回放修改。当前相机、USB 夹爪、后台监视、关节轨迹发送和 Triton/CUDA Graph 推理实现继续使用最新基线。
 - `VROperator` 复用 `A10Operator` 和独立 `GripperOperator`，保留末端局部增量累积、启动锚点相对米／xyzw 转换、握键启动、松手保持、参考重置、输入过期与跟踪误差检查、摇杆控制夹爪。A10Operator 只补充位姿接口注释，没有替换通信或轨迹逻辑。
-- 配置增加 `vr_operator` 分节和站点模板；保留现有本地配置中的 `model.checkpoint_format` 字段及校验，使 VR 入口可加载当前 site.local.yaml。依赖继续使用 follower 已有的 `pyserial==3.5`，未放宽版本或重装环境。本地和示例配置解析、VR-only 构建及 CLI 预览通过。
+- 配置增加 `vr_operator` 分节和站点模板；保留现有本地配置中的 `model.checkpoint_format` 字段及校验，使 VR 入口可加载当前 a10_single_site.local.yaml。依赖继续使用 follower 已有的 `pyserial==3.5`，未放宽版本或重装环境。本地和示例配置解析、VR-only 构建及 CLI 预览通过。
 - 回归结果：VR/A10/轨迹/相机/夹爪/控制台 124 项通过（其中 VR 专项 22 项）；共享项目 6 项通过，覆盖本机 HTTPS/WSS 模拟浏览器输入、数据写入和假服务闭环；推理 runner/适配 21 项发现、20 项通过、1 项真实 GPU 模型测试按默认跳过。合计 150 项通过、1 项跳过，日志在 `work_dirs/a10/vr_migration/20261015/`。本次没有启动真实头显服务、连接实机或发送运动指令；真实 GPU 路径沿用上一轮迁回时的验证结果。
 - 当前功能迁入完成。入口仍是 `projects/a10/teleop.py`，输入和 mapper 仍在 `projects/a10/vr`；统一遥操作基类／runner 整理、真实 VR→Cartesian follower 与夹爪联调、录制链路接入与验收留待后续开发。使用说明见 `docs/a10_vr_operator.md`。
 
@@ -585,12 +585,12 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 用户批准紧凑布局，并明确禁止改动／提交 `kaanh_follower` 中的未提交内容。因此仅新增 `/home/robot/VLA/FluxVLA_vr` 工作区检出 `kaanh_follower_vr`（原基线 `325b074`）。没有切换主目录、暂存其改动、合并或推进 follower 分支。主目录已有现场配置、控制台等内容由用户独立开发，本轮不纳入 VR 提交。
 - 将 `projects/a10/vr` 整体迁到 `engines/operators/vr`，保留网页、样式、图片、来源 NOTICE 和 Apache/MIT 许可证；setup.py 的 package_data 指向新包。mapper 只引用底层 TRANSFORMS 注册器，避免包初始化循环。
 - `vr_operator.py` 提供小型 `BaseTeleoperator` 和注册到 OPERATORS 的 `VROperator`，负责输入、映射、事件与反馈。已测试的 A10 控制状态机迁入 `vr/runtime.py` 的 `VRTeleopRuntime`；保留启动锚点转换、目标累积、松手保持、重置、过期及误差检查、启停和失败清理。未新增 runner 文件，未改 A10Operator、相机或夹爪驱动。
-- 新增 `scripts/teleoperate.py` 和 `configs/a10/a10_vr_teleop.py`，支持 `--cfg-options`、`--preview`，默认 VR-only，不再使用旧项目的 YAML/配置加载器。现场单位、位姿限值和运动开关必须显式确认；不读取主目录 site.local.yaml，不自动使能、回零、重连或抢占 follower。
+- 新增 `scripts/teleoperate.py` 和 `configs/a10/a10_single_vr_base.py`，支持 `--cfg-options`、`--preview`，默认 VR-only，不再使用旧项目的 YAML/配置加载器。现场单位、位姿限值和运动开关必须显式确认；不读取主目录 a10_single_site.local.yaml，不自动使能、回零、重连或抢占 follower。
 - USB 夹爪通过现有 GripperOperator 单独组装，由 runtime 管理连接；机器人实例不重复持有串口。默认未启用 USB 设备，配置后沿用 85mm 范围。这样松开机械臂握键时仍能用摇杆操作夹爪。
 - 诊断 JSONL 已接入循环，记录原始输入、映射动作、反馈、成功写出的相对目标、错误及耗时，关闭时刷盘并释放线程。HUD 模块与 send_feedback 接口保留；完整录制状态机／录制 HUD 留待下一轮。旧 teleop 入口明确报出新命令并退出；旧录制 session 反向引用新 VR 包的轻量适配器，不保留重复实现。
 - 验证：原 VR 专项 22 项通过；VR＋通信／轨迹／相机／夹爪／控制台＋新入口测试合计首次 132 项通过，再增一项原生输入门面到 runtime 的集成测试并通过，新入口专项最终 9 项通过；共享原生／工作流 6 项通过（含本机 HTTPS/WSS）；A10 推理 runner 14 项通过。合计 153 个不同测试通过。导入拦截测试禁止所有 fluxvla.projects 导入，新 CLI 预览仍通过；资源打包模式与网页／许可证存在性通过。未运行真实 GPU 权重，未接真实头显或机器人。
 - 验证产物：VR 工作区 `work_dirs/a10/vr_native/20261015/`。系统已有编译扩展通过本地硬链接复用，不修改 Conda 的 editable 安装；测试与脚本优先导入本工作区代码。
-- 使用：先进入 `/home/robot/VLA/FluxVLA_vr`，激活 `fluxvla`，再运行 `python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview`。实际头显输入去掉 preview，并在配置中指定本机局域网 host_ip。详细说明见 `docs/a10_vr_operator.md`。
+- 使用：先进入 `/home/robot/VLA/FluxVLA_vr`，激活 `fluxvla`，再运行 `python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py --preview`。实际头显输入去掉 preview，并在配置中指定本机局域网 host_ip。详细说明见 `docs/a10_vr_operator.md`。
 - 本轮仅在 VR 分支统一提交一次中文 commit；下一轮先验收真实 VR 输入及现场位姿方向，再接入分段录制、保存/重录/续录与 HUD。
 
 
@@ -711,7 +711,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
   保留原生命令透传，同时将 jog 注册为内置命令；推理与VR不同时驱动同一机器人。
 - 本地文件处理：复制原 VR `vr_calibration.local.json` 及 `.bak` 到统一目录（目标此前不存在）；
   两个目录证书不同，原 VR 证书独立复制到 `work_dirs/a10/vr/tls_vr`，VR配置默认指向该目录。
-  主目录原 `work_dirs/a10/vr/tls` 及 `configs/a10/site.local.yaml` 不覆盖；私钥、标定和日志不纳入Git。
+  主目录原 `work_dirs/a10/vr/tls` 及 `configs/a10/a10_single_site.local.yaml` 不覆盖；私钥、标定和日志不纳入Git。
   `CLI.text` 作为本地命令文件复制到主目录，命令目录指向统一目录；原文件保留。
   用户压缩包、PDF、others目录、未跟踪的双臂检查文档及历史日志仍留在原VR目录，不删除或自动提交。
 - 文档更新：命令速查、VR说明、现场说明和结构指南统一工作目录与分支；历史迁移记录中的旧路径保留作证据。
@@ -729,7 +729,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 ### 2026-10-26：旧单臂 .125 与老夹爪 VR 链路
 
 - 范围按用户现场设备收窄为旧单臂A10、192.168.0.125和老USB夹爪，不接知行驱动。
-- 新增继承配置 `a10_vr_teleop_legacy_gripper.py`：复用原VR配置和老GripperOperator，
+- 新增继承配置 `a10_single_vr.py`：复用原VR配置和老GripperOperator，
   明确串口、1000000波特率、ID10、100mm标定/85mm软件行程、舵机速度800和0.1秒超时。
   默认VR-only不联网、不打开串口；启用真实控制仍需显式参数，旧机械臂独立配置继续可用。
 - 专用配置摇杆目标变化速度10mm/s，新增方向参数gripper_direction=±1；
@@ -748,7 +748,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 ### 2026-10-26：显式配置 VR 前端角加速度
 
 - 将原提交 `1c73d85` 的角加速度配置迁入正确的 `kaanh_follower` 分支。
-- 在 `configs/a10/a10_vr_teleop.py` 的 `reference_options` 中显式设置
+- 在 `configs/a10/a10_single_vr_base.py` 的 `reference_options` 中显式设置
   `max_angular_accel_rad_s2=1.5`，并注明单位及原算法默认值0.96，方便现场调整旋转加速、减速和换向响应。
 - 1.5为待实机验证的候选值；继承此项且未覆盖它的配置同步生效，命令行仍可覆盖。
 - 验证基础配置及老夹爪配置读取结果均为1.5，参数可构建ReferenceConfig；未连接机器人。
@@ -949,7 +949,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 在 `kaanh_follower` 实施本轮批准的录制核心范围。新增 `datasets/episode_writer.py`，
   复用旧采集的字段约定，不依赖 `projects/a10`；双臂/VR实时录制接线暂不在本轮。
 - 保留30Hz、7维实际状态（六关节rad+夹爪mm）、8维旧VR动作、两路RGB、任务及索引；
-  新增配置 `configs/a10/a10_record.py`。拒绝14维状态、缺图、非有限值等非法帧；模拟数据有独立标记。
+  新增配置 `configs/a10/a10_single_record.py`。拒绝14维状态、缺图、非有限值等非法帧；模拟数据有独立标记。
 - 后台有界视频队列，满队列/编码失败使本集失效，不能静默保存缺帧数据。
   支持开始、保存、丢弃、续录；临时集+校验提交清单+互斥锁处理保存中断。
   恢复仅支持本录制器契约一致的数据，未提交集归档，已开始提交的集按校验继续完成。
@@ -971,7 +971,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 - 用户逐只发送小范围位置指令，并现场确认 FTDI `DU0EMMMM` 对应左手柄所控臂的夹爪，
   CP2102N `5c9323064b6eef11a2c4e7c2c169b110` 对应右手柄所控臂的夹爪。
   当前节点分别为ttyUSB0/ttyUSB1，均为115200/8N1、独立串口上的Modbus ID 1。
-- 新增 `configs/a10/a10_devices.py`，按手柄/物理机械臂命名left/right，使用稳定by-id路径；
+- 新增 `configs/a10/a10_dual_devices.py`，按手柄/物理机械臂命名left/right，使用稳定by-id路径；
   与operator历史内部键分开说明：左手对应ee1/key right，右手对应ee0/key left。
   记录小范围验证参数speed=5%、torque=60%，不宣称完整行程或raw毫米标定完成。
 - 用户确认D405为独立外部场景相机。序列号255323070551，彩色流video-index4（当前video4），
@@ -1029,7 +1029,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
 
 - 新增scripts/a10_devices.py，默认仅使用Linux sysfs、稳定设备链接和V4L2格式查询，
   不依赖RealSense SDK，不打开视频流或夹爪串口；输出相机/串口转接器序列号、节点和配置匹配结果。
-- a10_devices.py补充identity信息，绑定用途、型号、序列号、USB接口及相机video index。
+- a10_dual_devices.py补充identity信息，绑定用途、型号、序列号、USB接口及相机video index。
   相机按序列号+接口+index匹配，明确排除深度或不可读节点；检测到by-id跨接口重名时选择by-path，
   外部D435i换插口后可重新发现彩色接口。型号为展示信息，不以节点编号推断物理左右。
 - --check-grippers可选打开已匹配串口，仅使用原ZXGripper.read_state查询配置的Modbus ID；
@@ -1167,7 +1167,7 @@ PYTHONPATH=test/test_runners:. A10_TEST_REAL_MODEL=1 python -m unittest \
   按要求将该组合写入a10_dual_arm_vr_teleop.py，后续启动无需重复四项命令覆盖。
   该记录来自用户实机反馈，范围为夹爪开合体验，不扩大为抓取任务或数据录制验收。
 - VR从共用设备清单复制两侧身份、串口、量程及力矩，并分别覆盖speed=15%；
-  a10_devices.py自身speed=5%不变，设备检查/校准继续使用低速。
+  a10_dual_devices.py自身speed=5%不变，设备检查/校准继续使用低速。
   保留VR-only及夹爪默认关闭开关，运行时需显式选择实机和开启夹爪。
 - 使用现有配置测试核对两侧15%、目标速率3000、领先量600及检查清单5%；
   VR知行22项和设备检查45项共67项通过，不带速度覆盖的实机配置preview通过。

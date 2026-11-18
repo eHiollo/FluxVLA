@@ -2,13 +2,16 @@
 
 **只想找运行命令：先看 [A10 常用命令速查](a10_command_cheatsheet.md)。** 本文保留功能说明与开发细节。
 
-## 双臂当前默认入口（2026-11-12）
+## 双臂当前默认入口
 
 ```bash
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py
 ```
 
-等同于显式打开实机、运动发送权限、两只知行夹爪和`--record-controller`。
+默认开启实机、运动发送权限和两只知行夹爪；控制器高频记录默认关闭，本地诊断开启。
+世界坐标平移、局部旋转、90Hz；侧键只控制平移，正常松键保持会话。
+机械臂参数与VR参数分别维护，见[配置索引](../configs/a10/README.md)和[世界坐标说明](a10_vr_world_translation.md)。
+旧双臂和世界坐标转接文件已删除，双臂参数统一修改 `a10_dual_vr.py`。
 启动仍不自动使能机械臂；侧键控制对应臂，摇杆X控制对应夹爪。
 `--preview`只检查配置；`teleop.vr_only=True`或`--observe`不继承默认控制器录制（`--observe --record-controller`可显式录制）。
 普通夹爪通信异常只暂停该夹爪，不退出整个VR。读取CRC错误最多重读2次，写回复错误不重发原动作；
@@ -17,7 +20,7 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
 
 ## 旧单臂与老 USB 夹爪
 
-使用 `configs/a10/a10_vr_teleop_legacy_gripper.py`，沿用 `a10_vr_teleop.py` 的机械臂/VR流程。
+使用 `configs/a10/a10_single_vr.py`，沿用 `a10_single_vr_base.py` 的机械臂/VR流程。
 默认仍为VR-only；真实操作显式设置 `vr_only=False` 和 `operator.allow_motion=True`。
 完整命令和参数见 [速查：旧单臂 .125 + 老夹爪 VR](a10_command_cheatsheet.md)。
 
@@ -32,14 +35,18 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
 停止更新目标不会立即取消最后一个舵机目标；退出不自动开爪、回零或掉使能。
 新知行夹爪保持独立驱动，后续另行接入。
 
-## 当前分支和工作目录
+## 下面的开发记录与历史参数
+
+以下保留原单臂说明及各阶段开发记录。历史双臂锚点、松键停止和默认高频记录等描述不代表当前默认值；当前双臂配置以文首链接为准。
+
+## 历史分支和工作目录
 
 2026-10-26 已整合到 `kaanh_follower`，统一工作目录 `/home/robot/VLA/FluxVLA`。
 原 `kaanh_follower_vr` 分支和 `/home/robot/VLA/FluxVLA_vr` 目录保留作回退。
 沿用 `fluxvla` Conda 环境。推理、控制台和 VR 使用各自配置；同一机器人不要同时运行推理与 VR。
 
 本机已保留原 VR 标定文件；原 VR 证书复制到 `work_dirs/a10/vr/tls_vr`，当前 VR 配置默认使用该目录。
-主目录原有 `work_dirs/a10/vr/tls` 证书和 `site.local.yaml` 未覆盖。标定仍需与现场 VR 会话、机器人匹配。
+主目录原有 `work_dirs/a10/vr/tls` 证书和 `a10_single_site.local.yaml` 未覆盖。标定仍需与现场 VR 会话、机器人匹配。
 
 **2026-10-19 更新：检查当前标定方向请优先使用下方的 `--verify-calibration` 网页。**
 现有单姿态标定的重建误差小，只能说明采样与计算一致，不能证明实际射线与夹爪方向正确。
@@ -54,7 +61,7 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
 ```bash
 conda activate fluxvla
 python scripts/teleoperate.py \
-  --config configs/a10/a10_vr_teleop.py \
+  --config configs/a10/a10_single_vr_base.py \
   --verify-calibration \
   --cfg-options \
     teleop.operator.host=192.168.0.125 \
@@ -136,16 +143,16 @@ reference 速度、加速度和跟踪误差保护生成目标；平移不必等�
 原方式无需修改。切换回原 reference 映射：
 
 ```bash
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py --preview \
   --cfg-options teleop.control_mode=reference teleop.pose_mapping=anchor_relative
 ```
 
-使用新方式前，需要补齐 `configs/a10/a10_vr_teleop.py` 的 `pose_calibration`。
+使用新方式前，需要补齐 `configs/a10/a10_single_vr_base.py` 的 `pose_calibration`。
 `hand_to_tool_quat_xyzw` 已复用旧局部轴映射作为默认值，只需确定现场的
 `vr_to_robot_quat_xyzw`。四元数顺序均为 `[x,y,z,w]`，范数必须为 1，然后检查：
 
 ```bash
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py --preview \
   --cfg-options teleop.control_mode=reference teleop.pose_mapping=calibrated_absolute
 ```
 
@@ -195,7 +202,7 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview \
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/teleoperate.py \
-  --config configs/a10/a10_vr_teleop.py \
+  --config configs/a10/a10_single_vr_base.py \
   --calibrate-pose \
   --cfg-options \
     teleop.operator.host=192.168.0.125 \
@@ -237,7 +244,7 @@ WebSocket 重连只恢复传输，不会重新创建 XR 会话。如果追踪空
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_vr_teleop.py --observe \
+  --config configs/a10/a10_single_vr_base.py --observe \
   --cfg-options \
     teleop.pose_mapping=calibrated_absolute \
     teleop.operator.host=192.168.0.125 \
@@ -307,7 +314,7 @@ fluxvla/engines/operators/
 │   └── web-ui/              # 输入网页、calibration.html 验证页及脚本样式
 └── a10_operator.py          # 现有控制器协议与状态接口
 scripts/teleoperate.py        # 配置加载和启动
-configs/a10/a10_vr_teleop.py   # 唯一原生 VR 配置入口
+configs/a10/a10_single_vr_base.py   # 唯一原生 VR 配置入口
 scripts/replay_vr_control.py  # 新增：不连接设备的参考目标回放
 ```
 
@@ -332,11 +339,11 @@ USB 夹爪由 runtime 单独持有并关闭，避免与 A10Operator 重复打开
 ```bash
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py --preview
 ```
 
 原生入口只加载上述 Python 配置，支持 MMEngine `--cfg-options`；
-不读取 `site.local.yaml`、`project.yaml` 或 `projects/a10/config.py`。
+不读取 `a10_single_site.local.yaml`、`a10_single_project.yaml` 或 `projects/a10/config.py`。
 现有环境已安装 `requirements-a10.txt` 中的依赖，网页证书在首次服务启动时创建。
 
 ## 2. 先验证头显输入（VR-only）
@@ -344,7 +351,7 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py --preview
 将下面 `YOUR_LAN_IP` 换成运行 FluxVLA 的电脑局域网地址：
 
 ```bash
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py \
   --cfg-options teleop.input.network.host_ip=YOUR_LAN_IP
 ```
 
@@ -356,7 +363,7 @@ python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py \
 
 ## 3. 连接机器人前填写现场配置
 
-在 `a10_vr_teleop.py` 中，或通过 `--cfg-options` 设置：
+在 `a10_single_vr_base.py` 中，或通过 `--cfg-options` 设置：
 
 | 参数 | 含义 |
 | --- | --- |
@@ -391,7 +398,7 @@ ReferenceConfig 的默认值本来就是线速度 0.12m/s、角速度 0.32rad/s�
 cd /home/robot/VLA/FluxVLA
 conda activate fluxvla
 python scripts/teleoperate.py \
-  --config configs/a10/a10_vr_teleop.py \
+  --config configs/a10/a10_single_vr_base.py \
   --cfg-options \
     teleop.vr_only=False \
     teleop.control_mode=reference \
@@ -504,7 +511,7 @@ PDF 中的空数组示例直接用于发送。启动锚点刷新规则与完整 
 
 ## 双臂 VR：独立锚点、reference 与 SDK 发送（2026-10-29）
 
-使用新配置 `configs/a10/a10_dual_arm_vr_teleop.py`，原单臂配置和用法保留。
+使用新配置 `configs/a10/a10_dual_vr.py`，原单臂配置和用法保留。
 用户已反馈 `.150` 双臂基础控制台实机验证通过；**双臂 VR 的 SDK 发送和模拟测试已完成，
 VR 实机验收仍待现场进行。** 配置继承 `a10_dual_arm_operator.py`，连接 `.150:5999`、UDP 9998，
 左右编号、GET 反馈行及目标行顺序须与现场设备一致，不自动识别或切换远端模型。
@@ -582,20 +589,20 @@ cd /home/robot/VLA/FluxVLA_follower
 conda activate fluxvla
 
 # 默认只读取双手 VR，不连接机器人、不生成虚构的机器人反馈。
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py
 
 # 仅构造配置，不启动网页或连接设备。
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --preview
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --preview
 
 # 只读反馈并计算目标，不启动或停止 follower，不发送 UDP。
-python scripts/teleoperate.py --config configs/a10/a10_dual_arm_vr_teleop.py --observe
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --observe
 ```
 
 机械臂已由现场人员使能且停止后，先退出占用 `.150:5999` 的控制台或其他客户端，再执行：
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --cfg-options \
     teleop.vr_only=False \
     teleop.observe_only=False \
@@ -727,7 +734,7 @@ max_lead_raw=600，现设为a10_dual_arm_vr_teleop.py默认值。VR仍需显式�
 
 ### 2026-11-11：双臂VR现场调参设为默认值
 
-`configs/a10/a10_dual_arm_vr_teleop.py` 已按用户指定固化本轮参数：控制器倍率70%，
+`configs/a10/a10_dual_vr.py` 已按用户指定固化本轮参数：控制器倍率70%，
 最大线/角速度0.17m/s、1.1rad/s，最大线/角加速度1.0m/s²、3.0rad/s²，
 平移/旋转跟随增益10、12，reference软领先预算0.03m、0.1rad（约5.7°）。
 本次仅保存参数，不代表新增的0.1rad预算已完成实机验收；停止查询超时另行处理。
@@ -736,7 +743,7 @@ max_lead_raw=600，现设为a10_dual_arm_vr_teleop.py默认值。VR仍需显式�
 
 ```bash
 python scripts/teleoperate.py \
-  --config configs/a10/a10_dual_arm_vr_teleop.py \
+  --config configs/a10/a10_dual_vr.py \
   --record-controller \
   --cfg-options \
     teleop.vr_only=False \

@@ -147,7 +147,8 @@ class LegacyVRGripperTest(unittest.TestCase):
         self.assertFalse(targets(self.serial))
 
     def test_gripper_io_duration_is_recorded(self):
-        rt,_=runtime([row(1,1),row(2,1)],gripper=self.gripper)
+        # Inspect each simulated control frame independently of the 10Hz default.
+        rt,_=runtime([row(1,1),row(2,1)],gripper=self.gripper,diagnostics_hz=90.)
         clock=Clock()
         with tempfile.TemporaryDirectory() as folder, patch('time.monotonic',clock.now):
             rt.diagnostics_path=str(Path(folder)/'vr.jsonl')

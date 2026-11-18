@@ -12,8 +12,8 @@ from typing import Any
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG = PROJECT_ROOT / 'configs/a10/project.yaml'
-DEFAULT_SITE = PROJECT_ROOT / 'configs/a10/site.local.yaml'
+DEFAULT_CONFIG = PROJECT_ROOT / 'configs/a10/a10_single_project.yaml'
+DEFAULT_SITE = PROJECT_ROOT / 'configs/a10/a10_single_site.local.yaml'
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

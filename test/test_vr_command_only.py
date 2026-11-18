@@ -176,7 +176,7 @@ class LiveProfileLoopbackTest(unittest.TestCase):
             native.motion_override = dual_motion()
             native.jog_vel = 70
             native.active, native.mode = True, 'Cart'
-            cfg = Config.fromfile(str(ROOT/'configs/a10/a10_dual_arm_vr_teleop_world_translation.py')).teleop
+            cfg = Config.fromfile(str(ROOT/'configs/a10/a10_dual_vr.py')).teleop
             cfg.zx_grippers.enabled = False
             cfg.diagnostics_path = None
             cfg.operator.update(host='127.0.0.1', ws_port=native.server.socket.getsockname()[1],
@@ -205,7 +205,7 @@ class LiveProfileLoopbackTest(unittest.TestCase):
             worker.start()
             runtime = None
             try:
-                cfg = Config.fromfile(str(ROOT/'configs/a10/a10_dual_arm_vr_teleop_world_translation.py')).teleop
+                cfg = Config.fromfile(str(ROOT/'configs/a10/a10_dual_vr.py')).teleop
                 cfg.zx_grippers.enabled = False  # No serial hardware in a loopback test.
                 cfg.diagnostics_path = None
                 cfg.operator.update(host='127.0.0.1', ws_port=ws_port, status_ws_port=ws_port,

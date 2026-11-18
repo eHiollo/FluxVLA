@@ -18,7 +18,7 @@ import test_vr_dual_runtime as dual
 
 ROOT = Path(__file__).resolve().parents[1]
 MODE = 'world_translation_local_rotation'
-PROFILE = 'configs/a10/a10_dual_arm_vr_teleop_world_translation.py'
+PROFILE = 'configs/a10/a10_dual_vr.py'
 
 
 def sample(seq, position, quat, *, active=True, age=0., trigger=0.):
@@ -133,17 +133,9 @@ class WorldTranslationTest(unittest.TestCase):
             self.assertLessEqual(np.linalg.norm(velocity - previous_velocity), config.max_linear_accel_m_s2 / 90. + 1e-12)
             previous_velocity = velocity
 
-    def test_profile_inherits_tuning_and_never_reads_calibration(self):
-        old = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
-        cfg = Config.fromfile(str(ROOT / PROFILE)).teleop
-        for key in old:
-            if key not in ('pose_mapping', 'pose_calibration_path', 'diagnostics_path', 'input', 'record_controller', 'confirm_stop', 'resilient_takeover', 'continuous_feedback', 'stop_on_both_release', 'operator'):
-                self.assertEqual(cfg[key], old[key], key)
-        self.assertEqual({k:v for k,v in cfg.input.items() if k not in ('mapping_by_hand', 'mapping')},
-                         {k:v for k,v in old.input.items() if k != 'mapping'})
+    def test_profile_never_reads_calibration(self):
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_vr.py')).teleop
         self.assertTrue(cfg.input.mapping.squeeze_translation_only)
-        self.assertEqual({k:v for k,v in cfg.input.mapping.items() if k != 'squeeze_translation_only'},
-                         dict(old.input.mapping))
         self.assertEqual(cfg.fps, 90)
         self.assertFalse(cfg.record_controller)
         self.assertFalse(cfg.confirm_stop)
@@ -151,10 +143,6 @@ class WorldTranslationTest(unittest.TestCase):
         self.assertFalse(cfg.continuous_feedback)
         self.assertFalse(cfg.stop_on_both_release)
         self.assertFalse(cfg.operator.shared_control.require_feedback)
-        self.assertEqual({k: v for k, v in cfg.operator.items() if k != 'shared_control'},
-                         {k: v for k, v in old.operator.items() if k != 'shared_control'})
-        self.assertEqual({k: v for k, v in cfg.operator.shared_control.items() if k != 'require_feedback'},
-                         dict(old.operator.shared_control))
         self.assertIsNone(cfg.pose_calibration_path)
         cfg.update(vr_only=True, record_controller=False)
         cfg.zx_grippers.enabled = False

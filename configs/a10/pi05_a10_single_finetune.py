@@ -1,4 +1,4 @@
-"""Native A10 PI0.5 training config; values come from project.yaml."""
+"""Native A10 PI0.5 training config; values come from a10_single_project.yaml."""
 
 _base_ = []  # Use mmengine's regular parser for this generated configuration.
 

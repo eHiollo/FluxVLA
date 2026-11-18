@@ -11,7 +11,7 @@ def main(argv=None):
     from mmengine import Config, DictAction
     from fluxvla.engines.operators.vr.sandbox import build_sandbox
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', default=str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop_world_translation.py'))
+    parser.add_argument('--config', default=str(ROOT / 'configs/a10/a10_dual_vr.py'))
     parser.add_argument('--cfg-options', nargs='+', action=DictAction)
     parser.add_argument('--preview', action='store_true', help='只验证配置，不启动输入服务')
     args = parser.parse_args(argv)

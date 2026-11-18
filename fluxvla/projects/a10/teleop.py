@@ -2,7 +2,7 @@
 
 
 def main():
-    raise SystemExit('VR 入口已迁移：python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py')
+    raise SystemExit('VR 入口已迁移：python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py')
 
 
 if __name__ == '__main__':

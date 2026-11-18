@@ -57,7 +57,7 @@ def main(argv=None):
         cfg.merge_from_dict(args.cfg_options)
     if cfg.teleop.input.get('arm') == 'both' and (
             args.calibrate_pose or args.verify_calibration or args.pose_calibration):
-        parser.error('双臂模式本轮仅支持锚点相对控制，未开放双臂标定或标定验证界面')
+        parser.error('双臂模式未开放姿态标定或标定验证界面')
     if args.record_controller:
         if args.calibrate_pose or args.verify_calibration or args.inspect_controller:
             parser.error('--record-controller 仅用于遥操作或 --observe')
@@ -110,6 +110,10 @@ def main(argv=None):
         return 0
     if args.observe:
         cfg.teleop.update(vr_only=False, observe_only=True, control_mode='reference')
+        if cfg.teleop.input.get('arm') == 'both':
+            # Observation computes targets from real feedback, even when live
+            # world-translation control uses only the last sent reference.
+            cfg.teleop.continuous_feedback = True
     if (args.observe or args.check_record_buttons or cfg.teleop.get('vr_only', True)) and not args.record_controller:
         # Explicit observation/input-only modes do not inherit live recording.
         cfg.teleop.record_controller = False

@@ -1,6 +1,6 @@
 """Native FluxVLA dual-fold model server and dual follower client configuration."""
 
-_base_ = ["./a10_dual_arm_operator.py", "./a10_devices.py"]
+_base_ = ["./a10_dual_arm_operator.py", "./a10_dual_devices.py"]
 import os
 from pathlib import Path
 

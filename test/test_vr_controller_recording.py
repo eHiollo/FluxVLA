@@ -175,7 +175,7 @@ class RecorderRuntimeTest(unittest.TestCase):
         from scripts.teleoperate import main
         with patch('socket.socket', side_effect=AssertionError('preview opened a socket')):
             with redirect_stdout(io.StringIO()) as printed:
-                code = main(['--config', str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py'),
+                code = main(['--config', str(ROOT / 'configs/a10/a10_dual_vr.py'),
                              '--observe', '--record-controller', '--preview'])
         self.assertEqual(code, 0)
         self.assertIn('record_controller=True', printed.getvalue())
@@ -196,7 +196,7 @@ class RecorderRuntimeTest(unittest.TestCase):
             with self.assertRaises(socket.timeout): server.udp.recv(1024)
 
     def test_record_flag_requires_feedback_and_local_diagnostics(self):
-        cfg = Config.fromfile(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py').teleop
+        cfg = Config.fromfile(ROOT / 'configs/a10/a10_dual_vr.py').teleop
         cfg.record_controller = True
         cfg.vr_only = True
         with self.assertRaisesRegex(ValueError, 'live/observe'): build_runtime(cfg)

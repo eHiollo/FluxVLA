@@ -329,7 +329,7 @@ def main(argv=None):
     parser.add_argument('--vr-ip', required=True, help='头显IPv4地址；不是机器人控制器IP')
     parser.add_argument('--duration', type=float, default=120., help='追踪正常后测量秒数，默认120')
     parser.add_argument('--wait-timeout', type=float, default=90., help='等待头显追踪的最长秒数')
-    parser.add_argument('--config', type=Path, default=ROOT/'configs/a10/a10_dual_arm_vr_teleop.py')
+    parser.add_argument('--config', type=Path, default=ROOT/'configs/a10/a10_dual_vr.py')
     parser.add_argument('--record-config', type=Path, default=ROOT/'configs/a10/a10_dual_arm_record.py')
     parser.add_argument('--output', type=Path, default=ROOT/'work_dirs/a10/vr/network_checks')
     parser.add_argument('--interface', help='默认按头显IP自动选择Thor网卡')

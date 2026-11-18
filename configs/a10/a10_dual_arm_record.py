@@ -1,9 +1,9 @@
 """双臂录制配置：由 teleoperate.py --record-config 加载；单独加载不连接设备。
 
 物理左臂 ID1、右臂 ID0；状态为左右各6关节(rad)+实测夹爪闭合比例。
-设备身份从 a10_devices.py 继承；USB路径变化不改变数据字段/身份约定。
+设备身份从 a10_dual_devices.py 继承；USB路径变化不改变数据字段/身份约定。
 """
-_base_ = ['./a10_devices.py']
+_base_ = ['./a10_dual_devices.py']
 
 record = dict(
     backend='lerobot',  # 原工具链的 LeRobotDataset：add_frame/save_episode/clear_episode_buffer。

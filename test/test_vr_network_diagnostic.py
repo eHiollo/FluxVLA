@@ -112,7 +112,7 @@ class StandaloneTests(unittest.TestCase):
     def test_live_default_config_is_forced_to_input_only_without_instantiating_hardware(self):
         with tempfile.TemporaryDirectory() as tmp, patch(
                 'fluxvla.engines.operators.a10_operator.A10Operator.connect') as connect:
-            runtime = make_runtime(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py',
+            runtime = make_runtime(ROOT/'configs/a10/a10_dual_vr.py',
                                    ROOT/'configs/a10/a10_dual_arm_record.py',Path(tmp))
             self.assertIsNone(runtime.robot)
             self.assertFalse(runtime.execute)

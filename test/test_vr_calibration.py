@@ -66,7 +66,7 @@ class Robot:
 
 class CalibrationTest(unittest.TestCase):
     def config(self):
-        cfg = Config.fromfile(ROOT / 'configs/a10/a10_vr_teleop.py').teleop
+        cfg = Config.fromfile(ROOT / 'configs/a10/a10_single_vr_base.py').teleop
         cfg.operator.feedback_position_unit = 'mm'
         return cfg
 
@@ -172,7 +172,7 @@ class CalibrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, \
              patch('fluxvla.engines.operators.a10_operator.A10Operator.connect', side_effect=AssertionError('connected')):
             path = Path(temporary) / 'new.json'
-            result = main(['--config', str(ROOT / 'configs/a10/a10_vr_teleop.py'),
+            result = main(['--config', str(ROOT / 'configs/a10/a10_single_vr_base.py'),
                            '--calibrate-pose', '--preview', '--pose-calibration', str(path),
                            '--cfg-options', 'teleop.operator.feedback_position_unit=mm',
                            'teleop.pose_mapping=calibrated_absolute'])

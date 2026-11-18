@@ -104,7 +104,7 @@ def _doctor(cfg: dict) -> int:
           f'（WebSocket 端口 {network["websocket_port"]}，doctor 不启动服务）')
     if network['host_ip'] in {'127.0.0.1', 'localhost', '::1'}:
         print('待配置  VR 当前仅监听本机，头显无法通过局域网访问；'
-              '请在 site.local.yaml 中将 vr_server.host_ip 设为本机局域网地址。')
+              '请在 a10_single_site.local.yaml 中将 vr_server.host_ip 设为本机局域网地址。')
     print(f'配置 SHA256：{fingerprint(cfg)}')
     print('基础模型：' + (str(cfg['model']['base_checkpoint'])
                       if cfg['model']['base_checkpoint'] else '尚未指定'))
@@ -195,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
                         name='check-hardware', execute=args.execute, env=env)
         if args.command == 'teleop':
             if args.execute and not args.vr_only and not cfg['robot']['allow_motion']:
-                raise ValueError('Set robot.allow_motion=true in site.local.yaml')
+                raise ValueError('Set robot.allow_motion=true in a10_single_site.local.yaml')
             command = [flux_python, '-m', 'fluxvla.projects.a10.teleop']
             if args.vr_only:
                 command.append('--vr-only')
@@ -210,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                     f'{root} already contains a dataset; use --resume or '
                     'choose a new --root')
             if args.execute and not args.simulate and not cfg['robot']['allow_motion']:
-                raise ValueError('Set robot.allow_motion=true in site.local.yaml')
+                raise ValueError('Set robot.allow_motion=true in a10_single_site.local.yaml')
             return _run(_record_command(cfg, args),
                         cwd=PROJECT_ROOT, cfg=cfg,
                         name='record', execute=args.execute, env=env)
@@ -241,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                        '--standalone', '--nnodes=1', '--nproc-per-node=1',
                        str(PROJECT_ROOT / 'scripts/train.py'),
                        '--config', str(PROJECT_ROOT /
-                                       'configs/a10/pi05_a10_finetune.py'),
+                                       'configs/a10/pi05_a10_single_finetune.py'),
                        '--work-dir', work_dir]
             if args.resume_from:
                 command += ['--resume-from', args.resume_from]
@@ -269,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                         name='replay', execute=args.execute, env=env)
         if args.command == 'infer':
             if args.execute and not cfg['robot']['allow_motion']:
-                raise ValueError('Set robot.allow_motion=true in site.local.yaml')
+                raise ValueError('Set robot.allow_motion=true in a10_single_site.local.yaml')
             cycles = (cfg['inference']['max_cycles'] if args.cycles is None
                       else args.cycles)
             if cycles < 0:

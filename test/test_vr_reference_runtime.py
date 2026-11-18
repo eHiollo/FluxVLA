@@ -88,7 +88,7 @@ class ReferenceRuntimeTest(unittest.TestCase):
         self.assertNotIn(('start', 'cartesian'), robot.events)
 
     def test_new_mapping_requires_reference_and_explicit_calibration_in_preview(self):
-        cfg = Config.fromfile(ROOT / 'configs/a10/a10_vr_teleop.py')
+        cfg = Config.fromfile(ROOT / 'configs/a10/a10_single_vr_base.py')
         cfg.teleop.pose_calibration_path = None  # Never depend on a user's ignored site calibration.
         old = build_runtime(cfg.teleop)
         self.assertEqual(old.pose_mapping, 'anchor_relative')
@@ -252,7 +252,7 @@ class ReferenceRuntimeTest(unittest.TestCase):
         mapper.motion_shaping_mode = 'lerobot_a1'
         with self.assertRaisesRegex(ValueError, 'shaping bypass'):
             VRTeleopRuntime(FakeVR([]), mapper, control_mode='reference')
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_vr_teleop.py')).teleop
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_single_vr_base.py')).teleop
         cfg.update(vr_only=False, observe_only=True, control_mode='reference')
         cfg.operator.feedback_position_unit = 'mm'
         cfg.operator.allow_motion = True  # Builder must force this OFF for observation.
@@ -361,7 +361,7 @@ class ReferenceRuntimeTest(unittest.TestCase):
 class ReadOnlyProtocolTest(unittest.TestCase):
     def test_observe_cli_preview_does_not_connect_devices(self):
         result = subprocess.run([sys.executable, str(ROOT / 'scripts/teleoperate.py'),
-                                 '--config', str(ROOT / 'configs/a10/a10_vr_teleop.py'),
+                                 '--config', str(ROOT / 'configs/a10/a10_single_vr_base.py'),
                                  '--observe', '--preview', '--cfg-options',
                                  'teleop.operator.feedback_position_unit=mm',
                                  'teleop.operator.allow_motion=True'],

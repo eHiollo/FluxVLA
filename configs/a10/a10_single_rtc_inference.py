@@ -1,7 +1,7 @@
 """Native A10 RTC-trained 50k checkpoint; plain PyTorch by default.
 
 Server: python -m fluxvla.engines.runners.serving.serve --config
-configs/a10/a10_rtc_inference.py --from-config --dtype fp32 --acceleration off
+configs/a10/a10_single_rtc_inference.py --from-config --dtype fp32 --acceleration off
 This switches trained weights, not the synchronous runner to async RTC.
 """
 
@@ -31,7 +31,7 @@ for _key in ('projector', 'action_in_proj', 'action_out_proj', 'time_mlp_in', 't
 inference_model_accelerated = dict(type='NativeA10Policy', checkpoint_dir=_checkpoint,
                                    model_config=_accelerated_architecture)
 _stats = str(Path(_checkpoint) / 'dataset_statistics.json')
-inference = Config.fromfile(str(_root / 'configs/a10/a10_remote_inference.py')).inference.to_dict()
+inference = Config.fromfile(str(_root / 'configs/a10/a10_single_remote_inference.py')).inference.to_dict()
 inference.pop('remote_inference')
 inference.update(model_from_config=True, task_suite_name='a10',
                  instruction=_export['_TASK'],

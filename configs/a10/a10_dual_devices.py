@@ -4,9 +4,12 @@ left/right 按手柄和物理机械臂命名，不是 A10Operator 的内部字�
 左手柄 -> 物理左臂 -> ee_id=1（operator key: right）；右手柄相反。
 夹爪 device_id 是各自串口上的 Modbus 地址，与机械臂 ee_id 无关。
 
-本文件仅登记设备；当前 teleoperate.py 不会自动加载它，也不启用运动。
+本文件仅登记设备，不启用运动；a10_dual_vr.py、双臂录制及推理配置显式继承本清单。
 旧单臂/老夹爪配置继续单独使用，不能把知行 raw 位置当成旧夹爪毫米值。
 """
+
+from pathlib import Path
+_preset_dir = Path('{{fileDirname}}')
 
 # 逐台拔线/换接已验证接口确认腕部归属：
 # 左腕 D405 255323070485；右腕 D405 255323070551。
@@ -17,9 +20,6 @@ left/right 按手柄和物理机械臂命名，不是 A10Operator 的内部字�
 # 外部相机换口后运行 python scripts/a10_devices.py --update，按序列号找回彩色接口。
 # 三路同时读取各95帧，640x480 RGB / 约30Hz；未启用深度、IMU或硬件同步。
 # rotate_180=False 保留原始画面方向，安装方向待现场预览确认。
-from pathlib import Path
-_preset_dir = Path('{{fileDirname}}')
-
 cameras = dict(
     base_0_rgb=dict(
         identity=dict(model='D435i', serial='262923065199', usb_interface='03', video_index=0),

@@ -5,7 +5,7 @@ operator.allow_motion=True. Construction/preview never opens the serial port.
 Do not run inference or another gripper program on the same USB port.
 """
 
-_base_ = ['./a10_vr_teleop.py']
+_base_ = ['./a10_single_vr_base.py']
 
 teleop = dict(
     gripper_speed_mm_s=10.,  # Thumbstick target rate, distinct from servo speed.

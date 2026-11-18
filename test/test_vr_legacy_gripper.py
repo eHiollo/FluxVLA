@@ -13,7 +13,7 @@ from test_gripper_operator import FakeSerial
 from test_vr_reference_runtime import Clock, runtime, sample
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / 'configs/a10/a10_vr_teleop_legacy_gripper.py'
+CONFIG = ROOT / 'configs/a10/a10_single_vr.py'
 
 
 def row(sequence, velocity, *, active=False, age=0.):

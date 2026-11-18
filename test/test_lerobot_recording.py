@@ -89,7 +89,7 @@ class NativeWriterTests(unittest.TestCase):
     def test_recording_entrypoint_selects_spawn_before_runtime_construction(self):
         from scripts.teleoperate import main
         root = Path(__file__).resolve().parents[1]
-        args = ['--config', str(root/'configs/a10/a10_dual_arm_vr_teleop_world_translation.py'),
+        args = ['--config', str(root/'configs/a10/a10_dual_vr.py'),
                 '--record-config', str(root/'configs/a10/a10_dual_arm_record.py')]
         class ConstructionReached(Exception): pass
         for flags, configure in (([], True), (['--preview'], False), (['--check-record-buttons'], False)):

@@ -27,7 +27,7 @@ class A10InitMotionTest(unittest.TestCase):
     def test_robot_init_position_right_id_zero_and_instance_independence(self):
         root = Path(__file__).resolve().parents[1]
         dual = runpy.run_path(str(root / 'configs/a10/a10_dual_arm_operator.py'))['operator']
-        single = runpy.run_path(str(root / 'configs/a10/a10_operator.py'))['operator']
+        single = runpy.run_path(str(root / 'configs/a10/a10_single_operator.py'))['operator']
         a = A10Operator('127.0.0.1', arms=RIGHT_FIRST_ARMS,
                         cartesian_target_order=['right', 'left'], init_position=dual['init_position'])
         b = A10Operator('127.0.0.1', init_position=single['init_position'])

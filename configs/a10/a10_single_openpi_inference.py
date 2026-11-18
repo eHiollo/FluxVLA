@@ -1,11 +1,11 @@
 """A10 OpenPI 40000 inference defaults to plain PyTorch FP32; select --acceleration on for Triton/CUDA Graph.
 
 Local inference:
-  python scripts/inference.py --config configs/a10/a10_openpi_inference.py
+  python scripts/inference.py --config configs/a10/a10_single_openpi_inference.py
 Model server only (no robot connection):
   python -m fluxvla.engines.runners.serving.serve \
-    --config configs/a10/a10_openpi_inference.py --from-config --dtype fp32 --acceleration off
-Then use a10_remote_inference.py on the robot side.
+    --config configs/a10/a10_single_openpi_inference.py --from-config --dtype fp32 --acceleration off
+Then use a10_single_remote_inference.py on the robot side.
 Set A10_OPENPI_CHECKPOINT / A10_OPENPI_TOKENIZER to override local paths.
 """
 

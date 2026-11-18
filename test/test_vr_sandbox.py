@@ -270,7 +270,7 @@ class SandboxIsolationTest(unittest.TestCase):
                              ('https://192.168.0.111:8443/vr-sandbox.html', ['https://192.168.0.111:8443/']))
 
     def test_live_profile_cannot_construct_hardware_or_read_calibration(self):
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop_world_translation.py')).teleop
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_vr.py')).teleop
         cfg.pose_calibration_path = '/not-present/calibration.json'
         with patch('fluxvla.engines.operators.a10_operator.A10Operator.__init__', side_effect=AssertionError('Robot constructed')), \
              patch('fluxvla.engines.operators.vr.runtime.build_runtime', side_effect=AssertionError('Runtime constructed')), \

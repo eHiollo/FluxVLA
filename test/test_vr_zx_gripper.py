@@ -31,7 +31,7 @@ def options():
 
 
 def device(side='left'):
-    return Config.fromfile(str(ROOT / 'configs/a10/a10_devices.py')).grippers[side].to_dict()
+    return Config.fromfile(str(ROOT / 'configs/a10/a10_dual_devices.py')).grippers[side].to_dict()
 
 
 class SerialTimeoutConfigTest(unittest.TestCase):
@@ -358,14 +358,14 @@ class DualZXRuntimeTest(unittest.TestCase):
         self.addCleanup(self.logs.cleanup)
 
     def test_live_defaults_and_input_only_preview_never_open_usb(self):
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_vr.py')).teleop
         self.assertTrue(cfg.zx_grippers.enabled)
         self.assertFalse(cfg.vr_only)
         self.assertFalse(cfg.observe_only)
-        self.assertTrue(cfg.record_controller)
+        self.assertFalse(cfg.record_controller)
         self.assertTrue(cfg.operator.allow_motion)
-        self.assertEqual(cfg.zx_grippers.target_rate_raw_s, 3000.)
-        self.assertEqual(cfg.zx_grippers.max_lead_raw, 600.)
+        self.assertEqual(cfg.zx_grippers.target_rate_raw_s, 4500.)
+        self.assertEqual(cfg.zx_grippers.max_lead_raw, 900.)
         for side in ('left', 'right'):
             self.assertEqual(cfg.zx_grippers.devices[side].speed, 50)
             self.assertEqual(device(side)['speed'], 5)
@@ -391,9 +391,9 @@ class DualZXRuntimeTest(unittest.TestCase):
                 patch('serial.Serial', side_effect=AssertionError('USB IO')), \
                 patch('subprocess.Popen', side_effect=AssertionError('service startup')), \
                 contextlib.redirect_stdout(output):
-            self.assertEqual(main(['--config', str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py'), '--preview']), 0)
+            self.assertEqual(main(['--config', str(ROOT / 'configs/a10/a10_dual_vr.py'), '--preview']), 0)
         self.assertIn('vr_only=False', output.getvalue())
-        self.assertIn('record_controller=True', output.getvalue())
+        self.assertIn('record_controller=False', output.getvalue())
         self.assertIn('zx_grippers=True', output.getvalue())
 
     def test_input_only_and_observe_overrides_do_not_inherit_recording(self):
@@ -405,9 +405,12 @@ class DualZXRuntimeTest(unittest.TestCase):
             with patch('socket.socket', side_effect=AssertionError('network IO')), \
                     patch('serial.Serial', side_effect=AssertionError('USB IO')), \
                     contextlib.redirect_stdout(output):
-                self.assertEqual(main(['--config', str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py'),
+                self.assertEqual(main(['--config', str(ROOT / 'configs/a10/a10_dual_vr.py'),
                                        '--preview', *args]), 0)
             self.assertIn('record_controller=False', output.getvalue())
+            if '--observe' in args:
+                self.assertIn('observe_only=True', output.getvalue())
+                self.assertIn('continuous_feedback=True', output.getvalue())
 
     def test_opt_in_observe_does_not_construct_active_channels(self):
         cfg = configuration(); cfg.zx_grippers.enabled = True

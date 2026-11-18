@@ -1,6 +1,6 @@
 """Requires the joint/camera-capable A10Operator implementation.
 
-python scripts/inference.py --config configs/a10/a10_remote_inference.py
+python scripts/inference.py --config configs/a10/a10_single_remote_inference.py
 
 Use a FluxVLA ZMQ A10 server returning absolute [T,7] rad/mm targets.
 Configure the operator's real camera/feedback settings before running.

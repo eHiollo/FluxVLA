@@ -66,7 +66,7 @@ class CalibrationViewTest(unittest.TestCase):
         return CalibrationView(vr, robot, calibration or CALIBRATION, {'test': True})
 
     def config(self):
-        cfg = Config.fromfile(ROOT / 'configs/a10/a10_vr_teleop.py').teleop
+        cfg = Config.fromfile(ROOT / 'configs/a10/a10_single_vr_base.py').teleop
         cfg.operator.feedback_position_unit = 'mm'
         cfg.pose_calibration = copy.deepcopy(CALIBRATION)
         return cfg
@@ -226,7 +226,7 @@ class CalibrationViewTest(unittest.TestCase):
 
     def test_cli_preview_and_mode_exclusion(self):
         cmd = [sys.executable, str(ROOT / 'scripts/teleoperate.py'), '--config',
-               str(ROOT / 'configs/a10/a10_vr_teleop.py'), '--verify-calibration', '--preview']
+               str(ROOT / 'configs/a10/a10_single_vr_base.py'), '--verify-calibration', '--preview']
         options = ['--cfg-options', 'teleop.operator.host=192.0.2.1',
                    'teleop.operator.feedback_position_unit=mm',
                    'teleop.pose_calibration.vr_to_robot_quat_xyzw=[0,0,0,1]']

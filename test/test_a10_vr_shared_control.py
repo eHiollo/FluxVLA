@@ -9,7 +9,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mmengine import Config
 
 from fluxvla.engines.communication.a10_shared_connection import ControlTransferredError
 from fluxvla.engines.communication.a10_shared_server import SharedControl, SharedControlServer
@@ -17,7 +16,7 @@ from fluxvla.engines.operators.a10_operator import A10Operator
 from fluxvla.engines.operators.vr.runtime import build_runtime
 from scripts.a10_control import A10Console, main, parse_command
 from test_a10_operator import FakeController, DUAL_ARMS, dual_motion, status_reply
-from test_vr_dual_runtime import HandInput, hand
+from test_vr_dual_runtime import HandInput, hand, configuration
 from test_vr_controller_recording import reply as recording_reply
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,7 +136,7 @@ class DualSharedIntegrationTest(unittest.TestCase):
         return op
 
     def runtime(self, **overrides):
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
+        cfg = configuration()  # Explicit legacy feedback/stop lifecycle under test.
         cfg.vr_only = False
         cfg.record_controller = False
         cfg.zx_grippers.enabled = False

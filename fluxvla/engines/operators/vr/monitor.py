@@ -276,7 +276,7 @@ class VRMonitorBridge:
             print(f'FluxVLA VR: https://{host}:{self.config.https_port}', flush=True)
             if host in {'127.0.0.1', 'localhost', '::1'}:
                 print('VR 当前仅监听本机，头显无法通过局域网访问。'
-                      '请在 configs/a10/site.local.yaml 中将 vr_server.host_ip '
+                      '请在 configs/a10/a10_single_site.local.yaml 中将 vr_server.host_ip '
                       '设为本机局域网地址，然后重启服务。', flush=True)
             print(f'VR 输入连接：wss://{host}:{self.config.websocket_port}；'
                   '首次访问本平台需要信任本平台的本地证书。', flush=True)

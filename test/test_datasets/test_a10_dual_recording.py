@@ -170,7 +170,7 @@ class DualRecordingTest(unittest.TestCase):
         from mmengine import Config
         root=Path(__file__).resolve().parents[2]
         cfg=Config.fromfile(str(root/'configs/a10/a10_dual_arm_record.py'))
-        devices=Config.fromfile(str(root/'configs/a10/a10_devices.py'))
+        devices=Config.fromfile(str(root/'configs/a10/a10_dual_devices.py'))
         record=cfg.record.to_dict(); record.update(root=str(self.root),synthetic=True)
         for name in SPEC.cameras:
             self.assertEqual(record['cameras'][name]['identity'],devices.cameras[name].identity)

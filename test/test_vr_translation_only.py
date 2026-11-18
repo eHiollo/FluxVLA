@@ -146,7 +146,7 @@ class IndependentHandsTest(unittest.TestCase):
 ROOT = Path(__file__).resolve().parents[1]
 
 
-PROFILE = 'configs/a10/a10_dual_arm_vr_teleop_world_translation.py'
+PROFILE = 'configs/a10/a10_dual_vr.py'
 
 
 class DualTriggerInputTest(unittest.TestCase):

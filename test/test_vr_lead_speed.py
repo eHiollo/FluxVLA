@@ -208,7 +208,7 @@ class SpeedTest(unittest.TestCase):
         with patch.object(robot, 'get_speed_override', create=True) as getter:
             rt.connect(); rt.close()
             getter.assert_not_called()
-        cfg = Config.fromfile('configs/a10/a10_vr_teleop.py').teleop
+        cfg = Config.fromfile('configs/a10/a10_single_vr_base.py').teleop
         cfg.controller_speed_percent = 25
         rt = build_runtime(cfg)
         self.assertFalse(rt._connected)

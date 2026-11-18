@@ -1,6 +1,6 @@
 """Dual A10 follower using the native OpenPI server; preview by default."""
 
-_base_ = ["./a10_dual_arm_operator.py", "./a10_devices.py"]
+_base_ = ["./a10_dual_arm_operator.py", "./a10_dual_devices.py"]
 inference = dict(
     type="A10DualInferenceRunner",
     mode="preview",

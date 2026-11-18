@@ -29,7 +29,7 @@ def _statistics_path(checkpoint: Path, configured: str | None) -> Path:
             return path
     raise FileNotFoundError(
         'dataset_statistics.json not found beside or above checkpoint; '
-        'set model.statistics_path in site.local.yaml')
+        'set model.statistics_path in a10_single_site.local.yaml')
 
 
 def main() -> int:
@@ -43,7 +43,7 @@ def main() -> int:
         raise FileNotFoundError(checkpoint)
     statistics = _statistics_path(checkpoint, cfg['model']['statistics_path'])
     model_cfg = Config.fromfile(str(PROJECT_ROOT /
-                                    'configs/a10/pi05_a10_finetune.py'))
+                                    'configs/a10/pi05_a10_single_finetune.py'))
     model = build_vla_from_cfg(model_cfg.inference_model)
     if checkpoint.suffix == '.safetensors':
         state = load_file(str(checkpoint), device='cpu')

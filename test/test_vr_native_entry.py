@@ -15,7 +15,7 @@ from fluxvla.engines.operators.vr.runtime import build_runtime, VRTeleopRuntime
 from test_vr_operator import FakeVR, FakeMapper, FakeGripper, action
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = ROOT / 'configs/a10/a10_vr_teleop.py'
+CONFIG = ROOT / 'configs/a10/a10_single_vr_base.py'
 
 
 class NativeEntryTest(unittest.TestCase):
@@ -101,7 +101,7 @@ class BlockProjects(importlib.abc.MetaPathFinder):
         if fullname == 'fluxvla.projects' or fullname.startswith('fluxvla.projects.'):
             raise AssertionError('Legacy project imported: ' + fullname)
 sys.meta_path.insert(0, BlockProjects())
-sys.argv = ['scripts/teleoperate.py', '--config', 'configs/a10/a10_vr_teleop.py',
+sys.argv = ['scripts/teleoperate.py', '--config', 'configs/a10/a10_single_vr_base.py',
             '--cfg-options', 'teleop.input.network.host_ip=127.0.0.1', '--preview']
 runpy.run_path('scripts/teleoperate.py', run_name='__main__')
 """

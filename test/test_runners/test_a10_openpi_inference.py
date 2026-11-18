@@ -55,7 +55,7 @@ class A10OpenPITest(unittest.TestCase):
 
     def test_acceleration_selection_preserves_checkpoint_and_input_contract(self):
         from fluxvla.engines.utils.inference_config import select_inference_acceleration
-        path = str(ROOT / 'configs/a10/a10_openpi_inference.py')
+        path = str(ROOT / 'configs/a10/a10_single_openpi_inference.py')
         plain = Config.fromfile(path)
         accelerated = Config.fromfile(path)
         select_inference_acceleration(plain, 'off')
@@ -68,7 +68,7 @@ class A10OpenPITest(unittest.TestCase):
         self.assertEqual(plain.inference.dataset, accelerated.inference.dataset)
         self.assertEqual(plain.inference.denormalize_action, accelerated.inference.denormalize_action)
         for mode in ('on', 'off'):
-            remote = Config.fromfile(str(ROOT / 'configs/a10/a10_remote_inference.py'))
+            remote = Config.fromfile(str(ROOT / 'configs/a10/a10_single_remote_inference.py'))
             with self.assertRaisesRegex(ValueError, 'model server'):
                 select_inference_acceleration(remote, mode)
         with self.assertRaisesRegex(ValueError, 'does not declare'):
@@ -173,7 +173,7 @@ class A10OpenPITest(unittest.TestCase):
 
     @unittest.skipUnless((OPENPI / 'src/openpi/transforms.py').exists(), 'OpenPI reference absent')
     def test_matches_actual_openpi_transforms_and_tokenizer(self):
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_openpi_inference.py'))
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_single_openpi_inference.py'))
         if not Path(cfg.inference.dataset.tokenizer_path).exists():
             self.skipTest('Original tokenizer absent')
         dataset = build_dataset_from_cfg(cfg.inference.dataset)
@@ -207,7 +207,7 @@ class A10OpenPITest(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('A10_TEST_REAL_MODEL') == '1', 'Opt-in real GPU model test')
     def test_real_checkpoint_forward_and_service(self):
         from fluxvla.engines.runners.serving.zmq_server import create_server
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_openpi_inference.py'))
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_single_openpi_inference.py'))
         dataset = build_dataset_from_cfg(cfg.inference.dataset)
         denorm = build_transform_from_cfg(cfg.inference.denormalize_action)
         model = build_vla_from_cfg(cfg.inference_model)

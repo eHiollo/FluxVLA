@@ -1,6 +1,6 @@
 """Native VR-only defaults. Confirm feedback units before live operation.
 
-python scripts/teleoperate.py --config configs/a10/a10_vr_teleop.py
+python scripts/teleoperate.py --config configs/a10/a10_single_vr_base.py
 Override parameters with --cfg-options teleop.input.network.host_ip=YOUR_LAN_IP.
 No site YAML or projects/a10 import is used. No automatic motor enable/homing.
 """
@@ -72,7 +72,7 @@ teleop = dict(
                   cartesian_wire_format='pe321',
                   feedback_position_unit=None,
                   # Single .125 arm + old USB gripper: use the child config
-                  # a10_vr_teleop_legacy_gripper.py. Defaults here stay arm-only.
+                  # a10_single_vr.py. Defaults here stay arm-only.
                   gripper_transport='controller'),
     # Fixed per-frame bounds apply only to legacy delta mode. Reference mode
     # ignores these and uses reference_options speed/acceleration with actual dt.

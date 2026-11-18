@@ -520,7 +520,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
                                      epilog='例如：--config configs/a10/a10_dual_arm_operator.py（默认进入 shell 并允许控制）',
                                      allow_abbrev=False)
     parser.add_argument('--config', type=Path,
-                        help='机器人配置；默认 configs/a10/a10_operator.py，双臂使用 a10_dual_arm_operator.py')
+                        help='机器人配置；默认 configs/a10/a10_single_operator.py，双臂使用 a10_dual_arm_operator.py')
     parser.add_argument('--host', help='工控机 IP 或主机名；也可由 --config 提供')
     parser.add_argument('--ws-port', type=int)
     parser.add_argument('--udp-port', type=int)
@@ -567,7 +567,7 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
             from fluxvla.engines.operators.a10_operator import A10Operator
             operator_factory = A10Operator
         from mmengine import Config
-        config_path = args.config or Path(__file__).resolve().parents[1] / 'configs/a10/a10_operator.py'
+        config_path = args.config or Path(__file__).resolve().parents[1] / 'configs/a10/a10_single_operator.py'
         settings = dict(Config.fromfile(str(config_path))['operator'])
         if settings.pop('type', 'A10Operator') != 'A10Operator':
             raise CommandError('控制台配置必须使用 A10Operator')

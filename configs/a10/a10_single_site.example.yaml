@@ -1,4 +1,4 @@
-# Copy to site.local.yaml and replace the addresses and camera placeholders.
+# Copy to a10_single_site.local.yaml and replace the addresses and camera placeholders.
 robot:
   host: 192.168.0.125  # Address of the machine running the A10_new service.
   port: 8080

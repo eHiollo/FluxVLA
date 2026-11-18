@@ -48,7 +48,7 @@ class A10RTCInferenceTest(unittest.TestCase):
     @unittest.skipUnless((BUNDLE / 'config.json').exists(), 'Local model bundle absent')
     def test_bundle_inputs_match_training_mean_std_and_task(self):
         from fluxvla.engines import build_dataset_from_cfg
-        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_rtc_inference.py'))
+        cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_single_rtc_inference.py'))
         self.assertEqual(cfg.inference_model.type, 'NativeA10Policy')
         self.assertEqual(cfg.inference_model.model_config.n_action_steps, 30)
         self.assertEqual(cfg.inference_model.model_config.rtc_training_config.max_delay, 9)

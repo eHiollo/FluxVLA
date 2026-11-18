@@ -127,7 +127,7 @@ def make_live(samples, robot=None, **kwargs):
 
 class VRTeleopRuntimeTest(unittest.TestCase):
     def test_project_entrypoint_builds_vr_only_and_blocks_unverified_motion(self):
-        cfg = Config.fromfile(str(Path(__file__).resolve().parents[1] / 'configs/a10/a10_vr_teleop.py')).teleop
+        cfg = Config.fromfile(str(Path(__file__).resolve().parents[1] / 'configs/a10/a10_single_vr_base.py')).teleop
         self.assertIsInstance(build_runtime(cfg), VRTeleopRuntime)
         cfg.vr_only = False
         with self.assertRaises(ValueError):

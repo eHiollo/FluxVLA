@@ -566,7 +566,7 @@ def print_report(report):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    parser.add_argument('--config', type=Path, default=ROOT / 'configs/a10/a10_devices.py', help='设备清单路径')
+    parser.add_argument('--config', type=Path, default=ROOT / 'configs/a10/a10_dual_devices.py', help='设备清单路径')
     parser.add_argument('--update', action='store_true', help='先备份，只更新按身份唯一匹配设备的连接路径')
     parser.add_argument('--check-grippers', action='store_true', help='额外打开已匹配夹爪串口，只读配置ID的状态')
     parser.add_argument('--json', action='store_true', help='输出完整JSON，包含各视频接口和格式')

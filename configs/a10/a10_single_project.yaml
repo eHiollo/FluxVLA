@@ -1,5 +1,5 @@
 # A10 workflow configuration. Site-specific values may be overridden in
-# configs/a10/site.local.yaml; never put passwords or tokens in this file.
+# configs/a10/a10_single_site.local.yaml; never put passwords or tokens in this file.
 version: 1
 paths:
   fluxvla_python: null  # Use the currently active platform environment.
@@ -25,7 +25,7 @@ cameras:
   right_wrist_0_rgb: {device: /dev/v4l/by-id/usb-TSTC_USB20_WEB_CAMERA_TSTC_USB20_WEB_CAMERA_01.00.00-video-index0, width: 640, height: 480, fps: 30, rotate_180: true, exclusive_per_read: false}
 vr_operator:
   # Targets use the position/orientation anchor captured at follower start.
-  # Configure feedback units and onsite step limits in site.local.yaml.
+  # Configure feedback units and onsite step limits in a10_single_site.local.yaml.
   feedback_position_unit: null  # mm or m
   max_position_step_m: null
   max_rotation_step_rad: null

@@ -27,8 +27,15 @@ IDENTITY = np.array([0., 0., 0., 0., 0., 0., 1.])
 
 
 def configuration(*, identity_bindings=False):
-    cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_arm_vr_teleop.py')).teleop
-    cfg.update(vr_only=True, record_controller=False, feedback_poll_hz=None)  # Legacy synchronous fixtures.
+    cfg = Config.fromfile(str(ROOT / 'configs/a10/a10_dual_vr.py')).teleop
+    # These fixtures exercise the legacy anchor/feedback lifecycle explicitly;
+    # production entry points now all default to world translation.
+    cfg.update(vr_only=True, record_controller=False, feedback_poll_hz=None,
+               pose_mapping='anchor_relative', continuous_feedback=True,
+               stop_on_both_release=True, confirm_stop=True, resilient_takeover=False)
+    cfg.input.mapping.squeeze_translation_only = False
+    cfg.input.mapping_by_hand = {}
+    cfg.operator.shared_control.require_feedback = True
     cfg.zx_grippers.enabled = False
     if identity_bindings:
         # Lifecycle fixtures name arms after their hands; site mapping is tested separately.

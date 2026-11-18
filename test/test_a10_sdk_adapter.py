@@ -200,7 +200,7 @@ class RuntimeTest(unittest.TestCase):
     def test_config_rejects_unsupported_modes_before_connect(self):
         from mmengine import Config
         from fluxvla.engines.operators.vr.runtime import build_runtime
-        cfg=Config.fromfile(Path(__file__).resolve().parents[1]/'configs/a10/a10_vr_teleop.py')
+        cfg=Config.fromfile(Path(__file__).resolve().parents[1]/'configs/a10/a10_single_vr_base.py')
         cfg.teleop.cartesian_adapter='sdk_tool_cumulative'
         with self.assertRaisesRegex(ValueError,'reference'): build_runtime(cfg.teleop)
         cfg.teleop.control_mode='reference'

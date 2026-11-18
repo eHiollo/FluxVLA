@@ -1009,7 +1009,7 @@ class InitCancelTest(unittest.TestCase):
 class EntryTest(unittest.TestCase):
     def test_recording_cadence_is_independent_only_in_background_mode(self):
         from scripts.teleoperate import main
-        args=['--config', str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),
+        args=['--config', str(ROOT/'configs/a10/a10_dual_vr.py'),
               '--record-config', str(ROOT/'configs/a10/a10_dual_arm_record.py'), '--preview']
         with patch('fluxvla.engines.operators.vr.recording.RecordingSession.connect', side_effect=AssertionError('IO')):
             self.assertEqual(main(args+['--cfg-options', 'teleop.fps=90']), 0)
@@ -1026,7 +1026,7 @@ class EntryTest(unittest.TestCase):
 
     def test_button_preview_is_robot_free_and_live_requires_grippers(self):
         from scripts.teleoperate import main
-        args=['--config',str(ROOT/'configs/a10/a10_dual_arm_vr_teleop.py'),
+        args=['--config',str(ROOT/'configs/a10/a10_dual_vr.py'),
               '--record-config',str(ROOT/'configs/a10/a10_dual_arm_record.py'),'--preview']
         with patch('fluxvla.engines.operators.vr.recording.RecordingSession.connect',side_effect=AssertionError('IO')):
             self.assertEqual(main(args+['--check-record-buttons']),0)

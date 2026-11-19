@@ -85,6 +85,12 @@ python scripts/a10_devices.py --update
 只读夹爪状态：
 python scripts/a10_devices.py --check-grippers
 
+夹爪调试网页（唯一UI入口；电脑浏览器打开终端输出的完整链接）：
+python3 scripts/a10_gripper_ui.py
+
+夹爪单次开合命令：
+python3 scripts/a10_devices.py --gripper left --open
+
 VR网络诊断（将IP换成当前头显地址）：
 python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
 

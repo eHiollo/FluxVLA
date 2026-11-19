@@ -122,6 +122,26 @@ class DeviceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.load_config("cameras = dict(x=__import__('os').system('false'))\ngrippers=dict()")
 
+    def test_repository_config_resolves_camera_presets_and_gripper_endpoints(self):
+        path = m.ROOT / 'configs/a10/a10_dual_devices.py'
+        config, _ = m.load_config(path.read_text(), path.parent)
+        self.assertEqual(config['cameras']['base_0_rgb']['realsense_json'],
+                         str(path.parent / '外部.json'))
+        for side in ('left', 'right'):
+            self.assertEqual(config['grippers'][side]['check']['open_raw'], 0)
+            self.assertEqual(config['grippers'][side]['check']['close_raw'], 9000)
+
+    def test_preset_paths_do_not_allow_arbitrary_expressions(self):
+        prefix = "_preset_dir = Path('{{fileDirname}}')\n"
+        for expression in ("str(__import__('os').system('false'))",
+                           "str(_preset_dir / __import__('os').getcwd())",
+                           "str(_preset_dir / 'x', encoding='utf-8')"):
+            with self.subTest(expression=expression), self.assertRaises(ValueError):
+                m.load_config(prefix + 'cameras=dict(x=dict(realsense_json='
+                              + expression + '))\ngrippers=dict()')
+        with self.assertRaises(ValueError):
+            m.load_config("_preset_dir = __import__('os').getcwd()\n" + SOURCE)
+
     def test_default_cli_does_not_open_gripper_or_update(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'devices.py'; path.write_text(SOURCE)
@@ -231,7 +251,8 @@ class DeviceVisualTests(unittest.TestCase):
         from unittest.mock import MagicMock
         client = MagicMock()
         client.__enter__.return_value = client
-        client.read_state.return_value = SimpleNamespace(has_error=False, position_raw=0)
+        client.drop_alarm_policy = 'stop'
+        client.read_state.return_value = SimpleNamespace(has_error=False, position_raw=0, alarm_a=0, alarm_b=0)
         client.set_position_raw.side_effect = RuntimeError('timeout')
         module = SimpleNamespace(ZXGripper=MagicMock(return_value=client))
         with patch.object(m, 'load_operator', return_value=module):

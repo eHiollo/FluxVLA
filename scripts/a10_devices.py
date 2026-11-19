@@ -123,21 +123,41 @@ def dict_nodes(node):
     raise ValueError('设备清单须使用 dict(...) 或 {...}，不能执行动态表达式')
 
 
-def literal(node):
+def literal(node, preset_dir=None):
+    # Resolve only the camera preset path syntax; never execute config code.
+    if (preset_dir is not None and isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name) and node.func.id == 'str'
+            and len(node.args) == 1 and not node.keywords):
+        path = node.args[0]
+        if (isinstance(path, ast.BinOp) and isinstance(path.op, ast.Div)
+                and isinstance(path.left, ast.Name) and path.left.id == '_preset_dir'
+                and isinstance(path.right, ast.Constant)
+                and isinstance(path.right.value, str)):
+            return str(preset_dir / path.right.value)
     if isinstance(node, (ast.Dict, ast.Call)):
-        return {key: literal(value) for key, value in dict_nodes(node).items()}
+        return {key: literal(value, preset_dir) for key, value in dict_nodes(node).items()}
     return ast.literal_eval(node)
 
 
-def load_config(source):
+def load_config(source, config_dir=None):
     nodes = {}
+    preset_dir = None
     for node in ast.parse(source).body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id == '_preset_dir':
+                value = node.value
+                if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                        and value.func.id == 'Path' and not value.keywords
+                        and len(value.args) == 1 and isinstance(value.args[0], ast.Constant)
+                        and value.args[0].value == '{{fileDirname}}'):
+                    preset_dir = Path(config_dir) if config_dir is not None else Path('{{fileDirname}}')
+                else:
+                    raise ValueError('_preset_dir 须使用 Path(\'{{fileDirname}}\')')
             if node.targets[0].id in ('cameras', 'grippers'):
                 nodes[node.targets[0].id] = dict_nodes(node.value)
     if set(nodes) != {'cameras', 'grippers'}:
         raise ValueError('配置需要 cameras 和 grippers 两份设备清单')
-    config = {group: {name: literal(node) for name, node in entries.items()}
+    config = {group: {name: literal(node, preset_dir) for name, node in entries.items()}
               for group, entries in nodes.items()}
     return config, nodes
 
@@ -305,7 +325,7 @@ def take_snapshots(config, rows, output_dir=None):
     return dict(directory=str(folder), overview=str(folder / 'overview.jpg'), **manifest)
 
 
-def gripper_limits(settings):
+def gripper_limits(settings, *, max_speed=5):
     check = settings.get('check', {})
     low, high = check.get('min_raw'), check.get('max_raw')
     if type(low) is not int or type(high) is not int or not 0 <= low < high <= 0xFFFFFFFF:
@@ -317,32 +337,39 @@ def gripper_limits(settings):
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or not 0 < timeout <= 60:
         raise ValueError('check.move_timeout_s 须在 (0, 60] 秒内')
     speed, torque = settings.get('speed'), settings.get('torque')
-    if (type(speed) is not int or not 1 <= speed <= 5 or
+    if (type(speed) is not int or not 1 <= speed <= max_speed or
             type(torque) is not int or not 1 <= torque <= 60):
-        raise ValueError('设备检查要求 speed 在1..5、torque在1..60')
+        raise ValueError(f'设备检查要求 speed 在1..{max_speed}、torque在1..60')
     return low, high, tolerance, timeout
 
 
-def reached(state, target, tolerance):
-    return (not state.has_error and state.enabled and state.position_reached
+def has_check_alarm(state, *, drop_alarm_policy='stop'):
+    if drop_alarm_policy not in ('stop', 'warn'):
+        raise ValueError('drop_alarm_policy 须为 stop 或 warn')
+    alarm_b = state.alarm_b & ~0x1000 if drop_alarm_policy == 'warn' else state.alarm_b
+    return bool(state.alarm_a or alarm_b)
+
+
+def reached(state, target, tolerance, *, drop_alarm_policy='stop'):
+    return (not has_check_alarm(state, drop_alarm_policy=drop_alarm_policy) and state.enabled and state.position_reached
             and abs(state.position_raw - target) <= tolerance)
 
 
-def read_check_state(client, settings, *, require_range=True):
-    low, high, tolerance, _ = gripper_limits(settings)
+def read_check_state(client, settings, *, require_range=True, max_speed=5):
+    low, high, tolerance, _ = gripper_limits(settings, max_speed=max_speed)
     state = client.read_state(settings['device_id'])
-    if state.has_error:
+    if has_check_alarm(state, drop_alarm_policy=getattr(client, 'drop_alarm_policy', 'stop')):
         raise RuntimeError(f'夹爪有报警：0x{state.alarm_a:04X}/0x{state.alarm_b:04X}')
     if require_range and not max(0, low - tolerance) <= state.position_raw <= high + tolerance:
         raise ValueError(f'实际位置raw={state.position_raw}超出当前配置范围{low}..{high}附近；请先核对范围')
     return state
 
 
-def execute_check_move(client, settings, row, target, action='position'):
-    low, high, tolerance, timeout = gripper_limits(settings)
+def execute_check_move(client, settings, row, target, action='position', *, max_speed=5):
+    low, high, tolerance, timeout = gripper_limits(settings, max_speed=max_speed)
     if type(target) is not int or not low <= target <= high:
         raise ValueError(f'目标raw必须是{low}..{high}范围内的整数')
-    initial = read_check_state(client, settings)
+    initial = read_check_state(client, settings, max_speed=max_speed)
     started = time.monotonic()
     client.set_position_raw(settings['device_id'], target, speed=settings['speed'],
                             torque=settings['torque'], wait=False)
@@ -353,12 +380,13 @@ def execute_check_move(client, settings, row, target, action='position'):
     outcome = 'timeout'
     while time.monotonic() < deadline:
         final = client.read_state(settings['device_id'])
-        if final.has_error or not final.enabled:
+        if has_check_alarm(final, drop_alarm_policy=getattr(client, 'drop_alarm_policy', 'stop')) or not final.enabled:
             raise RuntimeError(f'运动反馈异常：raw={final.position_raw}，使能={final.enabled}，'
                                f'报警=0x{final.alarm_a:04X}/0x{final.alarm_b:04X}')
         if time.monotonic() >= deadline:
             break
-        reason = ('position_reached' if reached(final, target, tolerance) else
+        reason = ('position_reached' if reached(final, target, tolerance,
+                  drop_alarm_policy=getattr(client, 'drop_alarm_policy', 'stop')) else
                   'torque_reached' if final.torque_reached and final.status & 0x0004 else None)
         consecutive = consecutive + 1 if reason and reason == previous else 1 if reason else 0
         previous = reason
@@ -369,15 +397,16 @@ def execute_check_move(client, settings, row, target, action='position'):
     return dict(side=row['name'], serial=row['serial'], port=row['configured_path'],
                 action=action, initial_raw=initial.position_raw, target_raw=target,
                 speed=settings['speed'], torque=settings['torque'], final=asdict(final),
+                drop_alarm_policy=getattr(client, 'drop_alarm_policy', 'stop'),
                 error_raw=final.position_raw - target, tolerance_raw=tolerance,
                 elapsed_s=time.monotonic() - started, outcome=outcome,
                 arrived=outcome == 'position_reached')
 
 
-def move_gripper(config, rows, side, action, position_raw=None):
+def prepare_gripper_move(config, rows, side, action, position_raw=None, *, max_speed=5):
     row, = require_matched(rows, 'grippers', side)
     settings = config['grippers'][side]
-    low, high, _, _ = gripper_limits(settings)
+    low, high, _, _ = gripper_limits(settings, max_speed=max_speed)
     if action in ('open', 'close'):
         calibration = settings['check'].get('calibration')
         if calibration and (calibration.get('serial') != row['serial'] or
@@ -390,9 +419,17 @@ def move_gripper(config, rows, side, action, position_raw=None):
         position_raw = opened if action == 'open' else closed
     if type(position_raw) is not int or not low <= position_raw <= high:
         raise ValueError(f'目标raw必须是{low}..{high}范围内的整数')
+    return row, settings, position_raw
+
+
+def move_gripper(config, rows, side, action, position_raw=None, *, max_speed=5, drop_alarm_policy='stop'):
+    row, settings, position_raw = prepare_gripper_move(
+        config, rows, side, action, position_raw, max_speed=max_speed)
     module = load_operator('gripper')
-    with module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'], max_position_raw=high) as client:
-        return execute_check_move(client, settings, row, position_raw, action)
+    with module.ZXGripper(row['configured_path'], baudrate=settings['baudrate'],
+                          max_position_raw=settings['check']['max_raw'],
+                          drop_alarm_policy=drop_alarm_policy) as client:
+        return execute_check_move(client, settings, row, position_raw, action, max_speed=max_speed)
 
 
 def print_motion(motion):
@@ -593,7 +630,7 @@ def main(argv=None):
     try:
         path = args.config.resolve()
         original = path.read_bytes()
-        config, nodes = load_config(original.decode('utf-8'))
+        config, nodes = load_config(original.decode('utf-8'), path.parent)
         devices = scan_devices()
         rows = match_devices(config, devices)
         if args.check_grippers:

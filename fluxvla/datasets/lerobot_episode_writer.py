@@ -56,6 +56,13 @@ class LeRobotEpisodeWriter:
             if not path.is_file() or json.loads(path.read_text()) != self.contract:
                 raise ValueError('Native LeRobot resume requires the same backend/contract; '
                                  'use a NEW root, e.g. datasets/a10_dual_lerobot_record')
+            info_path = self.root / 'meta/info.json'
+            version = json.loads(info_path.read_text()).get('codebase_version')
+            if version != 'v3.0':
+                raise ValueError(
+                    f'原生 LeRobot 续录要求 v3.0，当前目录标记为 {version!r}：{self.root}。'
+                    '请使用新的 record.root 并设置 record.resume=False；'
+                    '已有 v2.1 导出或混合格式目录不能直接追加，旧数据保持不变。')
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = (self.root / '.recording.lock').open('a+')
         try:

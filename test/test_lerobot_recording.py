@@ -175,6 +175,29 @@ class NativeWriterTests(unittest.TestCase):
         contract.write_text(json.dumps(content))
         with self.assertRaisesRegex(ValueError, 'NEW root'): self.writer(resume=True)
 
+    def test_v21_or_mixed_directory_is_rejected_before_cleanup_or_native_open(self):
+        writer = self.writer()
+        writer.close()
+        info_path = self.root / 'meta/info.json'
+        info = json.loads(info_path.read_text())
+        info['codebase_version'] = 'v2.1'
+        info_path.write_text(json.dumps(info))
+        # Mixed directories may contain uncommitted files. Do not attempt to
+        # repair or delete any of them through the v3 resume cleanup path.
+        stage = self.root / '.recording/active'
+        stage.mkdir(parents=True)
+        (stage / 'keep.txt').write_text('preserve existing data')
+        before = {str(p.relative_to(self.root)): p.read_bytes()
+                  for p in self.root.rglob('*') if p.is_file()}
+        with patch.object(LeRobotEpisodeWriter, '_discard_pending') as cleanup, \
+             patch.object(LeRobotEpisodeWriter, '_open_dataset') as native_open:
+            with self.assertRaisesRegex(ValueError, 'v3.0.*v2.1'):
+                self.writer(resume=True)
+        cleanup.assert_not_called()
+        native_open.assert_not_called()
+        self.assertEqual(before, {str(p.relative_to(self.root)): p.read_bytes()
+                                  for p in self.root.rglob('*') if p.is_file()})
+
     def test_invalid_action_cannot_be_saved(self):
         writer = self.writer(); writer.start('bad frame')
         with self.assertRaisesRegex(ValueError, 'same-frame'):

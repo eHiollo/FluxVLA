@@ -53,6 +53,10 @@ python scripts/teleoperate.py \
   --record-options record.resume=True
 ```
 
+- 原生续录目录的 `meta/info.json` 必须保持 `codebase_version="v3.0"`。
+  v2.1 训练导出应写到另一个目录，不要原地覆盖源目录的元信息或混入 `episode_*.parquet`。
+  混合目录不能靠补空的 `episodes_stats.jsonl` 修复；先备份并恢复原生索引，再续录。
+
 - 另开任务/数据集可添加（续行时注意上一行末尾的反斜杠）：
 
 ```bash

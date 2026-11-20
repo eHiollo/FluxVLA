@@ -50,6 +50,8 @@ vendor/
 dist/
 build/
 out/
+/outputs/
+/others/
 *.egg-info/
 
 # Ignore work directories

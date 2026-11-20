@@ -96,10 +96,11 @@ def decode_frame(reply, settings, model=None):
 
 
 class ViewerState:
-    def __init__(self, source, mode, stale_after):
+    def __init__(self, source, mode, stale_after, refresh_hz=10.):
         self.source = source
         self.mode = mode
         self.stale_after = stale_after
+        self.refresh_hz = refresh_hz
         self.lock = threading.Lock()
         self.frame = self.updated = self.error = None
 
@@ -119,7 +120,8 @@ class ViewerState:
             stale = self.mode == 'live' and (
                 self.error is not None or age is None or age > self.stale_after)
             return dict(source=self.source, mode=self.mode, frame=self.frame, error=self.error,
-                        stale=stale, age_ms=None if age is None else round(age * 1000))
+                        stale=stale, age_ms=None if age is None else round(age * 1000),
+                        refresh_hz=self.refresh_hz)
 
 
 def read_live(connection_factory, state, settings, stopped, model=None):
@@ -215,6 +217,9 @@ def serve_page(page, mesh_script, state, model):
     mesh_manifest = json.dumps(model.visuals if model else None).encode()
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        disable_nagle_algorithm = True
+
         def do_GET(self):
             if self.path == '/':
                 payload, media = page, 'text/html; charset=utf-8'
@@ -264,6 +269,8 @@ def main(argv=None):
         for key in ('host', 'status_port', 'listen_port', 'poll_hz'):
             if getattr(args, key) is not None:
                 settings[key] = getattr(args, key)
+        if args.replay and args.poll_hz is None:
+            settings['poll_hz'] = settings.get('replay_hz', 10.)
         if not math.isfinite(settings['poll_hz']) or not 0 < settings['poll_hz'] <= 30:
             raise ValueError('poll_hz 应在 (0, 30] 内')
         if not math.isfinite(settings['stale_after_s']) or settings['stale_after_s'] <= 0:
@@ -284,7 +291,8 @@ def main(argv=None):
         else:
             mode, label = 'live', f"{settings['host']}:{settings['status_port']}"
             frames = None
-        state = ViewerState(label, mode, settings['stale_after_s'])
+        refresh_hz = 10. if mode == 'initial' else settings['poll_hz']
+        state = ViewerState(label, mode, settings['stale_after_s'], refresh_hz)
         viewer_dir = HERE / 'a10_visualizer'
         page = (viewer_dir / 'index.html').read_bytes()
         mesh_script = (viewer_dir / 'mesh.js').read_bytes()

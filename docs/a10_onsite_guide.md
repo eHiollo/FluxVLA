@@ -14,7 +14,7 @@
 python scripts/a10_visualize.py --host 192.168.0.198
 ```
 
-查看器经 WebSocket 在后台按 10 Hz 读取 `get`，浏览器从本机服务读取同一份最新状态。关节表会显示
+实时查看器默认经 WebSocket 按 30 Hz 读取 `get`，浏览器以相同频率查询本机状态。关节表会显示
 每轴实际角 `actual_pos`、目标角 `motor_pos` 和差值。默认从 `others/A10_fixed.zip` 读取 URDF 和七个 STL，
 用实际关节角驱动实体。模型轴向已与控制器反馈核对，两臂的 J1–J3 在 URDF 中反号。
 末端坐标轴用控制器的 `pq`。两臂按基座侧孔相对、中心距 115 cm 摆放。基座旋转和位移用于显示，关节表下的 TCP 读数保留控制器坐标。
@@ -30,12 +30,36 @@ python scripts/a10_visualize.py --host 192.168.0.198
 - 已有本机 A10 共享服务时，可加 `--shared-port 端口号`。共享服务的控制器 IP 和状态端口必须与查看器配置一致。
 - 在离线环境加 `--replay 文件.json`，可读取原始 `get` 单帧或帧数组。数组按配置频率播放一次，停在最后一帧。
   关节轨迹可使用 `a10_joint_feedback_v1` 格式，每帧以 `actual_deg` 和 `target_deg` 保存两臂各六轴。
-  页面使用 URDF 回放姿态，并标记未记录的 TCP。若轨迹采样频率不同，用 `--poll-hz` 指定。
+  页面使用 URDF 回放姿态，并标记未记录的 TCP。默认回放为 10 Hz，其他采样频率可用 `--poll-hz` 指定。
 - 反馈过期或连接断开时保留最后一帧并提示。默认配置见 [a10_visualizer.py](../configs/a10/a10_visualizer.py)。
 
 2026-11-20 验证记录：Chrome 已验证离线回放、.198 实时显示、缩放和重置视角。已确认从 5888 和 5999 可同时读取 `get`。
 现场 EtherCAT 主站链路为 DOWN，物理从站为 0。虚拟运动验收停在使能阶段，控制器记录“用户未登陆，使能信号无效”。
 请在控制器侧登录具备 Follower 权限的账号，再核对目标角、实际角和骨架是否随两个臂的单关节测试更新。
+
+### .198 双臂 VR 仿真遥操
+
+仅使用 .198 的虚拟驱动工程。启动前确认 14 个 EtherCAT 从站均为虚拟配置、物理链路为
+`DOWN`、物理从站数为 `0`，并确认控制器已自动登录。另开一个终端运行实时查看器
+`python scripts/a10_visualize.py --host 192.168.0.198`，浏览器访问 `http://127.0.0.1:8765`。
+
+先查验 VR 配置，再在 .198 上使能虚拟轴，最后启动遥操。控制命令与状态查询分别使用
+`5888` 和 `5999`，笛卡尔目标通过 `9998` 更新。
+
+```bash
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr_sim.py --preview
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py \
+  --host 192.168.0.198 --ws-port 5888 --status-ws-port 5888 --direct --allow-motion manual_en
+python scripts/teleoperate.py --config configs/a10/a10_dual_vr_sim.py
+```
+
+仿真配置从 30 Hz 开始，左手控制 ID 1，右手控制 ID 0。侧键用于平移，前扳机允许局部旋转。
+依次检查单手接管、双手接管、松开一只手时另一臂继续控制，以及退出时控制器回读已停止。
+`Ctrl+C` 退出遥操后，可用上面的控制台命令把末尾的 `manual_en` 换成 `manual_ds`，并回读掉使能。
+网页模型以控制器实际角度为准。单独的仿真诊断存放在 `work_dirs/a10/vr/dual_sim_diagnostics.jsonl`。
+
+验证记录：.198 只读反馈约 29.9 Hz，Chrome 实时取数约 30 Hz，连续运动回放约 29.6 Hz，
+原 10 Hz 回放仍按原速。VR HTTPS 和 WebSocket 已通过纯输入启动测试，头显接管与运动待现场核对。
 
 ### .198 在线全关节验收
 

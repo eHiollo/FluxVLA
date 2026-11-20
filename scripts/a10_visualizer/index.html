@@ -142,6 +142,9 @@ let frame = null;
 let drag = null;
 let stale = true;
 let paintMeshes = null;
+let pendingDraw = null;
+let drawnFrame = null;
+let drawnStale = true;
 const words = {
   Manual: "手动", Auto: "自动", Enabled: "已使能", Disabled: "未使能",
   Stopped: "已停止", Running: "运动中", Normal: "正常",
@@ -165,6 +168,28 @@ function rotate(point, [u, v, w, s]) {
   const [x, y, z] = point;
   const tx = 2 * (v * z - w * y), ty = 2 * (w * x - u * z), tz = 2 * (u * y - v * x);
   return [x + s * tx + v * tz - w * ty, y + s * ty + w * tx - u * tz, z + s * tz + u * ty - v * tx];
+}
+
+function scheduleDraw() {
+  if (pendingDraw !== null) return;
+  pendingDraw = requestAnimationFrame(() => {
+    pendingDraw = null;
+    draw();
+    drawnFrame = frame;
+    drawnStale = stale;
+  });
+}
+
+function sceneChanged() {
+  if (!drawnFrame || !frame) return drawnFrame !== frame;
+  const scene = arm => [...(arm.mesh_pq_m ?? [arm.base_m, ...arm.joints_m]),
+    arm.scene_tcp_pq_m ?? []];
+  return frame.arms.some((arm, id) => {
+    const previous = scene(drawnFrame.arms[id]);
+    return scene(arm).some((vector, i) =>
+      vector.length !== previous[i]?.length ||
+      vector.some((value, j) => Math.abs(value - previous[i][j]) > 1e-6));
+  });
 }
 
 function draw() {
@@ -253,11 +278,11 @@ function draw() {
 
 function zoom(factor) {
   view.zoom = Math.max(0.55, Math.min(2.6, view.zoom * factor));
-  draw();
+  scheduleDraw();
 }
 el("zoom-out").onclick = () => zoom(1 / 1.15);
 el("zoom-in").onclick = () => zoom(1.15);
-el("reset").onclick = () => { Object.assign(view, initialView); draw(); };
+el("reset").onclick = () => { Object.assign(view, initialView); scheduleDraw(); };
 canvas.addEventListener("pointerdown", event => {
   if (drag !== null) return;
   drag = { x: event.clientX, y: event.clientY, id: event.pointerId };
@@ -269,17 +294,21 @@ canvas.addEventListener("pointermove", event => {
   view.pitch = Math.max(-0.9, Math.min(1.35, view.pitch + (event.clientY - drag.y) * 0.01));
   drag.x = event.clientX;
   drag.y = event.clientY;
-  draw();
+  scheduleDraw();
 });
 canvas.addEventListener("lostpointercapture", () => { drag = null; });
 canvas.addEventListener("wheel", event => {
   event.preventDefault();
   if (event.deltaY) zoom(event.deltaY < 0 ? 1.10 : 1 / 1.10);
 }, { passive: false });
-new ResizeObserver(draw).observe(canvas);
+new ResizeObserver(scheduleDraw).observe(canvas);
+
+function updateText(element, text) {
+  if (element.textContent !== text) element.textContent = text;
+}
 
 function setText(id, text) {
-  if (el(id).textContent !== text) el(id).textContent = text;
+  updateText(el(id), text);
 }
 
 function render(report) {
@@ -299,15 +328,15 @@ function render(report) {
     `${frame.follower_active ? "运行中" : "未运行"} · ${label(frame.follower_mode)}`);
   for (const arm of frame?.arms ?? []) {
     const panel = jointPanels[arm.id];
-    panel.valueHeader.textContent = initial ? "预览" : "实际";
+    updateText(panel.valueHeader, initial ? "预览" : "实际");
     panel.rows.forEach((row, i) => {
-      row.cells[1].textContent = arm.actual_deg[i].toFixed(2);
-      row.cells[2].textContent = initial ? "—" : arm.target_deg[i].toFixed(2);
-      row.cells[3].textContent = initial ? "—" : (arm.target_deg[i] - arm.actual_deg[i]).toFixed(2);
+      updateText(row.cells[1], arm.actual_deg[i].toFixed(2));
+      updateText(row.cells[2], initial ? "—" : arm.target_deg[i].toFixed(2));
+      updateText(row.cells[3], initial ? "—" : (arm.target_deg[i] - arm.actual_deg[i]).toFixed(2));
     });
-    panel.tcp.textContent = arm.tcp_pq_m
+    updateText(panel.tcp, arm.tcp_pq_m
       ? `TCP [mm] · ${arm.tcp_pq_m.slice(0, 3).map(x => (x * 1000).toFixed(1)).join(" / ")}`
-      : initial ? "TCP —" : "TCP 未记录";
+      : initial ? "TCP —" : "TCP 未记录");
   }
   const codes = frame?.driver_codes?.filter(Boolean) ?? [];
   const faultText = frame?.fault ? [
@@ -318,14 +347,20 @@ function render(report) {
   el("diagnostics").classList.toggle("warning", !!(report.error || faultText));
   setText("diagnostics", [report.error, faultText].filter(Boolean).join(" · ") ||
     (frame ? `控制器状态 · ${label(frame.controller_status)}` : "等待控制器状态"));
-  draw();
+  if (drawnStale !== stale || sceneChanged()) scheduleDraw();
 }
 
+let refreshIntervalMs = 100;
 async function refresh() {
+  const started = performance.now();
   try {
     const reply = await fetch("/state", { cache: "no-store", signal: AbortSignal.timeout(1500) });
     if (!reply.ok) throw new Error(String(reply.status));
-    render(await reply.json());
+    const report = await reply.json();
+    if (Number.isFinite(report.refresh_hz) && report.refresh_hz > 0) {
+      refreshIntervalMs = 1000 / Math.min(report.refresh_hz, 30);
+    }
+    render(report);
   } catch {
     stale = true;
     el("health").classList.add("stale");
@@ -333,15 +368,15 @@ async function refresh() {
     setText("age", "—");
     el("diagnostics").classList.add("warning");
     setText("diagnostics", "与本机查看器服务的连接中断");
-    draw();
+    if (drawnStale !== stale) scheduleDraw();
   }
-  setTimeout(refresh, 100);
+  setTimeout(refresh, Math.max(0, refreshIntervalMs - (performance.now() - started)));
 }
 function showSkeleton(reason) {
   paintMeshes = null;
   el("mesh").hidden = true;
   setText("mesh-mode", reason);
-  draw();
+  scheduleDraw();
 }
 el("mesh").addEventListener("webglcontextlost", () => showSkeleton("WebGL 中断 · 骨架"));
 loadA10Meshes(el("mesh")).then(paint => {
@@ -351,7 +386,7 @@ loadA10Meshes(el("mesh")).then(paint => {
   }
   paintMeshes = paint;
   setText("mesh-mode", "A10 实体模型");
-  draw();
+  scheduleDraw();
 }).catch(error => showSkeleton(`${error.message} · 骨架`));
 refresh();
 </script>

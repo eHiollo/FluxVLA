@@ -26,6 +26,7 @@ def main(argv=None):
                         help='同一5999连接开启控制器高频记录；需实机模式或 --observe')
     parser.add_argument('--measure-vr-latency', action='store_true', help='诊断VR发包/收包间隔、WebSocket往返与输入读取延迟，单独保存日志')
     parser.add_argument('--preview', action='store_true', help='只检查配置，不启动服务或连接设备')
+    parser.add_argument('--ssh-known-hosts', type=Path, help='.198 仿真启动检查使用的 SSH 主机指纹文件')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--observe', action='store_true',
                         help='只读观察：读取机器人反馈并计算 reference 目标，不启动跟随或发送目标')
@@ -130,6 +131,7 @@ def main(argv=None):
                 and not args.preview and not args.check_record_buttons):
             _configure_recording_workers()
     runtime = build_runtime(cfg.teleop)
+    prepare_sim = runtime.execute and cfg.get('sim_start_at_init', False)
     runtime.vr.measure_latency = args.measure_vr_latency
     runtime.vr.latency_context = dict(recording=bool(args.record_config),
         button_check=args.check_record_buttons, execute=runtime.execute,
@@ -159,8 +161,19 @@ def main(argv=None):
               f'control_mode={runtime.control_mode}，pose_mapping={runtime.pose_mapping}，'
               f'record_controller={runtime.record_controller}，measure_vr_latency={args.measure_vr_latency}，'
               f'zx_grippers={getattr(runtime, "zx_grippers_enabled", False)}，'
+              f'启动时仿真归位={prepare_sim}，'
               '未启动服务或连接设备。')
         return 0
+    if prepare_sim:
+        from scripts.a10_virtual_trajectory_test import prepare_virtual_vr
+        try:
+            prepare_virtual_vr(runtime.robot, args.ssh_known_hosts)
+        except KeyboardInterrupt:
+            print('仿真归位已取消。', file=sys.stderr)
+            return 130
+        except Exception as error:
+            print(f'仿真启动失败：{error}', file=sys.stderr)
+            return 1
     runtime.run(fps=cfg.teleop.get('fps', 30),
                 max_steps=cfg.teleop.get('max_steps'))
     return 0

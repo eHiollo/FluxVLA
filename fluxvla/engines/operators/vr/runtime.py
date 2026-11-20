@@ -774,6 +774,7 @@ class VRTeleopRuntime:
             return result
         except BaseException as exc:
             from ...communication.a10_shared_connection import ControlTransferredError
+            from ..a10_operator import A10ControllerError
             transferred = isinstance(exc, ControlTransferredError)
             if (not transferred and isinstance(exc, Exception) and self.execute
                     and getattr(self.robot, 'shared_control', None) and self.robot.is_connected):
@@ -791,13 +792,17 @@ class VRTeleopRuntime:
             self._cancel_accessories()
             error = f'{type(exc).__name__}: {exc}'
             failure = getattr(self.robot, 'last_communication_failure', None)
+            query_failed = (failure is not None and failure.get('failed_wall_ns', 0) >= started_wall_ns
+                            and failure.get('command') in ('get', 'feedback_snapshot', 'record_heartbeat'))
+            feedback_fault = isinstance(exc, A10ControllerError) and (
+                query_failed or (self.last_frame or {}).get('has_error') is True)
             if (self.keep_session_on_query_error and isinstance(exc, Exception)
-                    and failure is not None and failure.get('failed_wall_ns', 0) >= started_wall_ns
-                    and failure.get('command') in ('get', 'feedback_snapshot', 'record_heartbeat')):
+                    and (query_failed or feedback_fault)):
                 if recording is not None:
                     recording.reset_cancel.set()
                 self.communication_pause = dict(reason=error, restart_required=True,
-                                                stop_confirmed=False)
+                                                stop_confirmed=False,
+                                                cause='controller_fault' if feedback_fault else 'query_failure')
                 try:
                     if self.execute:
                         self._stop_reference()
@@ -809,15 +814,14 @@ class VRTeleopRuntime:
                 self.last_reference_result = dict(state='communication_paused', arms={},
                                                  transmitted=False)
                 logging.getLogger(__name__).error(
-                    '控制器查询失败，VR界面保留，已暂停新目标；停止确认=%s。'
-                    '%s',
-                    self.communication_pause['stop_confirmed'],
-                    '请在现场确认停止，Ctrl+C退出后重新连接。')
+                    '%s，VR界面保留，已暂停新目标，停止确认=%s。%s',
+                    '控制器报警' if feedback_fault else '控制器查询失败',
+                    self.communication_pause['stop_confirmed'], error)
                 if self.teleoperator is not None:
                     try:
                         self.teleoperator.send_feedback(dict(
                             type='hud', phase='communication_paused',
-                            hint='CONTROLLER QUERY FAILED - MOTION PAUSED',
+                            hint='Controller fault' if feedback_fault else 'Controller query failed',
                             error='Confirm robot stopped onsite. Ctrl+C to exit and reconnect.'))
                     except Exception:
                         logging.getLogger(__name__).warning('通信暂停提示发送失败', exc_info=True)
@@ -1646,6 +1650,7 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         self._pause_result()
 
     def _checked_frame(self, *, require_active, force_refresh=False):
+        from ..a10_operator import A10ControllerError
         from .control import pose
         if (not self.continuous_feedback and not force_refresh and self._dual_time is not None):
             if self._sent_reference_poses is None:
@@ -1657,6 +1662,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         frame = self._timed_call('robot_feedback_s', read)
         self.last_frame = frame
         now = time.monotonic()
+        if isinstance(frame, dict) and frame.get('has_error') is True:
+            raise A10ControllerError('Dual A10 feedback reports a controller fault')
         if not isinstance(frame, dict) or frame.get('has_error') is not False:
             raise RuntimeError('Dual A10 feedback is missing or reports a fault')
         stamp = frame.get('received_monotonic_s')

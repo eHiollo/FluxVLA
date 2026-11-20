@@ -39,24 +39,23 @@ python scripts/a10_visualize.py --host 192.168.0.198
 
 ### .198 双臂 VR 仿真遥操
 
-仅使用 .198 的虚拟驱动工程。启动前确认 14 个 EtherCAT 从站均为虚拟配置、物理链路为
-`DOWN`、物理从站数为 `0`，并确认控制器已自动登录。另开一个终端运行实时查看器
-`python scripts/a10_visualize.py --host 192.168.0.198`，浏览器访问 `http://127.0.0.1:8765`。
-
-先查验 VR 配置，再在 .198 上使能虚拟轴，最后启动遥操。控制命令与状态查询分别使用
-`5888` 和 `5999`，笛卡尔目标通过 `9998` 更新。
+仿真入口通过 SSH 核对 .198 正在运行虚拟驱动工程。检查包含 14 个虚拟从站、物理链路
+`DOWN` 和物理从站数 `0`。SSH 需要已核验的主机指纹，可用 `--ssh-known-hosts 路径` 指定。
+控制器须已登录、处于手动模式且已停止。有故障时先清除报警。
 
 ```bash
 python scripts/teleoperate.py --config configs/a10/a10_dual_vr_sim.py --preview
-python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py \
-  --host 192.168.0.198 --ws-port 5888 --status-ws-port 5888 --direct --allow-motion manual_en
 python scripts/teleoperate.py --config configs/a10/a10_dual_vr_sim.py
 ```
 
-仿真配置从 30 Hz 开始，左手控制 ID 1，右手控制 ID 0。侧键用于平移，前扳机允许局部旋转。
-依次检查单手接管、双手接管、松开一只手时另一臂继续控制，以及退出时控制器回读已停止。
-`Ctrl+C` 退出遥操后，可用上面的控制台命令把末尾的 `manual_en` 换成 `manual_ds`，并回读掉使能。
-网页模型以控制器实际角度为准。单独的仿真诊断存放在 `work_dirs/a10/vr/dual_sim_diagnostics.jsonl`。
+启动时自动使能虚拟轴，以 `m_init` 配置归位并回读十二轴实际角度。看到到位提示后，另开终端运行
+`python scripts/a10_visualize.py --host 192.168.0.198`，浏览器打开 `http://127.0.0.1:8765`。
+VR 通过 `5888` 查反馈、启停跟随，通过 UDP `9998` 发送笛卡尔目标。网页独立通过 `5999` 读取实际关节角。
+
+仿真控制目标为 30 Hz，左手控制 ID 1，右手控制 ID 0。侧键用于平移，前扳机允许局部旋转。
+松开一只手时另一臂仍可控制，两手都松开会请求停止并确认。故障时停止下发并保留头显提示。
+退出后虚拟轴保持使能。需要掉使能时，可用控制台的 `manual_ds` 并核对状态。
+仿真诊断存放在 `work_dirs/a10/vr/dual_sim_diagnostics.jsonl`。
 
 验证记录：.198 只读反馈约 29.9 Hz，Chrome 实时取数约 30 Hz，连续运动回放约 29.6 Hz，
 原 10 Hz 回放仍按原速。VR HTTPS 和 WebSocket 已通过纯输入启动测试，头显接管与运动待现场核对。

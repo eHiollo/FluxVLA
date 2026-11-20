@@ -144,15 +144,21 @@ class HoldSessionTest(unittest.TestCase):
         self.assertIsNone(self.runtime._recording_next_heartbeat)
         self.assertTrue(self.vr.is_connected)
 
-    def test_controller_fault_still_requests_stop_and_is_not_treated_as_query_timeout(self):
+    def test_controller_fault_stops_and_keeps_interface_without_restarting_motion(self):
         self.runtime.keep_session_on_query_error = True
         self.move()
         self.robot.last_communication_failure = dict(command='get', failed_wall_ns=1)
         self.robot.frame_fault = True
-        with self.assertRaisesRegex(RuntimeError, 'fault'):
-            self.tick()
-        self.assertIsNone(self.runtime.communication_pause)
+        sent = len(self.robot.targets)
+        self.tick()
+        self.assertEqual(self.runtime.communication_pause['cause'], 'controller_fault')
+        self.assertTrue(self.runtime.communication_pause['restart_required'])
         self.assertEqual(self.robot.events.count('stop'), 1)
+        self.assertTrue(self.vr.is_connected)
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(len(self.robot.targets), sent)
+        self.assertEqual(self.robot.events.count('start'), 1)
 
     def test_diagnostic_tracking_policy_covers_runtime_guard_and_complete_sdk_packets(self):
         cfg = ReferenceConfig(enforce_tracking_error_limits=False,

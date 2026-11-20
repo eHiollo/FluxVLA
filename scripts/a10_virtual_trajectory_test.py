@@ -79,6 +79,50 @@ def preflight(known_hosts):
     return json.loads(result.stdout)
 
 
+def prepare_virtual_vr(robot, known_hosts=None):
+    """Return the isolated virtual controller to the configured m_init pose."""
+    from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init
+
+    connection = robot._connection
+    if (connection.host, connection.ws_port, robot.status_ws_port, robot.shared_control) != (
+            HOST, CONTROL_PORT, CONTROL_PORT, None):
+        raise ValueError('仿真归位只允许直连 .198:5888')
+    validation = preflight(known_hosts)
+    limits = np.asarray(validation['limits_rad'], dtype=float)
+    target = np.concatenate([robot.init_position[name] for name in robot.joint_target_order])
+    if (target.shape != (12,) or limits.shape != (12, 2) or not np.isfinite(limits).all()
+            or not np.isfinite(target).all() or np.any(target < limits[:, 0])
+            or np.any(target > limits[:, 1])):
+        raise ValueError('m_init 目标与 .198 的十二轴关节限位不符')
+
+    print(f'已确认 .198 使用虚拟驱动（PID {validation["pid"]}），正在准备 m_init。', flush=True)
+    enable_attempted = False
+    try:
+        robot.connect()
+        state = robot.get_state()
+        info = controller_info(state)
+        user = state.raw['ret_context'].get('user_management_msg', {}).get('user')
+        if (user != 'Manufacturer' or info.get('op_mode') != 'Manual'
+                or info.get('motion') != 'Stopped' or state.follower_active is not False
+                or info.get('activate') not in ('Enabled', 'Disabled')):
+            raise RuntimeError('仿真归位要求已登录、手动模式、已停止且 follower 未运行')
+        if state.has_error:
+            raise RuntimeError('.198 仍报告故障，请在控制器上清除报警后重试')
+        if [state.arms[name].ee_id for name in robot.joint_target_order] != [0, 1]:
+            raise RuntimeError('仿真归位要求按 ID 0、ID 1 排列两组关节')
+        if info['activate'] == 'Disabled':
+            enable_attempted = True
+            robot.enable()
+        move_to_init(robot, progress=lambda line: print(line, flush=True))
+        print('双臂已到 m_init，已确认关节跟随退出。VR 现在可以接管。', flush=True)
+    except BaseException:
+        if enable_attempted:
+            restore(robot, follower_attempted=False)
+        raise
+    finally:
+        robot.close()
+
+
 def trajectory_offsets(start, limits):
     limits = np.rad2deg(limits)
     magnitude = np.array([[10., 14., 18., 12., 15., 20.],

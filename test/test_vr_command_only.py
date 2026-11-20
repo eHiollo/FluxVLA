@@ -196,6 +196,12 @@ class LiveProfileLoopbackTest(unittest.TestCase):
     def test_live_profile_buttons_row_order_no_continuous_get_and_reclutch(self):
         with FakeController() as native:
             native.motion_override = dual_motion()
+            # The real dual profile checks acceleration before starting. Keep
+            # that check enabled and provide the matching read-only reply.
+            native.command_replies['read_motor --all'] = dict(
+                ret_code=0, ret_context=json.dumps([
+                    dict(motion_type='rotatory', max_acc=1000., min_acc=-1000.)
+                    for _ in range(12)]), ret_msg='')
             ws_port = native.server.socket.getsockname()[1]
             relay = SharedControl('127.0.0.1', ws_port, ws_port,
                 native.udp.getsockname()[1], native.joint_udp.getsockname()[1], timeout_s=1.)

@@ -540,6 +540,19 @@ class DualRuntimeTest(unittest.TestCase):
             self.tick(False, False)
         self.assertEqual(self.robot.events.count('start'), 1)
 
+    def test_controller_fault_keeps_headset_open_without_sending_targets(self):
+        self.runtime.keep_session_on_query_error = True
+        self.move(4)
+        sent = len(self.robot.targets)
+        self.robot.frame_fault = True
+        self.tick()
+        self.assertEqual(self.runtime.communication_pause['cause'], 'controller_fault')
+        self.assertTrue(self.vr.is_connected)
+        self.assertIn('stop', self.robot.events)
+        self.robot.frame_fault = False
+        self.tick()
+        self.assertEqual(len(self.robot.targets), sent)
+
     def test_missing_feedback_stops_group_no_partial_packet(self):
         self.move()
         count = len(self.robot.targets)

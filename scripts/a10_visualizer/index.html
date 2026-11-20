@@ -210,10 +210,11 @@ function draw() {
   for (const arm of frame.arms) {
     const color = colors[arm.id];
     const base = project(add(arm.base_m, arm.offset_m));
-    const tcpXYZ = add(arm.tcp_pq_m.slice(0, 3), arm.offset_m);
-    const tcp = project(tcpXYZ);
+    const tcpXYZ = arm.tcp_pq_m ? add(arm.tcp_pq_m.slice(0, 3), arm.offset_m) : null;
+    const tcp = tcpXYZ ? project(tcpXYZ) : null;
     if (!paintMeshes) {
-      const points = [base, ...arm.joints_m.map(point => project(add(point, arm.offset_m))), tcp];
+      const points = [base, ...arm.joints_m.map(point => project(add(point, arm.offset_m)))];
+      if (tcp) points.push(tcp);
       dot(base, 9, color);
       points.slice(1).forEach((p, i) => {
         const previous = points[i];
@@ -221,7 +222,7 @@ function draw() {
         if (i < 6) joints.push({ p, color });
       });
     }
-    tcpAxes.push({ tcp, tips: axisColors.map((_, index) => {
+    if (tcp) tcpAxes.push({ tcp, tips: axisColors.map((_, index) => {
       const axis = [0, 0, 0];
       axis[index] = 0.16;
       return project(add(tcpXYZ, rotate(axis, arm.tcp_pq_m.slice(3))));
@@ -302,7 +303,9 @@ function render(report) {
       [arm.actual_deg[i], arm.target_deg[i], arm.target_deg[i] - arm.actual_deg[i]]
         .forEach((num, j) => { row.cells[j + 1].textContent = num.toFixed(2); });
     });
-    panel.tcp.textContent = `TCP [mm] · ${arm.tcp_pq_m.slice(0, 3).map(x => (x * 1000).toFixed(1)).join(" / ")}`;
+    panel.tcp.textContent = arm.tcp_pq_m
+      ? `TCP [mm] · ${arm.tcp_pq_m.slice(0, 3).map(x => (x * 1000).toFixed(1)).join(" / ")}`
+      : "TCP 未记录";
   }
   const codes = frame?.driver_codes?.filter(Boolean) ?? [];
   const faultText = frame?.fault ? [

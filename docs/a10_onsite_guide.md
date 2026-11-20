@@ -28,6 +28,8 @@ python scripts/a10_visualize.py --host 192.168.0.198
   `--status-port 5888` 将查看器接到另一个已验证可读取 `get` 的控制器端口。
 - 已有本机 A10 共享服务时，可加 `--shared-port 端口号`。共享服务的控制器 IP 和状态端口必须与查看器配置一致。
 - 在离线环境加 `--replay 文件.json`，可读取原始 `get` 单帧或帧数组。数组按配置频率播放一次，停在最后一帧。
+  关节轨迹可使用 `a10_joint_feedback_v1` 格式，每帧以 `actual_deg` 和 `target_deg` 保存两臂各六轴。
+  页面使用 URDF 回放姿态，并标记未记录的 TCP。若轨迹采样频率不同，用 `--poll-hz` 指定。
 - 反馈过期或连接断开时保留最后一帧并提示。默认配置见 [a10_visualizer.py](../configs/a10/a10_visualizer.py)。
 
 2026-11-20 验证记录：Chrome 已验证离线回放、.198 实时显示、缩放和重置视角。已确认从 5888 和 5999 可同时读取 `get`。

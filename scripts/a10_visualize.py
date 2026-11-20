@@ -150,8 +150,31 @@ def connection_for(settings, shared_port):
     return _FollowerConnection(host, status, cartesian, timeout, joint)
 
 
+def decode_joint_replay(data, settings, model):
+    if model is None:
+        raise ValueError('关节轨迹回放需要 A10_fixed.zip')
+    frames = []
+    base_pose = (0., 0., 0., 0., 0., 0., 1.)
+    for sample in data['frames']:
+        actual = _vectors(sample['actual_deg'], 2, 6, 'actual_deg')
+        target = _vectors(sample['target_deg'], 2, 6, 'target_deg')
+        arms = []
+        for side in range(2):
+            meshes = model.link_poses(actual[side], base_pose)
+            arms.append(dict(id=side, base_m=base_pose[:3],
+                             joints_m=[pose[:3] for pose in meshes[1:]],
+                             mesh_pq_m=meshes, offset_m=settings['display_offsets_m'][side],
+                             actual_deg=actual[side], target_deg=target[side]))
+        frames.append(dict(arms=arms, controller_status='历史关节反馈'))
+    return frames
+
+
 def replay_frames(path, settings, model=None):
     data = json.loads(path.read_text(encoding='utf-8'))
+    if isinstance(data, dict) and data.get('format') == 'a10_joint_feedback_v1':
+        if not data['frames']:
+            raise ValueError('回放文件没有关节帧')
+        return decode_joint_replay(data, settings, model)
     entries = data if isinstance(data, list) else [data]
     if not entries:
         raise ValueError('回放文件没有帧')
@@ -202,7 +225,7 @@ def main(argv=None):
     parser.add_argument('--poll-hz', type=float, help='GET 轮询或回放频率')
     parser.add_argument('--model-archive', type=Path, help='A10_fixed URDF 和 STL 的 ZIP 文件')
     source = parser.add_mutually_exclusive_group()
-    source.add_argument('--replay', type=Path, help='GET 回包 JSON，支持单帧或帧数组')
+    source.add_argument('--replay', type=Path, help='GET 回包或 a10_joint_feedback_v1 关节轨迹 JSON')
     source.add_argument('--shared-port', type=int, help='复用正在运行的本机 A10 状态服务')
     args = parser.parse_args(argv)
     try:

@@ -12,8 +12,9 @@
 | [a10_dual_devices.py](a10_dual_devices.py) | 相机与夹爪的身份、连接路径、硬件行程和设备检查参数；换USB口可用 `scripts/a10_devices.py --update` 更新 |
 | [a10_dual_vr.py](a10_dual_vr.py) | VR服务、手柄绑定、坐标映射、按键、倍率、参考轨迹速度/加速度约束、夹爪操控手感和会话策略 |
 | [a10_dual_arm_record.py](a10_dual_arm_record.py) | 数据目录、任务、30Hz采样、录制按键、数据有效性阈值和保存参数 |
-| [a10_dual_fold_inference.py](a10_dual_fold_inference.py) | FluxVLA双臂模型及客户端；默认preview |
-| [a10_dual_openpi_remote.py](a10_dual_openpi_remote.py) | OpenPI双臂客户端；默认preview |
+| [a10_dual_inference.py](a10_dual_inference.py) | 双臂统一推理配置；用 `--model fluxvla/openpi` 选择模型，默认motion |
+| [a10_dual_fold_inference.py](a10_dual_fold_inference.py) | FluxVLA兼容入口，继承统一推理配置 |
+| [a10_dual_openpi_remote.py](a10_dual_openpi_remote.py) | OpenPI兼容入口，继承统一推理配置 |
 | [双臂训练配置](../pi05/pi05_paligemma_a10_dual_fold_10steps.py) | 双臂训练数据、模型及优化设置；资源配置见 [训练说明](../../docs/a10_dual_fold.md) |
 
 `a10_dual_vr.py` 只继承机械臂和设备配置，不经过旧遥操作入口。

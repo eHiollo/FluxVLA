@@ -25,10 +25,6 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --observe
 实机遥操作（默认实机 + 两只知行夹爪，不自动使能或归位）：
 python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py
 
-默认90Hz控制；侧键只平移，前扳机允许局部旋转；松键减速保持会话。
-控制器高频日志默认关闭，本地 JSONL 诊断保持开启。
-清理控制器日志容量后，如需控制器诊断记录，显式加 --record-controller。
-
 临时调整手感（不改配置默认值）：
 python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py \
   --cfg-options teleop.input.mapping.pos_scale=1.2 \
@@ -85,11 +81,9 @@ python scripts/a10_devices.py --update
 只读夹爪状态：
 python scripts/a10_devices.py --check-grippers
 
-夹爪调试网页（唯一UI入口；电脑浏览器打开终端输出的完整链接）：
-python3 scripts/a10_gripper_ui.py
-
-夹爪单次开合命令：
+夹爪开合控制：
 python3 scripts/a10_devices.py --gripper left --open
+python3 scripts/a10_gripper_ui.py
 
 VR网络诊断（将IP换成当前头显地址）：
 python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
@@ -104,22 +98,35 @@ python fluxvla/engines/operators/zx_gripper.py \
 
 四、双臂训练与推理
 
-训练配置：configs/pi05/pi05_paligemma_a10_dual_fold_10steps.py
-数据、统计、基础权重环境变量及训练命令见 docs/a10_dual_fold.md。
-这是十步训练适配配置，运行训练前按该说明设置实际资源路径。
+训练适配示例：configs/pi05/pi05_paligemma_a10_dual_fold_10steps.py。
+当前部署默认使用50k模型，不使用10步接口测试权重。
+模型准备、训练数据约定和推理说明见 docs/a10_dual_fold.md。
 
 FluxVLA模型服务（独立终端）：
 python -m fluxvla.engines.runners.serving.serve \
-  --config configs/a10/a10_dual_fold_inference.py \
-  --from-config --dtype fp32 --host 127.0.0.1 --port 5556
+  --config configs/a10/a10_dual_inference.py \
+  --model fluxvla --from-config --dtype fp32 --host 127.0.0.1 --port 5556
 
-FluxVLA双臂客户端（默认preview，不连接设备或模型服务）：
-python scripts/inference.py --config configs/a10/a10_dual_fold_inference.py
+统一双臂客户端（默认motion，操作前确认现场状态并手动使能）：
+python scripts/inference.py --config configs/a10/a10_dual_inference.py
 
-OpenPI双臂客户端（默认preview；服务在OpenPI侧启动）：
-python scripts/inference.py --config configs/a10/a10_dual_openpi_remote.py
+选择OpenPI模型（服务在OpenPI侧启动）：
+python scripts/inference.py --config configs/a10/a10_dual_inference.py --model openpi
 
-实机只读和运动模式分别为 inference.mode=read_only / motion，详见 docs/a10_dual_fold.md。
+仅预览、不连接模型或设备：
+python scripts/inference.py --config configs/a10/a10_dual_inference.py \
+  --cfg-options inference.mode=preview
+
+默认follower倍率12%、手动倍率100%，电机加速度目标±375°/s²。
+运动前回读加速度，匹配则跳过写入，不匹配由公共预检按控制器权限和状态处理。
+不自动使能或为自动预检停止/卸载其他运动；不满足写入条件时清晰报错。
+遥操作和m_init使用双臂基础配置的加速度目标±1000°/s²。
+每块保留20个30Hz策略点，每点重复两遍，以60Hz发送40包；不做客户端规划或均值补偿。
+发完后保持follower运行，实际12轴误差≤0.5°即停止，无固定稳定等待；
+停止及停止后新反馈核验通过后，才取得新观测。到位超时默认30秒。
+默认100万轮、单次模型超时3600秒、双夹爪报警warn；故障和过期反馈保护保留。
+可选推理等待期只读反馈诊断：--cfg-options inference.trace_inference_feedback=True。
+
 
 五、旧单臂
 
@@ -146,3 +153,40 @@ python -m fluxvla.engines.runners.serving.serve \
 
 旧单臂推理客户端：
 python scripts/inference.py --config configs/a10/a10_single_remote_inference.py
+
+kaanhbin调整加速度
+。项目规定 write_motor 必须在程序**未加载（Unloaded）**时执行，仅停止程序还不够。
+
+在控制器命令终端依次操作：
+
+1. 如果程序正在运行，先停止：
+
+   pgmctrl --stop
+2. 卸载当前程序：
+
+   pgmctrl --unload
+
+   卸载是解除当前加载，不是删除程序文件。
+3. 卸载成功后，保持厂家权限、手动模式、未使能，重新发送你那条完整的 write_motor 指令。
+4. 写入成功后读取确认：
+
+   read_motor --id=0
+
+
+项目控制台加速度快捷命令（需退出并重新启动控制台加载）：
+set_acc 400                 全部12轴设为 max_acc=400、min_acc=-400，单位 °/s²
+set_acc 400 --all           同上
+set_acc 400 --id=0          只修改控制器电机索引0（不是slave_id）
+
+也可单次运行：
+python scripts/a10_control.py --config configs/a10/a10_dual_arm_operator.py set_acc 400
+
+要求厂家权限、手动模式、无故障。指令自动停止follower/程序、卸载至Unloaded，
+然后掉使能并确认Disabled/Stopped后逐轴写入完整配置，仅更改max_acc/min_acc。
+无需手工拼JSON；每轴写后回读全部12轴，其他字段或未选择电机有变化就中止。
+原配置、期望配置、逐条控制器回复、部分完成列表和验证结果保存在
+work_dirs/a10/motor_acc_commands/<时间戳>/。
+超时结果可能未知，不自动重试或回滚；失败时检查error.json和commands.json。
+结束保持未使能、Unloaded，不自动加载程序或使能；此电机限制也影响其他运动方式。
+Python调用：from fluxvla.engines.operators.kaanh_commands.set_acc import set_acceleration
+控制台角色operator在新命令上下文调用 set_acceleration(robot, 400, motor_id=None)。

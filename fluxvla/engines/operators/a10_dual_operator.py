@@ -327,14 +327,12 @@ class A10DualOperator(BaseOperator):
 
         def sample():
             try:
-                deadline = time.monotonic()
                 while not stop.is_set():
+                    started = time.monotonic()
                     reader()
-                    deadline += 1 / 30
-                    now = time.monotonic()
-                    if deadline < now:
-                        deadline = now + 1 / 30
-                    stop.wait(max(0., deadline - now))
+                    # Query starts target 100Hz. Discard missed sampling slots;
+                    # never queue GETs or add a full period after a slow reply.
+                    stop.wait(max(0., .01 - (time.monotonic() - started)))
             except Exception as exc:
                 failures.append(exc)
                 stop.set()

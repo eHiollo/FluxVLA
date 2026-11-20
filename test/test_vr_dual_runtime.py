@@ -913,10 +913,10 @@ class CachedFeedbackRuntimeTest(unittest.TestCase):
         robot.start_feedback_polling = lambda hz: robot.events.append(('poll', hz))
         robot.get_cached_frame = lambda: robot.get_frame()
         runtime = DualVRTeleopRuntime(vr, robot, execute=True, control_mode='reference',
-                                     feedback_poll_hz=30)
+                                     feedback_poll_hz=100)
         try:
             runtime.connect()
-            self.assertIn(('poll', 30), robot.events)
+            self.assertIn(('poll', 100), robot.events)
             cached = robot.get_frame()
             with patch.object(robot, 'get_cached_frame', return_value=cached) as read_cache, \
                  patch.object(robot, 'get_frame', wraps=robot.get_frame) as read_fresh:

@@ -1071,7 +1071,7 @@ class A10Operator(BaseOperator):
                 self._started_here = True
             return reply
 
-    def start_feedback_polling(self, hz=30.):
+    def start_feedback_polling(self, hz=100.):
         """Subscribe to the shared service's single controller GET worker.
 
         A separate local worker reads/parses shared snapshots at this rate.

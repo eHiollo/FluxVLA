@@ -33,7 +33,7 @@ teleop = dict(
     confirm_stop=False,  # Send stop only; do not claim a confirmed physical stop.
     keep_session_on_query_error=True,
     # Control uses sent references; background measured GET is for recording.
-    continuous_feedback=False, feedback_poll_hz=30,
+    continuous_feedback=False, feedback_poll_hz=100,
     controller_speed_percent=70,
     # Bounds shape frontend targets, not motor limits or collision distances.
     reference_options=dict(

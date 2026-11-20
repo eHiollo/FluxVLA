@@ -9,7 +9,39 @@ from fluxvla.engines.operators.a10_operator import A10Operator, A10ControllerErr
 from fluxvla.engines.communication.a10_shared_server import SharedControl, SharedControlServer
 
 
+class FeedbackScheduleTest(unittest.TestCase):
+    def test_100hz_overrun_skips_missed_samples_without_extra_wait(self):
+        service = SharedControl('127.0.0.1')  # No sockets are connected.
+        service._poll_rates['test'] = 100.
+        clock = [0.]
+        waits = []
+        durations = iter((.004, .015, .004))
+
+        def read():
+            clock[0] += next(durations)
+            return status_reply()
+
+        def wait(delay):
+            waits.append(delay)
+            clock[0] += delay
+            if len(waits) == 3:
+                service._poll_stop.set()
+
+        with patch.object(service, 'read_state', side_effect=read), \
+             patch.object(service._poll_wakeup, 'wait', side_effect=wait), \
+             patch('fluxvla.engines.communication.a10_shared_server.time.monotonic',
+                   side_effect=lambda: clock[0]):
+            service._poll_feedback()
+        self.assertEqual(service._poll_count, 3)
+        for actual, expected in zip(waits, (.006, 0., .006)):
+            self.assertAlmostEqual(actual, expected)
+
+
 class FeedbackPollingTest(unittest.TestCase):
+    def test_default_subscription_requests_100hz(self):
+        metrics = self.client.start_feedback_polling()
+        self.assertEqual(metrics['requested_hz'], 100.)
+
     def setUp(self):
         self.fake = FakeController().__enter__()
         port = self.fake.server.socket.getsockname()[1]

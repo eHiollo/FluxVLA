@@ -49,7 +49,7 @@ inference = dict(
         position_tolerance_deg=.5, speed_tolerance_deg_s=None,
         stable_duration_s=0., max_feedback_gap_s=.1,
     ),
-    # Optional read-only 30Hz feedback while the synchronous model call waits.
+    # Optional read-only 100Hz feedback while the synchronous model call waits.
     trace_inference_feedback=False,
     max_joint_step_rad=0.2,
 )

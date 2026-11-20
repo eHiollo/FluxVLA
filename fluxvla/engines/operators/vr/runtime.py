@@ -1244,8 +1244,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                 raise ValueError('Command-only control requires SDK cumulative mode without measured tracking/lead limits')
         if feedback_poll_hz is not None and (isinstance(feedback_poll_hz, bool)
                 or not isinstance(feedback_poll_hz, (float, int))
-                or not math.isfinite(feedback_poll_hz) or not 1 <= feedback_poll_hz <= 90):
-            raise ValueError('feedback_poll_hz must be None or within 1..90 Hz')
+                or not math.isfinite(feedback_poll_hz) or not 1 <= feedback_poll_hz <= 100):
+            raise ValueError('feedback_poll_hz must be None or within 1..100 Hz')
         self.feedback_poll_hz = feedback_poll_hz
         self._feedback_polling = False
         if not self.reference_control.config.limit_acceleration:

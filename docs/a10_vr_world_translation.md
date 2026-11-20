@@ -15,7 +15,7 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py --preview
 VR映射、手感和会话参数统一在 `a10_dual_vr.py`。完整分工见[配置索引](../configs/a10/README.md)。
 新入口不自动使能或回初始位；接管时读取状态和末端朝向；位置参考使用本地零点，测试台虚拟位姿不作为实机绝对目标。
 
-新配置选择 `pose_mapping='world_translation_local_rotation'`，控制 90 Hz；只有附带录制时订阅 30 Hz 反馈，
+新配置选择 `pose_mapping='world_translation_local_rotation'`，控制 90 Hz；只有附带录制时订阅 100 Hz 反馈，
 运动参数与左右手绑定统一在 `a10_dual_vr.py` 维护；每手轴矩阵只作用于世界平移，局部旋转不变。
 不读取或要求 VR 标定文件，也不改变 VR 网页和机器人协议。
 
@@ -83,7 +83,7 @@ VR 断流、输入异常、发送失败、退出/Ctrl+C 仍请求停止跟随。
 原始实际反馈与接收时间保持原样，不把指令位置伪装成实测位置。
 运行时仍支持 `continuous_feedback=True` 的反馈约束路径；当前入口默认关闭。
 
-不带 `--record-config` 时不订阅后台 GET；带录制配置时继续订阅 30 Hz 实际反馈，
+不带 `--record-config` 时不订阅后台 GET；带录制配置时继续订阅 100 Hz 实际反馈，
 用于真实关节状态和数据记录。新配置通过 `operator.shared_control.require_feedback=False`
 解除反馈轮询错误与目标权限的耦合；录制仍会报告查询失败并使缺失反馈的一集失效。
 这不掩盖运动发送链路本身的断开，也不允许抢占其他会话。
@@ -109,3 +109,6 @@ VR 断流、输入异常、循环超时、目标发送失败仍停发目标；�
 只重设旋转参考，不重设平移锚点，也不重启整组跟随；另一只手互不影响。
 内部锚点指令用 `rotation_enabled` 传递模式，不改变机器人 UDP 协议。
 旧单臂配置继续沿用原侧键行为；当前双臂入口启用仅平移侧键。
+
+后台 GET 以100Hz为目标，慢回复时跳过错过的采样周期，不补发堆积请求；缓存仅保留最新实际反馈。
+实际查询频率取决于控制器响应时间，录制仍按独立的30Hz采样节拍运行。

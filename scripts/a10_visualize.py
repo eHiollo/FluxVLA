@@ -9,6 +9,8 @@ import runpy
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 
 
 HERE = Path(__file__).resolve().parent
@@ -16,6 +18,8 @@ DEFAULT_CONFIG = HERE.parent / 'configs/a10/a10_visualizer.py'
 
 # Use the transport from this checkout even when another checkout is installed.
 sys.path.insert(0, str(HERE.parent))
+
+from scripts.a10_visualizer.model import A10MeshModel, rotate
 
 
 def _vectors(values, rows, width, field):
@@ -35,22 +39,11 @@ def _pose(values, position_scale):
     return [x * position_scale for x in values[:3]] + [x / norm for x in values[3:]]
 
 
-def _rotate(xyz, quat):
-    x, y, z = xyz
-    qx, qy, qz, qw = quat
-    tx = 2 * (qy * z - qz * y)
-    ty = 2 * (qz * x - qx * z)
-    tz = 2 * (qx * y - qy * x)
-    return (x + qw * tx + qy * tz - qz * ty,
-            y + qw * ty + qz * tx - qx * tz,
-            z + qw * tz + qx * ty - qy * tx)
-
-
 def _world_point(pose, offset):
-    return [p + d for p, d in zip(pose[:3], _rotate(offset, pose[3:]))]
+    return [p + d for p, d in zip(pose[:3], rotate(offset, pose[3:]))]
 
 
-def decode_frame(reply, settings):
+def decode_frame(reply, settings, model=None):
     context = reply.get('ret_context', reply)
     if isinstance(context, str):
         context = json.loads(context)
@@ -72,11 +65,15 @@ def decode_frame(reply, settings):
         poses = [_pose(p, pos_scale) for p in _vectors(group, 7, 7, f'part_pq[{side}]')]
         joints = [_world_point(poses[parent], marker)
                   for parent, marker in settings['joint_markers']]
-        arms.append(dict(id=side, base_m=poses[0][:3], joints_m=joints,
-                         tcp_pq_m=_pose(tcp[side], pos_scale),
-                         offset_m=settings['display_offsets_m'][side],
-                         actual_deg=[x * to_deg for x in actual[side]],
-                         target_deg=[x * to_deg for x in target[side]]))
+        actual_deg = [x * to_deg for x in actual[side]]
+        arm = dict(id=side, base_m=poses[0][:3], joints_m=joints,
+                   tcp_pq_m=_pose(tcp[side], pos_scale),
+                   offset_m=settings['display_offsets_m'][side],
+                   actual_deg=actual_deg,
+                   target_deg=[x * to_deg for x in target[side]])
+        if model is not None:
+            arm['mesh_pq_m'] = model.link_poses(actual_deg, poses[0])
+        arms.append(arm)
     return dict(arms=arms, mode=robot.get('op_mode'), motor=robot.get('activate'),
                 motion=robot.get('motion'), controller_status=robot.get('status'),
                 follower_active=follower.get('running_state'),
@@ -113,7 +110,7 @@ class ViewerState:
                         stale=stale, age_ms=None if age is None else round(age * 1000))
 
 
-def read_live(connection_factory, state, settings, stopped):
+def read_live(connection_factory, state, settings, stopped, model=None):
     interval = 1 / settings['poll_hz']
     while not stopped.is_set():
         connection = None
@@ -124,7 +121,7 @@ def read_live(connection_factory, state, settings, stopped):
                 started = time.monotonic()
                 reply = connection.request('get', status=True)
                 try:
-                    state.publish(decode_frame(reply, settings))
+                    state.publish(decode_frame(reply, settings, model))
                 except (KeyError, TypeError, ValueError, AttributeError) as exc:
                     state.failed(f'反馈格式异常：{exc}')
                 stopped.wait(max(0., interval - (time.monotonic() - started)))
@@ -153,19 +150,27 @@ def connection_for(settings, shared_port):
     return _FollowerConnection(host, status, cartesian, timeout, joint)
 
 
-def replay_frames(path, settings):
+def replay_frames(path, settings, model=None):
     data = json.loads(path.read_text(encoding='utf-8'))
     entries = data if isinstance(data, list) else [data]
     if not entries:
         raise ValueError('回放文件没有帧')
-    return [decode_frame(entry.get('state', entry), settings) for entry in entries]
+    return [decode_frame(entry.get('state', entry), settings, model) for entry in entries]
 
 
-def serve_page(page, state):
+def serve_page(page, mesh_script, state, model):
+    mesh_manifest = json.dumps(model.visuals if model else None).encode()
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == '/':
                 payload, media = page, 'text/html; charset=utf-8'
+            elif self.path == '/mesh.js':
+                payload, media = mesh_script, 'text/javascript; charset=utf-8'
+            elif self.path == '/model':
+                payload, media = mesh_manifest, 'application/json; charset=utf-8'
+            elif model is not None and self.path in model.meshes:
+                payload, media = model.meshes[self.path], 'model/stl'
             elif self.path == '/state':
                 payload = json.dumps(state.snapshot(), ensure_ascii=False).encode()
                 media = 'application/json; charset=utf-8'
@@ -195,6 +200,7 @@ def main(argv=None):
     parser.add_argument('--status-port', type=int, help='GET WebSocket 端口')
     parser.add_argument('--listen-port', type=int, help='网页的本机端口')
     parser.add_argument('--poll-hz', type=float, help='GET 轮询或回放频率')
+    parser.add_argument('--model-archive', type=Path, help='A10_fixed URDF 和 STL 的 ZIP 文件')
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--replay', type=Path, help='GET 回包 JSON，支持单帧或帧数组')
     source.add_argument('--shared-port', type=int, help='复用正在运行的本机 A10 状态服务')
@@ -214,10 +220,18 @@ def main(argv=None):
         mode = 'replay' if args.replay else 'live'
         label = args.replay.name if args.replay else f"{settings['host']}:{settings['status_port']}"
         state = ViewerState(label, mode, settings['stale_after_s'])
-        frames = replay_frames(args.replay, settings) if args.replay else None
-        page = (HERE / 'a10_visualizer/index.html').read_bytes()
-        server = ThreadingHTTPServer(('127.0.0.1', settings['listen_port']), serve_page(page, state))
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        archive = args.model_archive or HERE.parent / 'others/A10_fixed.zip'
+        model = A10MeshModel(archive) if args.model_archive is not None or archive.is_file() else None
+        if model is None:
+            print(f'未找到实体模型 {archive}，使用骨架显示。', file=sys.stderr)
+        frames = replay_frames(args.replay, settings, model) if args.replay else None
+        viewer_dir = HERE / 'a10_visualizer'
+        page = (viewer_dir / 'index.html').read_bytes()
+        mesh_script = (viewer_dir / 'mesh.js').read_bytes()
+        server = ThreadingHTTPServer(('127.0.0.1', settings['listen_port']),
+                                     serve_page(page, mesh_script, state, model))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, ET.ParseError,
+            zipfile.BadZipFile) as exc:
         parser.exit(2, f'启动失败：{exc}\n')
 
     stopped = threading.Event()
@@ -234,7 +248,7 @@ def main(argv=None):
     else:
         worker = threading.Thread(
             target=read_live,
-            args=(lambda: connection_for(settings, args.shared_port), state, settings, stopped),
+            args=(lambda: connection_for(settings, args.shared_port), state, settings, stopped, model),
             daemon=True,
         )
     worker.start()

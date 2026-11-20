@@ -55,6 +55,9 @@ button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .stage { position: relative; background: var(--canvas); }
 canvas { display: block; width: 100%; height: clamp(330px, 51vw, 570px); touch-action: none; cursor: grab; }
 canvas:active { cursor: grabbing; }
+#mesh[hidden] { display: none; }
+#mesh { position: absolute; inset: 0; pointer-events: none; }
+#scene { position: relative; }
 .empty {
   position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
   pointer-events: none; background: #0c141f9c;
@@ -101,7 +104,7 @@ tbody tr:nth-child(odd) { background: #16202c; }
   <div class="layout">
     <section class="panel" aria-labelledby="scene-title">
       <header class="panel-header">
-        <h2 id="scene-title">三维骨架</h2>
+        <h2 id="scene-title">双臂三维视图</h2>
         <div class="scene-tools">
           <button id="zoom-out" aria-label="缩小">−</button>
           <button id="zoom-in" aria-label="放大">+</button>
@@ -109,12 +112,13 @@ tbody tr:nth-child(odd) { background: #16202c; }
         </div>
       </header>
       <div class="stage">
+        <canvas id="mesh" aria-hidden="true"></canvas>
         <canvas id="scene" aria-label="双臂三维视图"></canvas>
         <p class="empty" id="empty">正在等待第一帧</p>
       </div>
       <div class="legend">
         <span class="arm arm0">ID 0</span><span class="arm arm1">ID 1</span>
-        <small>示意布局 · 拖动旋转 · 滚轮缩放</small>
+        <small><span id="mesh-mode">加载实体模型…</span> · 示意布局 · 拖动旋转 · 滚轮缩放</small>
       </div>
     </section>
     <aside class="panel" aria-labelledby="joints-title">
@@ -124,6 +128,7 @@ tbody tr:nth-child(odd) { background: #16202c; }
   </div>
   <p class="panel muted" id="diagnostics" role="status">等待控制器状态</p>
 </main>
+<script src="/mesh.js"></script>
 <script>
 "use strict";
 const el = id => document.getElementById(id);
@@ -136,6 +141,7 @@ const view = { ...initialView };
 let frame = null;
 let drag = null;
 let stale = true;
+let paintMeshes = null;
 const words = {
   Manual: "手动", Auto: "自动", Enabled: "已使能", Disabled: "未使能",
   Stopped: "已停止", Running: "运动中", Normal: "正常",
@@ -178,8 +184,8 @@ function draw() {
   function project([x, y, z]) {
     const forward = x * sy + y * cy;
     return [width / 2 + (x * cy - y * sy) * size,
-      height * 0.61 + (forward * sp - (z - 0.30) * cp) * size,
-      forward * cp + (z - 0.30) * sp];
+      height * 0.61 - (forward * sp + (z - 0.30) * cp) * size,
+      forward * cp - (z - 0.30) * sp];
   }
   function line(a, b, color, thickness) {
     ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]);
@@ -189,10 +195,14 @@ function draw() {
     ctx.beginPath(); ctx.arc(p[0], p[1], radius, 0, Math.PI * 2);
     ctx.fillStyle = color; ctx.fill();
   }
-  for (let i = -6; i <= 6; i++) {
-    const k = i * 0.35;
-    line(project([k, -2.1, 0]), project([k, 2.1, 0]), "#233347", 1);
-    line(project([-2.1, k, 0]), project([2.1, k, 0]), "#233347", 1);
+  if (paintMeshes) {
+    paintMeshes(frame, view, width, height, dpr, size, stale);
+  } else {
+    for (let i = -6; i <= 6; i++) {
+      const k = i * 0.35;
+      line(project([k, -2.1, 0]), project([k, 2.1, 0]), "#233347", 1);
+      line(project([-2.1, k, 0]), project([2.1, k, 0]), "#233347", 1);
+    }
   }
   if (!frame) return;
   ctx.globalAlpha = stale ? 0.60 : 1;
@@ -200,16 +210,17 @@ function draw() {
   for (const arm of frame.arms) {
     const color = colors[arm.id];
     const base = project(add(arm.base_m, arm.offset_m));
-    const points = [base, ...arm.joints_m.map(point => project(add(point, arm.offset_m)))];
     const tcpXYZ = add(arm.tcp_pq_m.slice(0, 3), arm.offset_m);
     const tcp = project(tcpXYZ);
-    dot(base, 9, color);
-    points.push(tcp);
-    points.slice(1).forEach((p, i) => {
-      const previous = points[i];
-      segments.push({ previous, p, depth: p[2] + previous[2], color });
-      if (i < 6) joints.push({ p, color });
-    });
+    if (!paintMeshes) {
+      const points = [base, ...arm.joints_m.map(point => project(add(point, arm.offset_m))), tcp];
+      dot(base, 9, color);
+      points.slice(1).forEach((p, i) => {
+        const previous = points[i];
+        segments.push({ previous, p, depth: p[2] + previous[2], color });
+        if (i < 6) joints.push({ p, color });
+      });
+    }
     tcpAxes.push({ tcp, tips: axisColors.map((_, index) => {
       const axis = [0, 0, 0];
       axis[index] = 0.16;
@@ -321,6 +332,22 @@ async function refresh() {
   }
   setTimeout(refresh, 100);
 }
+function showSkeleton(reason) {
+  paintMeshes = null;
+  el("mesh").hidden = true;
+  setText("mesh-mode", reason);
+  draw();
+}
+el("mesh").addEventListener("webglcontextlost", () => showSkeleton("WebGL 中断 · 骨架"));
+loadA10Meshes(el("mesh")).then(paint => {
+  if (!paint) {
+    showSkeleton("未提供模型 · 骨架");
+    return;
+  }
+  paintMeshes = paint;
+  setText("mesh-mode", "A10 实体模型");
+  draw();
+}).catch(error => showSkeleton(`${error.message} · 骨架`));
 refresh();
 </script>
 </body>

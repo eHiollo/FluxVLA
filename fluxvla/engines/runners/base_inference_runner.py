@@ -354,30 +354,37 @@ class BaseInferenceRunner:
             instructions = self._get_user_task_instruction(default_instruction)
             self._prev_ctx = None
             for instruction in instructions:
-                self._action_ctx = SimpleNamespace()
-                self._action_ctx.instruction = instruction
-                inputs = self._preprocess(instruction)
-
-                with torch.autocast(
-                        'cuda',
-                        dtype=self.mixed_precision_dtype,
-                        enabled=(self.enable_mixed_precision
-                                 and not self._use_remote)):
-                    raw_action = self._predict_action(inputs)
-                actions = self._postprocess_actions(raw_action)
-                self._execute_actions(actions, rate)
-
-                if self._poll_keyboard_pause():
-                    self.reset_inference_history()
+                _, paused = self._run_action_chunk(instruction, rate)
+                if paused:
                     overwatch.info('Paused after the current action chunk; '
                                    'waiting for the next instruction.')
                     return
 
-                self._prev_ctx = self._action_ctx
                 t += (
                     getattr(self, 'execute_horizon', None)
                     or self.action_chunk)
                 overwatch.info(f'Published Step {t}')
+
+    def _run_action_chunk(self, instruction, rate=None):
+        """Common chunk lifecycle, independent of ROS and the hardware clock.
+
+        Operators finish publishing the chunk before this returns. A configured
+        operator may also require actual-position arrival before returning.
+        """
+        self._action_ctx = SimpleNamespace(instruction=instruction)
+        inputs = self._preprocess(instruction)
+        with torch.autocast(
+                'cuda', dtype=self.mixed_precision_dtype,
+                enabled=self.enable_mixed_precision and not self._use_remote):
+            raw_action = self._predict_action(inputs)
+        actions = self._postprocess_actions(raw_action)
+        self._execute_actions(actions, rate)
+        paused = self._poll_keyboard_pause()
+        if paused:
+            self.reset_inference_history()
+        else:
+            self._prev_ctx = self._action_ctx
+        return actions, paused
 
     def _preprocess(self, instruction: str) -> dict:
         """Observe environment and build model inputs.

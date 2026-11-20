@@ -68,6 +68,63 @@ class Device(b.SimDevices):
         self.closed = True
 
 
+def live_device_fixture(clock=None, query_s=0., send_s=0.):
+    """Real LiveDevices logic with in-memory hardware and a controllable clock."""
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    d = object.__new__(b.LiveDevices)
+    sample = Device().sample()
+    state = SimpleNamespace(
+        has_error=False, follower_active=True, follower_mode="Axis",
+        raw={"ret_context": {"robot_msg": {"activate": "Enabled", "motion": "Stopped"}}},
+        received_monotonic_s=b.time.monotonic(),
+        arms={
+            "left": SimpleNamespace(ee_id=0, actual_joints_rad=sample["joints"][0]),
+            "right": SimpleNamespace(ee_id=1, actual_joints_rad=sample["joints"][1]),
+        },
+    )
+    d.lock = threading.Lock()
+    d.write_locks = {s: threading.Lock() for s in ("left", "right")}
+    d.cancel, d.quit = threading.Event(), threading.Event()
+    d.feedback, d.gripper_faults, d.grips = {}, {}, {}
+    d.error, d.target, d._checked_state = None, None, None
+    d._speed_restore = None
+    d.gripper_pause_required, d.attempted, d.motion = False, False, True
+    d.threads = []
+    d.cfg, d.log = {"bridge": SETTINGS}, Mock()
+
+    def get_state():
+        if clock:
+            clock.sleep(query_s)
+        now = b.time.monotonic()
+        state.received_monotonic_s = now
+        d.feedback = {s: (v, now, True) for s, v in sample["grippers"].items()}
+        return state
+
+    def snapshot(_):
+        return {n: dict(image=img, received_monotonic_s=b.time.monotonic())
+                for n, img in sample["images"].items()}
+
+    def start(_):
+        state.follower_active = True
+
+    def stop():
+        state.follower_active = False
+        return state
+
+    d.robot = Mock()
+    d.robot.get_state.side_effect = get_state
+    d.robot.start_follower.side_effect = start
+    d.robot.stop_follower.side_effect = stop
+    if clock:
+        d.robot.send_joints.side_effect = lambda _: clock.sleep(send_s)
+    d.cameras = Mock()
+    d.cameras.snapshot.side_effect = snapshot
+    return d, state
+
+
 class BridgeTests(unittest.TestCase):
     def run_bridge(self, device, policy, clock=None, **kw):
         return b.run(device, policy, SETTINGS, lambda *a, **k: None, clock=clock or Clock(), **kw)
@@ -85,7 +142,7 @@ class BridgeTests(unittest.TestCase):
         clock = Clock()
         self.run_bridge(device, policy, clock=clock)
         self.assertEqual(device.sent, 20)
-        self.assertEqual(device.stops, 2)
+        self.assertEqual(device.stops, 1)
         self.assertAlmostEqual(clock.now, 20 / 30)
         self.assertTrue(device.closed and policy.closed)
 
@@ -165,12 +222,45 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue((actions[:, :6] == 1).all())
         self.assertTrue((raw[:, 6] == -2).all())
 
-    def test_unconfirmed_stop_never_next_cycle(self):
+    def test_unconfirmed_exit_stop_is_reported(self):
         d = Device()
         d.stop = lambda: False
         with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
             self.run_bridge(d, Policy())
+        self.assertEqual(d.sent, 20)
+
+    def test_30hz_retains_follower_across_predictions_without_replaying_targets(self):
+        from unittest.mock import Mock
+
+        d, policy, clock = Device(), Policy(), Clock()
+        d.start = Mock(wraps=d.start)
+        infer = policy.infer
+        observations = []
+
+        def predict(obs):
+            observations.append((d.active, d.sent))
+            clock.sleep(.5)
+            return infer(obs)
+
+        policy.infer = predict
+        self.run_bridge(d, policy, clock=clock, cycles=3)
+        self.assertEqual(observations, [(False, 0), (True, 10), (True, 20)])
+        d.start.assert_called_once()
+        self.assertEqual(d.stops, 1)
+        self.assertFalse(d.active)
+        self.assertEqual(d.sent, 30)
+
+    def test_prediction_failure_after_first_chunk_stops_retained_follower(self):
+        from unittest.mock import Mock
+
+        d, policy = Device(), Policy()
+        first = policy.infer(b.observation(d.sample(), SETTINGS))
+        policy.infer = Mock(side_effect=[first, TimeoutError("model timeout")])
+        with self.assertRaisesRegex(TimeoutError, "model timeout"):
+            self.run_bridge(d, policy)
         self.assertEqual(d.sent, 10)
+        self.assertEqual(d.stops, 1)
+        self.assertFalse(d.active)
 
     def test_failed_start_still_stops(self):
         d = Device()
@@ -185,26 +275,111 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(d.sent, 0)
 
     def test_real_adapter_joint_mapping_and_gripper_raw_target(self):
-        from types import SimpleNamespace
-        import threading
-
-        d = object.__new__(b.LiveDevices)
-        received = []
-        d.robot = SimpleNamespace(
-            get_state=lambda: SimpleNamespace(
-                arms={
-                    "left": SimpleNamespace(ee_id=0),
-                    "right": SimpleNamespace(ee_id=1),
-                }
-            ),
-            send_joints=lambda x: received.append(x),
-        )
-        d.lock = threading.Lock()
+        d, _ = live_device_fixture()
         row = np.array([1] * 6 + [0.25] + [2] * 6 + [0.75], dtype=float)
+        d.check()
         d.send(row)
-        np.testing.assert_array_equal(received[0]["right"], [1] * 6)
-        np.testing.assert_array_equal(received[0]["left"], [2] * 6)
+        received = d.robot.send_joints.call_args.args[0]
+        np.testing.assert_array_equal(received["right"], [1] * 6)
+        np.testing.assert_array_equal(received["left"], [2] * 6)
         np.testing.assert_array_equal(d.target[0], row)
+        d.robot.get_state.assert_called_once()
+        self.assertIsNone(d._checked_state)
+        # A second send cannot silently reuse the previous frame's feedback.
+        d.send(row)
+        self.assertEqual(d.robot.get_state.call_count, 2)
+
+    def test_delayed_or_faulted_send_rejects_checked_feedback(self):
+        from unittest.mock import patch
+
+        for failure in ("robot_stale", "gripper_stale", "camera_stale", "gripper_fault"):
+            with self.subTest(failure=failure):
+                clock = Clock()
+                with patch.object(b.time, "monotonic", side_effect=clock.monotonic):
+                    d, _ = live_device_fixture(clock)
+                    d.check()
+                    if failure == "robot_stale":
+                        clock.sleep(SETTINGS["max_robot_age_s"] + .01)
+                    elif failure == "gripper_stale":
+                        d.feedback["left"] = (1000, -1., True)
+                    elif failure == "camera_stale":
+                        d.cameras.snapshot.side_effect = lambda _: {
+                            n: dict(image=np.zeros((2, 2, 3), np.uint8), received_monotonic_s=-1.)
+                            for n in b.CAMERAS
+                        }
+                    else:
+                        d.gripper_pause_required = True
+                    with self.assertRaises(RuntimeError):
+                        d.send(np.zeros(14))
+                    d.robot.send_joints.assert_not_called()
+                    d.robot.get_state.assert_called_once()
+                    self.assertIsNone(d._checked_state)
+
+    def test_follower_faults_and_missing_mapping_send_nothing(self):
+        for failure in ("alarm", "inactive", "wrong_mode", "missing_arm"):
+            with self.subTest(failure=failure):
+                d, state = live_device_fixture()
+                if failure == "alarm":
+                    state.has_error = True
+                elif failure == "inactive":
+                    state.follower_active = False
+                elif failure == "wrong_mode":
+                    state.follower_mode = "Cart"
+                else:
+                    state.arms["left"].ee_id = 1
+                with self.assertRaises((RuntimeError, ValueError)):
+                    d.send(np.zeros(14))
+                d.robot.send_joints.assert_not_called()
+
+    def test_backend_control_rejection_does_not_publish_gripper_target(self):
+        d, _ = live_device_fixture()
+        d.robot.send_joints.side_effect = PermissionError("control revoked")
+        d.check()
+        with self.assertRaisesRegex(PermissionError, "control revoked"):
+            d.send(np.zeros(14))
+        d.robot.get_state.assert_called_once()
+        self.assertIsNone(d._checked_state)
+        self.assertIsNone(d.target)
+
+    def test_stop_invalidates_checked_feedback(self):
+        d, _ = live_device_fixture()
+        d.check()
+        self.assertIsNotNone(d._checked_state)
+        self.assertTrue(d.stop())
+        self.assertIsNone(d._checked_state)
+
+    def test_one_query_per_frame_avoids_cumulative_30hz_overrun(self):
+        from unittest.mock import patch
+
+        clock = Clock()
+        with patch.object(b.time, "monotonic", side_effect=clock.monotonic):
+            d, _ = live_device_fixture(clock, query_s=.014, send_s=.003)
+            events = []
+            settings = dict(SETTINGS, execute_horizon=30)
+            b.run(d, Policy(), settings, lambda event, **data: events.append((event, data)),
+                  cycles=1, clock=clock)
+            # Two observations per prediction, then one query per frame.
+            self.assertEqual(d.robot.get_state.call_count, 32)
+            self.assertEqual(d.robot.send_joints.call_count, 30)
+            sent = [data for event, data in events if event == "sent"]
+            self.assertTrue(all(abs(row["check_s"] - .014) < 1e-8 for row in sent))
+            self.assertTrue(all(abs(row["send_s"] - .003) < 1e-8 for row in sent))
+            self.assertLess(clock.now, 1.04)
+
+    def test_slow_feedback_still_stops_before_sending(self):
+        from unittest.mock import patch
+
+        clock = Clock()
+        with patch.object(b.time, "monotonic", side_effect=clock.monotonic):
+            d, _ = live_device_fixture(clock, query_s=.11)
+            events = []
+            with self.assertRaisesRegex(RuntimeError, "Feedback check exceeded"):
+                b.run(d, Policy(), SETTINGS, lambda event, **data: events.append((event, data)),
+                      cycles=1, clock=clock)
+            d.robot.send_joints.assert_not_called()
+            d.robot.stop_follower.assert_called_once()
+            missed = next(data for event, data in events if event == "send_deadline_missed")
+            self.assertAlmostEqual(missed["check_s"], .11)
 
     def test_gripper_worker_rate_raw_and_cancel(self):
         from types import SimpleNamespace
@@ -218,12 +393,14 @@ class BridgeTests(unittest.TestCase):
         d.cancel = threading.Event()
         d.feedback = {}
         d.error = None
+        d.gripper_faults, d.gripper_pause_required = {}, False
         row = np.zeros(14)
         row[6] = 0.25
         d.target = (row, b.time.monotonic() + 1)
         state = SimpleNamespace(position_raw=1000, has_error=False, enabled=True)
         d.grips = {
             "left": SimpleNamespace(
+                connect=lambda: None,
                 read_state=lambda _: state,
                 set_position_raw=lambda *args, **kw: writes.append((args, kw)),
             )
@@ -250,6 +427,193 @@ class BridgeTests(unittest.TestCase):
         d.quit = Quit()
         d._gripper_worker("left", dict(device_id=1, speed=5, torque=60))
         self.assertEqual(writes, [])
+
+    def test_gripper_expiry_and_stop_cancel_keep_worker_alive(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import threading
+        from fluxvla.engines.operators.zx_gripper import ZXGripperInputExpired
+
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                d = object.__new__(b.LiveDevices)
+                d.lock = threading.Lock()
+                d.write_locks = {"left": threading.Lock()}
+                d.cancel = threading.Event()
+                d.feedback, d.error = {}, None
+                d.gripper_faults, d.gripper_pause_required = {}, False
+                d.log = Mock()
+                row = np.zeros(14)
+                d.target = (row, b.time.monotonic() + 10)
+                state = SimpleNamespace(position_raw=1000, has_error=False, enabled=True)
+                attempts = []
+
+                def write(*args, **kwargs):
+                    attempts.append(args[1])
+                    if len(attempts) == 1:
+                        if cancelled:
+                            d.cancel.set()
+                            d.target = None
+                        raise ZXGripperInputExpired("expired during serial I/O")
+
+                grip = SimpleNamespace(connect=Mock(), read_state=Mock(return_value=state), set_position_raw=write)
+                d.grips = {"left": grip}
+
+                class Quit:
+                    ticks = 0
+
+                    def is_set(self):
+                        return self.ticks == 3
+
+                    def wait(self, seconds):
+                        self.ticks += 1
+                        if self.ticks == 2:
+                            # Next action chunk supplies a fresh target.
+                            d.cancel.clear()
+                            fresh = row.copy()
+                            fresh[6] = 0.5
+                            d.target = (fresh, b.time.monotonic() + 10)
+                        else:
+                            d.target = None
+
+                d.quit = Quit()
+                d._gripper_worker("left", dict(device_id=1, speed=5, torque=60))
+                self.assertIsNone(d.error)
+                self.assertEqual(grip.read_state.call_count, 3)
+                self.assertEqual(attempts, [0, 4500])
+                d.log.assert_called_once()
+                self.assertEqual(d.log.call_args.kwargs["cancelled"], cancelled)
+
+    def test_gripper_faults_keep_polling_and_latch_pause(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import threading
+        from fluxvla.engines.operators.zx_gripper import ZXGripperCommunicationError
+
+        healthy = SimpleNamespace(position_raw=1000, has_error=False, enabled=True)
+        alarm = SimpleNamespace(has_error=True, alarm_a=2, alarm_b=0)
+        for failure in (ZXGripperCommunicationError("timeout"), alarm):
+            with self.subTest(failure=failure):
+                d = object.__new__(b.LiveDevices)
+                d.lock = threading.Lock()
+                d.write_locks = {"left": threading.Lock()}
+                d.cancel = threading.Event()
+                d.feedback, d.error = {}, None
+                d.gripper_faults = {"right": "other fault"}
+                d.gripper_pause_required = False
+                d.target = (np.zeros(14), b.time.monotonic() + 10)
+                d.log = Mock()
+                grip = Mock()
+                grip.read_state.side_effect = [failure, healthy]
+                d.grips = {"left": grip}
+
+                class Quit:
+                    ticks = 0
+
+                    def is_set(self):
+                        return self.ticks == 2
+
+                    def wait(self, seconds):
+                        self.ticks += 1
+
+                d.quit = Quit()
+                d._gripper_worker("left", dict(device_id=1, speed=5, torque=60))
+                self.assertIsNone(d.error)
+                self.assertEqual(grip.read_state.call_count, 2)
+                grip.disconnect.assert_called_once()
+                grip.set_position_raw.assert_not_called()
+                self.assertTrue(d.cancel.is_set())
+                self.assertTrue(d.gripper_pause_required)
+                self.assertIsNone(d.target)
+                self.assertEqual(d.gripper_faults, {"right": "other fault"})
+                with self.assertRaises(b.GripperFault):
+                    d.sample()
+
+    def test_drop_alarm_warn_continues_but_mixed_alarm_pauses(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import threading
+
+        for alarm_a, alarm_b, paused in [(0, 0x1000, False), (1, 0x1000, True), (0, 0x1001, True)]:
+            with self.subTest(alarm_a=alarm_a, alarm_b=alarm_b):
+                d = object.__new__(b.LiveDevices)
+                d.lock = threading.Lock()
+                d.write_locks = {"left": threading.Lock()}
+                d.cancel = threading.Event()
+                d.feedback, d.error, d.gripper_faults = {}, None, {}
+                d.gripper_pause_required = False
+                d.target = (np.zeros(14), b.time.monotonic() + 10)
+                d.log = Mock()
+                grip = Mock()
+                grip.read_state.return_value = SimpleNamespace(
+                    has_error=True, alarm_a=alarm_a, alarm_b=alarm_b, enabled=True, position_raw=1000,
+                )
+                d.grips = {"left": grip}
+
+                class Quit:
+                    done = False
+
+                    def is_set(self):
+                        return self.done
+
+                    def wait(self, seconds):
+                        self.done = True
+
+                d.quit = Quit()
+                d._gripper_worker("left", dict(device_id=1, speed=5, torque=60, drop_alarm_policy="warn"))
+                self.assertIsNone(d.error)
+                self.assertEqual(d.gripper_pause_required, paused)
+                self.assertEqual(grip.set_position_raw.call_count, 0 if paused else 1)
+
+    def test_gripper_pause_requires_fresh_feedback_and_acknowledgement(self):
+        import threading
+        from unittest.mock import Mock, patch
+
+        d = object.__new__(b.LiveDevices)
+        d.lock = threading.Lock()
+        d.stop = Mock(return_value=True)
+        d.log = Mock()
+        d.error, d.gripper_faults = None, {"left": "timeout"}
+        d.grips = {"left": object(), "right": object()}
+        d.feedback = {}
+        d.cfg = {"bridge": SETTINGS}
+        d.motion, d.gripper_pause_required = True, True
+        events = []
+
+        def recover(_):
+            events.append("poll")
+            d.gripper_faults.clear()
+            d.feedback = {s: (1000, b.time.monotonic(), True) for s in d.grips}
+
+        def acknowledge(_):
+            d.stop.assert_called_once()
+            self.assertTrue(d.gripper_pause_required)
+            events.append("ack")
+
+        with patch.object(b.time, "sleep", side_effect=recover), patch("builtins.input", side_effect=acknowledge):
+            d.wait_for_grippers()
+        self.assertEqual(events, ["poll", "ack"])
+        self.assertFalse(d.gripper_pause_required)
+
+    def test_fault_midchunk_stops_then_repredicts_without_closing(self):
+        from unittest.mock import Mock
+
+        d = Device()
+        d.fail = b.GripperFault("communication lost")
+
+        def recover():
+            self.assertGreater(d.stops, 0)
+            self.assertFalse(d.closed)
+            d.fail = None
+
+        d.wait_for_grippers = Mock(side_effect=recover)
+        policy = Policy()
+        policy.infer = Mock(wraps=policy.infer)
+        self.run_bridge(d, policy, cycles=1)
+        d.wait_for_grippers.assert_called_once()
+        self.assertEqual(policy.infer.call_count, 2)
+        self.assertEqual(d.sent, 12)
+        self.assertTrue(d.closed and policy.closed)
 
     def test_websocket_native_codec_and_timeout(self):
         from unittest.mock import Mock, patch
@@ -278,13 +642,169 @@ class BridgeTests(unittest.TestCase):
         socket.close.assert_called_once()
 
 
+class ManualSpeedTests(unittest.TestCase):
+    def device(self, original=30):
+        d, state = live_device_fixture()
+        state.follower_active = False
+        d.cfg = {"bridge": dict(SETTINGS, manual_speed_percent=70)}
+        speed = dict(mode="Manual", percent=original)
+        d.robot.get_speed_override.side_effect = lambda: dict(speed)
+
+        def set_speed(percent, *, expected_mode, expected_percent, **kwargs):
+            self.assertEqual(speed["mode"], expected_mode)
+            self.assertEqual(speed["percent"], expected_percent)
+            speed["percent"] = percent
+
+        d.robot.set_speed_override.side_effect = set_speed
+        return d, speed
+
+    def test_motion_sets_once_and_restores_after_all_chunks(self):
+        d, speed = self.device()
+        b.run(d, Policy(), SETTINGS, lambda *a, **kw: None, cycles=2, clock=Clock())
+        self.assertEqual(speed["percent"], 30)
+        calls = d.robot.set_speed_override.call_args_list
+        self.assertEqual([call.args[0] for call in calls], [70, 30])
+        self.assertTrue(calls[-1].kwargs["allow_cancelled"])
+        self.assertIsNone(d._speed_restore)
+        d.robot.enable.assert_not_called()
+
+    def test_readonly_never_changes_speed(self):
+        d, speed = self.device()
+        d.motion = False
+        b.run(d, Policy(), SETTINGS, lambda *a, **kw: None, cycles=1, read_only=True, clock=Clock())
+        self.assertEqual(speed["percent"], 30)
+        d.robot.get_speed_override.assert_not_called()
+        d.robot.set_speed_override.assert_not_called()
+        d.robot.start_follower.assert_not_called()
+
+    def test_ctrl_c_stops_and_restores(self):
+        d, speed = self.device()
+        d.robot.send_joints.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            b.run(d, Policy(), SETTINGS, lambda *a, **kw: None, cycles=1, clock=Clock())
+        d.robot.stop_follower.assert_called_once()
+        self.assertEqual(speed["percent"], 30)
+
+    def test_lost_setting_ack_restores_without_starting_motion(self):
+        d, speed = self.device()
+        normal_set = d.robot.set_speed_override.side_effect
+
+        def lost_ack(percent, **kwargs):
+            normal_set(percent, **kwargs)
+            if percent == 70:
+                raise TimeoutError("ACK lost after setting took effect")
+
+        d.robot.set_speed_override.side_effect = lost_ack
+        with self.assertRaises(TimeoutError):
+            d.start()
+        d.close()
+        self.assertEqual(speed["percent"], 30)
+        d.robot.start_follower.assert_not_called()
+        d.robot.send_joints.assert_not_called()
+
+    def test_external_change_is_preserved(self):
+        for mode, percent in (("Manual", 40), ("Auto", 70)):
+            with self.subTest(mode=mode, percent=percent):
+                d, speed = self.device()
+                d._apply_manual_speed()
+                speed.update(mode=mode, percent=percent)
+                with self.assertRaisesRegex(RuntimeError, "preserving site settings"):
+                    d.close()
+                self.assertEqual(speed, dict(mode=mode, percent=percent))
+                d.robot.set_speed_override.assert_called_once()
+                d.robot.close.assert_called_once()
+
+    def test_auto_mode_does_not_change_speed_or_start(self):
+        d, speed = self.device()
+        speed["mode"] = "Auto"
+        with self.assertRaisesRegex(RuntimeError, "requires Manual"):
+            d.start()
+        d.robot.set_speed_override.assert_not_called()
+        d.robot.start_follower.assert_not_called()
+        self.assertIsNone(d._speed_restore)
+
+    def test_disabled_robot_does_not_change_speed_or_enable(self):
+        d, speed = self.device()
+        state = d.robot.get_state()
+        state.raw["ret_context"]["robot_msg"]["activate"] = "Disabled"
+        with self.assertRaisesRegex(RuntimeError, "Enabled/Stopped"):
+            d.start()
+        self.assertEqual(speed["percent"], 30)
+        d.robot.set_speed_override.assert_not_called()
+        d.robot.enable.assert_not_called()
+        d.robot.start_follower.assert_not_called()
+
+    def test_unconfirmed_stop_does_not_restore_speed(self):
+        d, speed = self.device()
+        d._apply_manual_speed()
+        d.stop = lambda: False
+        with self.assertRaisesRegex(RuntimeError, "stop unconfirmed"):
+            d.close()
+        self.assertEqual(speed["percent"], 70)
+        d.robot.set_speed_override.assert_called_once()
+        d.robot.close.assert_called_once()
+
+
 class ConfiguredInferenceTests(unittest.TestCase):
+
+    def test_manual_speed_percent_validation_and_config_scope(self):
+        from mmengine import Config
+        from fluxvla.engines import build_runner_from_cfg
+
+        base = Config.fromfile(ROOT / "configs/a10/a10_dual_arm_operator.py")
+        config = Config.fromfile(ROOT / "configs/a10/a10_dual_openpi_remote.py")
+        self.assertEqual(base.operator.joint_follower_velocity_percent, 100)
+        self.assertEqual(config.operator.joint_follower_velocity_percent, 12)
+        self.assertEqual(config.inference.manual_speed_percent, 100)
+        self.assertTrue(config.inference.follower_tail.enabled)
+        config.inference.cfg = config
+        runner = build_runner_from_cfg(config.inference)
+        for percent in (None, 1, 70, 100):
+            runner.settings["manual_speed_percent"] = percent
+            runner.run_setup()
+        for percent in (True, 0, -1, 101, "70", float("nan")):
+            with self.subTest(percent=percent):
+                runner.settings["manual_speed_percent"] = percent
+                with self.assertRaisesRegex(ValueError, "manual_speed_percent"):
+                    runner.run_setup()
+
+    def test_cli_alarm_policy_validated_before_hardware(self):
+        import argparse
+        from mmengine import Config, DictAction
+        from fluxvla.engines import build_runner_from_cfg
+        from fluxvla.engines.operators.zx_gripper import ZXGripper
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--cfg-options', nargs='+', action=DictAction)
+        for right in ('warn', 'war'):
+            with self.subTest(right=right):
+                args = parser.parse_args([
+                    '--cfg-options', 'inference.mode=read_only',
+                    'grippers.left.drop_alarm_policy=warn',
+                    f'grippers.right.drop_alarm_policy={right}',
+                ])
+                config = Config.fromfile(ROOT / 'configs/a10/a10_dual_openpi_remote.py')
+                config.merge_from_dict(args.cfg_options)
+                config.inference.cfg = config
+                runner = build_runner_from_cfg(config.inference)
+                if right == 'war':
+                    with self.assertRaisesRegex(ValueError, r"grippers.right.drop_alarm_policy.*'war'"):
+                        runner.run_setup()
+                else:
+                    runner.run_setup()
+                    for device in runner.config['grippers'].values():
+                        # Construct the real driver without opening a port.
+                        driver = ZXGripper(device['port'], drop_alarm_policy=device['drop_alarm_policy'])
+                        self.assertEqual(driver.drop_alarm_policy, 'warn')
+                        self.assertIsNone(driver._serial)
+
     def test_preview_uses_standard_registry_without_devices(self):
         from mmengine import Config
         from fluxvla.engines import build_runner_from_cfg
         from unittest.mock import patch
 
         config = Config.fromfile(ROOT / "configs/a10/a10_dual_openpi_remote.py")
+        config.inference.mode = "preview"
         config.inference.cfg = config
         runner = build_runner_from_cfg(config.inference)
         self.assertEqual(type(runner).__name__, "A10DualInferenceRunner")
@@ -313,7 +833,7 @@ class ConfiguredInferenceTests(unittest.TestCase):
         config.inference.cfg = config
         runner = build_runner_from_cfg(config.inference)
         runner.run_setup()
-        self.assertEqual(runner.mode, "preview")
+        self.assertEqual(runner.mode, "motion")
         self.assertEqual(runner.remote["protocol"], "fluxvla_zmq")
 
     def test_native_quantile_roundtrip_preserves_both_grippers(self):
@@ -399,7 +919,8 @@ class ConfiguredInferenceTests(unittest.TestCase):
         bundle = ROOT / "checkpoints/FluxVLA-A10-Dual-Fold-10steps"
         if not bundle.exists():
             self.skipTest("Model bundle not downloaded")
-        config = Config.fromfile(ROOT / "configs/a10/a10_dual_fold_inference.py")
+        with patch.dict(os.environ, {"A10_DUAL_CHECKPOINT": str(bundle)}):
+            config = Config.fromfile(ROOT / "configs/a10/a10_dual_fold_inference.py")
         dataset = build_dataset_from_cfg(config.inference.dataset)
         sample = Device().sample()
         obs = dict(
@@ -419,6 +940,7 @@ class ConfiguredInferenceTests(unittest.TestCase):
         pipeline = training.train_dataloader.dataset.datasets.transforms[1:]
         data = dict(
             states=obs["qpos"].copy(),
+            task_description=obs["task_description"],
             actions=np.tile(obs["qpos"], (30, 1)),
             images=[obs[key].transpose(2, 0, 1) for key in b.CAMERAS],
             img_masks=np.ones(3, dtype=bool),
@@ -426,6 +948,8 @@ class ConfiguredInferenceTests(unittest.TestCase):
         )
         for item in pipeline:
             item = item.to_dict() if hasattr(item, "to_dict") else dict(item)
+            if item["type"] == "PrepareA10OpenPIInputs":
+                item["task_description"] = obs["task_description"]
             if item["type"] == "ProcessPrompts":
                 item["tokenizer"]["model_path"] = str(bundle / "tokenizer")
             data = build_transform_from_cfg(item)(data)
@@ -433,6 +957,51 @@ class ConfiguredInferenceTests(unittest.TestCase):
             np.testing.assert_allclose(actual[key].numpy()[0], np.asarray(data[key]), rtol=1e-6, atol=1e-6)
         self.assertEqual(tuple(actual["images"].shape), (1, 9, 224, 224))
         self.assertTrue(torch.equal(actual["img_masks"], torch.ones((1, 3), dtype=torch.bool)))
+
+
+
+
+class MotorAccelerationPreflightTests(unittest.TestCase):
+    def test_motion_preflight_runs_before_cameras_or_grippers(self):
+        from unittest.mock import Mock, patch
+        config = dict(operator=dict(shared_control=dict(mode='managed'),
+                                    motor_acceleration_deg_s2=375), cameras={}, grippers={}, bridge={})
+        events = []
+        robot, cameras = Mock(), Mock()
+        robot.connect.side_effect = lambda: events.append('connect')
+        robot.ensure_motor_acceleration.side_effect = lambda: events.append('acceleration')
+        cameras.start.side_effect = lambda: events.append('cameras')
+        with patch('fluxvla.engines.operators.a10_operator.A10Operator', return_value=robot), \
+             patch('fluxvla.engines.operators.camera_operator.BufferedCameraOperator', return_value=cameras), \
+             patch.object(b.LiveDevices, 'sample', return_value={}), \
+             patch.object(b, 'observation', return_value={}):
+            b.LiveDevices(config, Mock(), motion=True)
+        self.assertEqual(events, ['connect', 'acceleration', 'cameras'])
+
+    def test_preflight_failure_blocks_camera_start_and_cleans_up(self):
+        from unittest.mock import Mock, patch
+        config = dict(operator=dict(shared_control=dict(mode='managed')), cameras={}, grippers={}, bridge={})
+        robot, cameras = Mock(), Mock()
+        robot.ensure_motor_acceleration.side_effect = RuntimeError('acceleration mismatch')
+        with patch('fluxvla.engines.operators.a10_operator.A10Operator', return_value=robot), \
+             patch('fluxvla.engines.operators.camera_operator.BufferedCameraOperator', return_value=cameras), \
+             patch.object(b.LiveDevices, 'close') as close:
+            with self.assertRaisesRegex(RuntimeError, 'acceleration mismatch'):
+                b.LiveDevices(config, Mock(), motion=True)
+        cameras.start.assert_not_called()
+        robot.start_follower.assert_not_called()
+        close.assert_called_once()
+
+    def test_read_only_does_not_request_acceleration_changes(self):
+        from unittest.mock import Mock, patch
+        config = dict(operator=dict(shared_control=dict(mode='managed')), cameras={}, grippers={}, bridge={})
+        robot = Mock()
+        with patch('fluxvla.engines.operators.a10_operator.A10Operator', return_value=robot), \
+             patch('fluxvla.engines.operators.camera_operator.BufferedCameraOperator'), \
+             patch.object(b.LiveDevices, 'sample', return_value={}), \
+             patch.object(b, 'observation', return_value={}):
+            b.LiveDevices(config, Mock(), motion=False)
+        robot.ensure_motor_acceleration.assert_not_called()
 
 
 if __name__ == "__main__":

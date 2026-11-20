@@ -437,7 +437,7 @@ class A10InferenceRunner(BaseInferenceRunner):
 
 
 @RUNNERS.register_module()
-class A10DualInferenceRunner:
+class A10DualInferenceRunner(BaseInferenceRunner):
     """Config-driven dual follower with interchangeable remote policy transport."""
 
     def __init__(
@@ -452,6 +452,7 @@ class A10DualInferenceRunner:
         action_dt=1 / 30,
         max_joint_step_rad=0.2,
         max_send_lag_s=0.1,
+        manual_speed_percent=None,
         prompt=None,
         max_robot_age_s=0.15,
         max_camera_age_s=0.15,
@@ -462,10 +463,31 @@ class A10DualInferenceRunner:
         denormalize_action=None,
         task_suite_name="a10_dual",
         debug_log=None,
+        trace_inference_feedback=False,
+        follower_tail=None,
+        task_descriptions=None,
+        task_pose_sequences=None,
+        action_chunk=30,
+        state_dim=14,
+        publish_rate=None,
+        async_execution=False,
     ):
-        del dataset, denormalize_action, task_suite_name, debug_log  # Model-server settings, not client transforms.
+        del dataset, denormalize_action, debug_log  # Model-server settings, not client transforms.
         if ckpt_path is not None:
             raise ValueError("Set the checkpoint on the model server")
+        if (isinstance(action_dt, bool) or not isinstance(action_dt, (int, float))
+                or not math.isfinite(action_dt) or action_dt <= 0):
+            raise ValueError('action_dt must be positive and finite')
+        if action_chunk != 30 or state_dim != 14:
+            raise ValueError('Dual A10 policy requires action_chunk=30 and state_dim=14')
+        if async_execution is not False:
+            raise ValueError('Dual A10 framework baseline requires async_execution=False')
+        if publish_rate is not None and (isinstance(publish_rate, bool)
+                or not isinstance(publish_rate, (int, float))
+                or not math.isfinite(publish_rate)
+                or not math.isclose(publish_rate, 1 / action_dt)):
+            raise ValueError('publish_rate must equal 1/action_dt')
+        self.async_execution = False
         self.config = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg or {})
         # The standard entrypoint injects cfg into cfg.inference; omit that back-reference.
         self.config.get("inference", {}).pop("cfg", None)
@@ -477,12 +499,28 @@ class A10DualInferenceRunner:
             action_dt=action_dt,
             max_joint_step_rad=max_joint_step_rad,
             max_send_lag_s=max_send_lag_s,
+            manual_speed_percent=manual_speed_percent,
             max_robot_age_s=max_robot_age_s,
             max_camera_age_s=max_camera_age_s,
             max_gripper_age_s=max_gripper_age_s,
             max_skew_s=max_skew_s,
             prompt=prompt,
+            trace_inference_feedback=trace_inference_feedback,
+            follower_tail=follower_tail,
         )
+        self._policy = None
+        self._external_runtime = False
+        self._cycle = 0
+        self.log = lambda *args, **kwargs: None
+        self.execute_horizon = execute_horizon
+        super().__init__(
+            cfg=cfg, remote_inference=self.remote,
+            operator=dict(type='A10DualOperator', config=self.config,
+                          settings=self.settings, mode=mode),
+            state_dim=14, action_chunk=30, publish_rate=1 / action_dt,
+            camera_names=['base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb'],
+            task_suite_name=task_suite_name, task_descriptions=task_descriptions,
+            task_pose_sequences=task_pose_sequences, enable_mixed_precision=False)
         self._ready = False
 
     def run_setup(self):
@@ -494,10 +532,24 @@ class A10DualInferenceRunner:
         if type(horizon) is not int or not 1 <= horizon <= 30:
             raise ValueError("execute_horizon must be 1..30")
         for key, value in self.settings.items():
+            if key == 'follower_tail':
+                continue
+            if key == 'trace_inference_feedback':
+                if type(value) is not bool:
+                    raise ValueError('trace_inference_feedback must be bool')
+                continue
             if key == "prompt":
+                continue
+            if key == "manual_speed_percent" and value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{key} must be positive and finite")
+            if key == "manual_speed_percent" and value > 100:
+                raise ValueError("manual_speed_percent must be within (0, 100]")
+        from ..utils.a10_follower_tail import tail_config
+        tail = tail_config(self.settings['follower_tail'])
+        if tail['enabled'] and horizon != 20:
+            raise ValueError('follower_tail requires execute_horizon=20')
         timeout = self.remote.get("timeout_s", 120.0)
         if (
             isinstance(timeout, bool)
@@ -510,9 +562,108 @@ class A10DualInferenceRunner:
             raise ValueError("remote protocol must be openpi_ws or fluxvla_zmq")
         if type(self.remote.get("server_port")) is not int or not 1 <= self.remote["server_port"] <= 65535:
             raise ValueError("Invalid server port")
+        for side, device in self.config.get("grippers", {}).items():
+            policy = device.get("drop_alarm_policy", "stop")
+            if policy not in ("stop", "warn"):
+                raise ValueError(
+                    f"grippers.{side}.drop_alarm_policy must be stop or warn; got {policy!r}"
+                )
         self._ready = True
 
-    def run(self):
+    def _init_zmq_client(self, cfg):
+        # The base lifecycle calls this hook for remote initialization. Defer
+        # either transport until run(), so preview never connects to anything.
+        self._server_address = f"{cfg.get('protocol', 'openpi_ws')}://{cfg['server_host']}:{cfg['server_port']}"
+
+    def ping(self):
+        return self._policy is not None
+
+    @classmethod
+    def from_components(cls, devices, policy, settings, log, *, cycles=2,
+                        read_only=False, clock=time, bridge=None):
+        """Offline/legacy entrypoint; uses the same framework chunk lifecycle."""
+        from ..operators.a10_dual_operator import A10DualOperator
+        runner = cls(dict(protocol='openpi_ws', server_host='127.0.0.1', server_port=8001),
+                     mode='read_only' if read_only else 'simulate', cycles=cycles, **settings)
+        runner.ros_operator = A10DualOperator(devices=devices, settings=settings,
+                                             log=log, clock=clock, bridge=bridge)
+        runner._policy, runner.log = policy, log
+        runner._external_runtime = runner._ready = True
+        runner._clock = clock
+        return runner
+
+    def update_observation_window(self):
+        frame = self.ros_operator.get_frame()
+        self.log('observation', cycle=self._cycle, state=frame['qpos'],
+                 robot_time=frame['robot_time'], camera_times=frame['camera_times'],
+                 gripper_times=frame['gripper_times'],
+                 observation_finished_s=self._clock.monotonic())
+        if self.observation_window is None:
+            self.observation_window = deque(maxlen=1)
+        self.observation_window.append(frame)
+        return frame
+
+    def _predict_action_remote(self, inputs):
+        control = self.ros_operator.bridge
+        wire = {'observation/state': inputs['qpos']}
+        wire.update({f'observation/images/{alias}': inputs[name]
+                     for name, alias in control.CAMERAS.items()})
+        instruction = inputs.get('task_description')
+        if instruction is not None:
+            wire['prompt'] = instruction
+        with self.ros_operator.inference_feedback():
+            started = self._clock.monotonic()
+            self.log('inference_start', cycle=self._cycle, started_s=started,
+                     observation_received_s=inputs['robot_time'])
+            response = self._policy.infer(wire)
+            finished = self._clock.monotonic()
+            self.log('inference_end', cycle=self._cycle, finished_s=finished,
+                     request_s=finished - started)
+        ready = self._clock.monotonic()
+        self.log('inference_feedback_end', cycle=self._cycle, ready_s=ready,
+                 sampler_shutdown_s=ready - finished)
+        self._action_ctx.raw_response = response
+        self._action_ctx.inference_start = started
+        self._action_ctx.inference_finished = finished
+        return response
+
+    def _postprocess_actions(self, raw_action):
+        actions, clipped = self.ros_operator.bridge.actions_from_response(raw_action)
+        self.log('prediction', cycle=self._cycle,
+                 request_s=self._action_ctx.inference_finished - self._action_ctx.inference_start,
+                 raw_actions=raw_action['actions'], converted_actions=actions,
+                 clipped_grippers=clipped)
+        return actions
+
+    def _execute_actions(self, actions, rate=None):
+        del rate  # The operator owns the one hardware clock, as in ALOHA.
+        if self.mode == 'read_only':
+            return
+        current = self.ros_operator.validate_actions(actions)
+        joints = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
+        self.log('pre_execution_feedback', cycle=self._cycle, state=current,
+                 received_monotonic_s=self.ros_operator.last_frame['robot_time'],
+                 observation_received_s=self.observation_window[-1]['robot_time'],
+                 joint_motion_since_observation_rad=current[joints] - self._action_ctx.state[joints],
+                 first_target_error_rad=actions[0, joints] - current[joints])
+        selected = actions[:self.execute_horizon]
+        self.ros_operator.execute_trajectory(
+            arm_trajectories={'left': selected[:, :6], 'right': selected[:, 7:13]},
+            gripper_trajectories={'left': selected[:, 6], 'right': selected[:, 13]},
+            dt=self.settings['action_dt'], async_exec=False)
+
+    def cleanup(self):
+        try:
+            self.ros_operator.close()
+        finally:
+            try:
+                if self._policy is not None:
+                    self._policy.close()
+                    self._policy = None
+            finally:
+                super().cleanup()
+
+    def run(self, initial_instruction=None):
         from pathlib import Path
         import uuid
         from fluxvla.projects.a10 import inference as control
@@ -520,40 +671,63 @@ class A10DualInferenceRunner:
         if not self._ready:
             self.run_setup()
         print(json.dumps(dict(mode=self.mode, remote_inference=self.remote, **self.settings), indent=2), flush=True)
-        if self.mode == "preview":
+        if self.mode == 'preview':
             return
-        root = Path(self.log_root)
-        if not root.is_absolute():
-            root = control.ROOT / root
-        directory = root / (time.strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8] + "_dual_client")
-        directory.mkdir(parents=True, exist_ok=False)
-        (directory / "config.json").write_text(json.dumps(control.plain(self.config), indent=2))
-        log = control.Journal(directory / "events.jsonl")
-        print(f"A10 run logs: {directory}", flush=True)
-        policy = devices = None
+        journal = None
+        completed = False
+        self._clock = getattr(self, '_clock', time)
         try:
-            remote = self.remote
-            args = (remote["server_host"], remote["server_port"], remote.get("timeout_s", 120.0))
-            if remote["protocol"] == "openpi_ws":
-                client_root = remote.get("client_root")
-                if client_root and not Path(client_root).is_absolute():
-                    client_root = str(control.ROOT / client_root)
-                policy = control.RemotePolicy(*args, client_root=client_root)
-            else:
-                policy = control.ZmqPolicy(*args, prompt=self.settings["prompt"])
-            log("connected", metadata=policy.metadata, mode=self.mode)
-            config = dict(self.config, bridge=self.settings)
-            devices = (
-                control.SimDevices(log)
-                if self.mode == "simulate"
-                else control.LiveDevices(config, log, motion=self.mode == "motion")
-            )
-            control.run(devices, policy, self.settings, log, cycles=self.cycles, read_only=self.mode == "read_only")
-            print("A10_DUAL_INFERENCE_OK", flush=True)
+            if not self._external_runtime:
+                root = Path(self.log_root)
+                if not root.is_absolute():
+                    root = control.ROOT / root
+                directory = root / (time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8] + '_dual_client')
+                directory.mkdir(parents=True, exist_ok=False)
+                (directory / 'config.json').write_text(json.dumps(control.plain(self.config), indent=2))
+                journal = control.Journal(directory / 'events.jsonl', metadata=dict(
+                    settings=self.settings, mode=self.mode,
+                    runner=type(self).__name__, operator=type(self.ros_operator).__name__,
+                    loop='BaseInferenceRunner._run_action_chunk'))
+                self.log = journal
+                self.ros_operator.log = journal
+                self.ros_operator.trace.log = journal
+                print(f'A10 run logs: {directory}', flush=True)
+                remote = self.remote
+                args = (remote['server_host'], remote['server_port'], remote.get('timeout_s', 120.))
+                if remote['protocol'] == 'openpi_ws':
+                    client_root = remote.get('client_root')
+                    if client_root and not Path(client_root).is_absolute():
+                        client_root = str(control.ROOT / client_root)
+                    self._policy = control.RemotePolicy(*args, client_root=client_root)
+                else:
+                    self._policy = control.ZmqPolicy(*args, prompt=self.settings['prompt'])
+                self.log('connected', metadata=self._policy.metadata, mode=self.mode)
+                self.ros_operator.connect()
+            instruction = self.settings['prompt'] if initial_instruction is None else initial_instruction
+            while self._cycle < self.cycles:
+                self.ros_operator.cycle = self._cycle
+                try:
+                    _, paused = self._run_action_chunk(instruction)
+                except self.ros_operator.bridge.GripperFault:
+                    self.ros_operator.stop_trajectory(reason='gripper_fault')
+                    self.ros_operator.devices.wait_for_grippers()
+                    self.reset_inference_history()
+                    continue
+                self._cycle += 1
+                if paused:
+                    self.log('paused', cycles=self._cycle)
+                    break
+            completed = True
         except BaseException as exc:
-            log("client_error", error=str(exc), type=type(exc).__name__)
-            if devices is None and policy is not None:
-                policy.close()
+            self.log('error', error=str(exc), type=type(exc).__name__)
             raise
         finally:
-            log.close()
+            try:
+                self.cleanup()
+                if completed:
+                    self.log('complete', cycles=self._cycle)
+            finally:
+                if journal is not None:
+                    journal.close()
+        if not self._external_runtime:
+            print('A10_DUAL_INFERENCE_OK', flush=True)

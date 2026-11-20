@@ -25,6 +25,7 @@ def parse_args():
         help='Select Triton/CUDA Graph (on) or plain PyTorch (off); omitted uses config default')
     parser.add_argument(
         '--config', required=True, help='Path to mmengine config file')
+    parser.add_argument('--model', choices=['fluxvla', 'openpi'], default=None)
     weights = parser.add_mutually_exclusive_group(required=True)
     weights.add_argument('--ckpt-path', help='Path to native model checkpoint')
     weights.add_argument('--from-config', action='store_true',
@@ -54,6 +55,10 @@ def main():
     configure_inference_attention_defaults()
 
     cfg = Config.fromfile(args.config)
+    from fluxvla.engines.utils.a10_inference_backends import select_a10_backend
+    select_a10_backend(cfg, args.model)
+    if cfg.get('model_backend') == 'openpi':
+        raise ValueError('Start the OpenPI model server in its own project; this server serves FluxVLA')
     from fluxvla.engines.utils.inference_config import select_inference_acceleration
     select_inference_acceleration(cfg, args.acceleration)
 

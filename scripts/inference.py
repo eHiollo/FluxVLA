@@ -40,6 +40,8 @@ def parse_args():
         required=True,
         help='Path to the configuration file.',
     )
+    parser.add_argument("--model", choices=["fluxvla", "openpi"], default=None,
+                        help="Select the model backend in the common dual A10 config")
     parser.add_argument(
         '--ckpt-path',
         type=str,
@@ -62,6 +64,8 @@ if __name__ == '__main__':
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    from fluxvla.engines.utils.a10_inference_backends import select_a10_backend
+    select_a10_backend(cfg, args.model, overrides=args.cfg_options)
     from fluxvla.engines.utils.inference_config import select_inference_acceleration
     select_inference_acceleration(cfg, args.acceleration)
     cfg.inference.cfg = cfg

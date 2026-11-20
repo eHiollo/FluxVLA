@@ -57,14 +57,16 @@ class _LogHandler(logging.Handler):
 
 class A10DebugLog:
     def __init__(self, *, role, root_dir='work_dirs/a10/inference_logs',
-                 metadata=None, image_every_n_cycles=5, queue_size=128, **unused):
+                 metadata=None, image_every_n_cycles=5, queue_size=128,
+                 directory=None, units=None, **unused):
         if type(image_every_n_cycles) is not int or image_every_n_cycles < 0:
             raise ValueError('image_every_n_cycles must be a nonnegative integer')
         if type(queue_size) is not int or queue_size <= 0:
             raise ValueError('queue_size must be a positive integer')
         self.run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ') + '_' + uuid.uuid4().hex[:8]
-        self.path = Path(root_dir).expanduser().resolve() / (self.run_id + '_' + role)
-        self.path.mkdir(parents=True)
+        self.path = (Path(directory).resolve() if directory is not None else
+                     Path(root_dir).expanduser().resolve() / (self.run_id + '_' + role))
+        self.path.mkdir(parents=True, exist_ok=directory is not None)
         self.image_every_n_cycles = image_every_n_cycles
         self.dropped = 0
         self.write_errors = 0
@@ -73,6 +75,12 @@ class A10DebugLog:
         source_root = Path(__file__).resolve().parents[3]
         source_hashes = {}
         for name in ('fluxvla/engines/runners/a10_inference_runner.py',
+                     'fluxvla/engines/runners/base_inference_runner.py',
+                     'fluxvla/engines/operators/a10_dual_operator.py',
+                     'fluxvla/engines/utils/a10_execution_trace.py',
+                     'fluxvla/engines/utils/a10_follower_tail.py',
+                     'fluxvla/engines/utils/a10_inference_backends.py',
+                     'fluxvla/projects/a10/inference.py',
                      'fluxvla/engines/operators/a10_operator.py',
                      'fluxvla/engines/runners/serving/zmq_server.py',
                      'fluxvla/datasets/a10_openpi_inference.py',
@@ -92,7 +100,7 @@ class A10DebugLog:
         manifest = dict(schema_version=1, run_id=self.run_id, role=role,
                         started_utc=datetime.now(timezone.utc).isoformat(),
                         clock='monotonic_s is host-local; feedback times are receive times',
-                        units=dict(joints='rad', gripper='mm', time='s'),
+                        units=units or dict(joints='rad', gripper='mm', time='s'),
                         image_every_n_cycles=image_every_n_cycles, metadata=self.metadata)
         (self.path / 'metadata.json').write_text(json.dumps(_json(manifest), ensure_ascii=False, indent=2))
         self._queue = queue.Queue(maxsize=queue_size)

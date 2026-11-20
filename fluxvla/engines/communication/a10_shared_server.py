@@ -18,6 +18,23 @@ from .a10_shared_connection import ControlTransferredError
 logger = logging.getLogger(__name__)
 
 
+def _copy_feedback(value):
+    """Copy decoded JSON containers without deepcopy's per-number bookkeeping.
+
+    Controller feedback consists of dicts/lists and immutable JSON scalars.
+    Keep a fallback for non-JSON values supplied by in-process callers so the
+    cache continues to own an independent copy in that case too.
+    """
+    kind = type(value)
+    if kind is dict:
+        return {key: _copy_feedback(item) for key, item in value.items()}
+    if kind is list:
+        return [_copy_feedback(item) for item in value]
+    if kind in (str, int, float, bool, type(None)):
+        return value
+    return copy.deepcopy(value)
+
+
 def _controller_state(reply):
     """Parse global flags only; clients validate their own joint/TCP layout.
 
@@ -73,15 +90,19 @@ class SharedControl:
         # This is the actual robot receive time. Reading the cache must never
         # refresh it, including while a native stop holds the transaction lock.
         stamp = time.monotonic()
+        cached_reply = _copy_feedback(reply)
         with self._snapshot_lock:
             self._snapshot_sequence += 1
-            self._snapshot = dict(reply=copy.deepcopy(reply), received_monotonic_s=stamp,
+            self._snapshot = dict(reply=cached_reply, received_monotonic_s=stamp,
                                   sequence=self._snapshot_sequence)
         return reply
 
     def feedback_snapshot(self):
         with self._snapshot_lock:
-            snapshot = copy.deepcopy(self._snapshot)
+            # Published snapshots are never mutated in place. Copy outside the
+            # mutex so a reader doesn't delay publication of newer feedback.
+            published = self._snapshot
+        snapshot = _copy_feedback(published)
         with self._poll_lock:
             error = self._poll_error
             if snapshot is not None:

@@ -383,7 +383,7 @@ cd /home/robot/VLA/FluxVLA
 /home/robot/miniforge3/envs/fluxvla/bin/python -m unittest discover -s test -p 'test_a10_*.py' -v
 ```
 
-测试端点仅为 127.0.0.1 随机端口，不访问工控机。开发记录见 `a10_controller_follower_review.md` 和 `a10_full_migration_plan.md`。
+测试端点仅为 127.0.0.1 随机端口，不访问工控机。
 
 ### 6. 六轴关节 follower 的现场验证（2026-10-12）
 
@@ -741,7 +741,7 @@ python -m fluxvla.projects.a10 validate --root datasets/a10/onsite_trial_001 --e
 
 ## 6. 留下验收记录
 
-在 [开发记录](a10_full_migration_plan.md) 追加 commit、站点配置摘要、设备对应关系、报告位置、实际帧率、现场核对结果与待办。通过后再确定正式训练的数据／任务划分、时长和评估方法。
+在本次运行日志中记录 commit、站点配置摘要、设备对应关系、报告位置、实际帧率、现场核对结果与待办。通过后再确定正式训练的数据／任务划分、时长和评估方法。
 
 目前模型只训练两步，已出现夹爪越界预测，只证明软件流程连通，不能用来直接控制机器人。正式训练与实机效果均尚未验收。
 

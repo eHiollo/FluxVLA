@@ -373,7 +373,5 @@ FluxVLA 短训的文件容量和 OpenPI 的内存占用属于不同环境、配�
 - [项目结构入门说明](project_structure_guide.md)：想了解模块和源码位置时查阅。
 - [VR 使用与开发说明](a10_vr_operator.md)：当前 VR 入口、配置和行为。
 - [A10 现场操作说明](a10_onsite_guide.md)：控制台与推理接入。
-- [迁移开发记录](a10_full_migration_plan.md)：历史实施与验证证据。
-- [控制器核查记录](a10_controller_follower_review.md)：控制器职责和接口边界。
 
-本轮补充的部署记录来源见 [Thor 环境记录](../local_setup/thor/README.md) 和迁移开发记录。这里使用历史记录说明遇到过的兼容性问题，不将旧环境版本作为今天机器状态的断言。
+部署环境说明见 [Thor 环境记录](../local_setup/thor/README.md)。这里使用历史记录说明遇到过的兼容性问题，不将旧环境版本作为今天机器状态的断言。

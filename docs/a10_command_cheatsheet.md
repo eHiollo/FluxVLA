@@ -67,6 +67,4 @@ python scripts/diagnose_vr_network.py --vr-ip 192.168.110.211
 两种双臂推理配置默认preview；旧单臂控制台、老夹爪及加速推理命令见[CLI兼容用法](../CLI.txt)。
 旧单臂默认VR-only，行为保持不变。
 
-各阶段开发与参数记录保留在[VR开发说明](a10_vr_operator.md)、
-[迁移记录](a10_vr_reference_migration.md)和[分支合并记录](a10_branch_integration_20261116.md)，
-其中历史双臂默认值和旧工作目录不作为当前启动依据。
+当前遥操作入口与设备行为见 [VR 使用说明](a10_vr_operator.md)，控制与采集方式见 [世界坐标说明](a10_vr_world_translation.md)。

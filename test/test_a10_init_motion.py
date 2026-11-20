@@ -13,7 +13,7 @@ import numpy as np
 from scripts.a10_control import A10Console, CommandError, main, parse_command
 from fluxvla.engines.operators.a10_operator import A10Operator, A10ControllerError
 from test_a10_operator import FakeController, dual_motion
-from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init
+from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init, InitMotionError
 
 
 RIGHT_FIRST_ARMS = {
@@ -32,15 +32,14 @@ class A10InitMotionTest(unittest.TestCase):
                         cartesian_target_order=['right', 'left'], init_position=dual['init_position'])
         b = A10Operator('127.0.0.1', init_position=single['init_position'])
         self.assertEqual(a.joint_target_order, ('right', 'left'))
-        np.testing.assert_allclose(np.rad2deg(a.init_position['right']),
-                                   [-117.127, -46.664, 136.691, -37.318, -70.145, -13.986])
-        np.testing.assert_allclose(np.rad2deg(a.init_position['left']), [0, 0, 150, -105, -90, 0])
+        np.testing.assert_allclose(np.rad2deg(a.init_position['right']), [-18, -36, 128, -18, -106, -5])
+        np.testing.assert_allclose(np.rad2deg(a.init_position['left']), [21, 38, -131, 28, 111, -3])
         a.init_position['right'][0] = 0.
         self.assertNotEqual(b.init_position['right'][0], 0.)
         config = runpy.run_path(str(Path(__file__).resolve().parents[1] /
                                 'configs/a10/a10_dual_arm_operator.py'))['operator']
-        self.assertEqual(config['arms']['right']['ee_id'], 0)
-        self.assertEqual(config['arms']['left']['ee_id'], 1)
+        self.assertEqual(config['arms']['right']['ee_id'], 1)
+        self.assertEqual(config['arms']['left']['ee_id'], 0)
 
     def test_missing_init_position_has_no_implicit_target_or_motion(self):
         with FakeController() as c:
@@ -88,7 +87,11 @@ class A10InitMotionTest(unittest.TestCase):
                 self.assertTrue(console.execute(parse_command(['m_init'])))
                 self.assertTrue(op.last_init_motion['completed'])
                 self.assertIn('夹爪初始化尚未执行', '\n'.join(output))
-                self.assertEqual([x for x in c.commands if x != 'get'], ['follower_aj', 'stop_follower'])
+                self.assertEqual([x for x in c.commands if x != 'get'], [
+                    'set_jog_vel --vel_percent=5', 'start_follower', 'follower_aj',
+                    'stop_follower', 'set_jog_vel --vel_percent=10'])
+                self.assertTrue(op.last_init_motion['speed_restored'])
+                self.assertEqual(op.last_init_motion['original_speed']['percent'], 10)
                 self.assertFalse(c.active)
                 packet = c.joint_udp.recv(4096)
                 values = json.loads(packet[40:].decode().split('=', 1)[1])
@@ -98,7 +101,9 @@ class A10InitMotionTest(unittest.TestCase):
         with FakeController() as c:
             c.motion_override = dual_motion()
             op = c.operator(arms=RIGHT_FIRST_ARMS, cartesian_target_order=['right', 'left'],
-                            init_motion=dict(max_velocity_rad_s=1., max_acceleration_rad_s2=2.))
+                            joint_follower_filter=runpy.run_path(str(
+                                Path(__file__).resolve().parents[1] /
+                                'configs/a10/a10_dual_arm_operator.py'))['operator']['joint_follower_filter'])
             initial = {n: arm.actual_joints_rad.copy() for n, arm in op.get_state().arms.items()}
             target = {n: q + (.03 if n == 'right' else -.02) for n, q in initial.items()}
             op.init_position = target
@@ -110,9 +115,10 @@ class A10InitMotionTest(unittest.TestCase):
                     except socket.timeout:
                         continue
                     try:
-                        text = packet[40:].decode()
-                        self.assertTrue(text.startswith('jp --motor_pos='))
-                        values = json.loads(text.split('=', 1)[1])
+                        self.assertEqual(int.from_bytes(packet[:4], 'little'), len(packet) - 40)
+                        data = json.loads(packet[40:])
+                        self.assertIs(data['filter'], False)
+                        values = data['motor_pos']
                         self.assertEqual(len(values), 12)
                         packets.append(values)
                         c.motion_override['actual_pos'] = [values[:6], values[6:]]
@@ -129,7 +135,7 @@ class A10InitMotionTest(unittest.TestCase):
                 worker.join(1)
             self.assertEqual(errors, [])
             self.assertGreater(len(packets), 3)
-            np.testing.assert_allclose(packets[0], np.rad2deg(np.r_[initial['right'], initial['left']]))
+            np.testing.assert_allclose(packets[0], np.rad2deg(np.r_[target['right'], target['left']]))
             np.testing.assert_allclose(packets[-1], np.rad2deg(np.r_[target['right'], target['left']]))
             self.assertTrue(op.last_init_motion['completed'])
             self.assertIn('机器人定义的初始位置', '\n'.join(output))
@@ -220,8 +226,10 @@ class A10InitMotionTest(unittest.TestCase):
                 original(targets)
                 c.fault = 'disconnect'
             with patch.object(op, 'send_joints', side_effect=send):
-                with self.assertRaises(ConnectionError):
+                with self.assertRaises(InitMotionError) as caught:
                     move_to_init(op)
+                self.assertIsNotNone(caught.exception.primary_error)
+                self.assertIsNotNone(caught.exception.stop_error)
             self.assertTrue(op.follower_stop_pending)
             self.assertFalse(op.is_connected)
             self.assertFalse(op.last_init_motion['completed'])
@@ -236,7 +244,11 @@ class A10InitMotionTest(unittest.TestCase):
             op.init_position = {'right': op.get_state().actual_joints_rad.copy()}
             move_to_init(op)
             self.assertEqual([x for x in c.commands if x != 'get'],
-                             ['follower_cart', 'stop_follower', 'follower_aj', 'stop_follower'])
+                             ['follower_cart', 'stop_follower', 'set_jog_vel --vel_percent=5',
+                              'start_follower', 'follower_aj', 'stop_follower',
+                              'set_jog_vel --vel_percent=10', 'follower_cart'])
+            self.assertTrue(c.active)
+            self.assertEqual(op.last_init_motion['follower_mode'], 'Cart')
 
 
 if __name__ == '__main__':

@@ -16,6 +16,7 @@ jsonlines==4.0.0
 matplotlib
 mmengine==0.10.7
 numpy==1.26.4
+scipy>=1.13
 opencv-python
 peft==0.19.1
 sentencepiece==0.1.99

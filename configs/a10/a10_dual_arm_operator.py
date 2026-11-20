@@ -15,6 +15,8 @@ operator = dict(
     # First console/VR auto-starts the relay; either UI may open or close first.
     shared_control=dict(mode='managed', host='127.0.0.1', port=5870, role='teleop'),
     joint_follower_velocity_percent=100,  # follower_aj parameter; not set_jog_vel.
+    joint_follower_filter=False,  # Updated SDK requires JSON motor_pos packets.
+    motor_acceleration_deg_s2=1000.,  # Console/m_init/teleoperation motor limits.
     allow_motion=False, command_mode='cartesian', cartesian_wire_format='pe321',
     feedback_joint_unit='deg', feedback_position_unit='mm',
     # Keep the existing VR aliases and GET mappings; physical hand binding is defined by VR.

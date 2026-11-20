@@ -353,8 +353,8 @@ class NetworkTest(unittest.TestCase):
                 operator = controller.operator(feedback_position_unit='mm')
                 with self.assertRaises(RuntimeError) as error:
                     operator.start_follower()
-                self.assertIn(f"activate={activation!r}", str(error.exception))
-                self.assertIn(f"motion={motion!r}", str(error.exception))
+                self.assertIn(f"activate={activation}", str(error.exception))
+                self.assertIn(f"motion={motion}", str(error.exception))
                 self.assertTrue(all(command == 'get' for command in controller.commands))
 
     def test_pe321_preserves_signed_angles_against_native_sdk_samples(self):
@@ -424,9 +424,31 @@ class NetworkTest(unittest.TestCase):
             with self.assertRaises(socket.timeout):
                 controller.udp.recvfrom(65535)
             self.assertFalse(operator.stop_follower().follower_active)
-            self.assertEqual(controller.commands, ['get','follower_aj','get','stop_follower','get'])
+            self.assertEqual(controller.commands,
+                             ['get','start_follower','follower_aj','get','stop_follower','get'])
             operator.close()
             self.assertIsNone(operator._connection.joint_udp)
+
+    def test_joint_json_filter_is_boolean_in_every_packet(self):
+        for enabled in (False, True):
+            with self.subTest(filter=enabled), FakeController() as controller:
+                controller.coordinate = 'Axis'
+                controller.tcp = False
+                operator = controller.operator(joint_follower_filter=enabled)
+                operator.start_follower(mode='joint')
+                for _ in range(2):
+                    operator.send_joints({'right': [0, np.pi/2, -np.pi/2, np.pi, 0, np.pi/4]})
+                    packet, _ = controller.joint_udp.recvfrom(65535)
+                    self.assertEqual(struct.unpack('<IIQqqq', packet[:40]),
+                                     (len(packet)-40, 0, 0, 0, 0, 0))
+                    data = json.loads(packet[40:])
+                    self.assertIs(data['filter'], enabled)
+                    np.testing.assert_allclose(data['motor_pos'], [0, 90, -90, 180, 0, 45])
+                operator.stop_follower()
+                operator.close()
+        for value in ('false', 0, 1):
+            with self.assertRaisesRegex(ValueError, 'joint_follower_filter'):
+                A10Operator(host='127.0.0.1', joint_follower_filter=value)
 
     def test_joint_and_cartesian_targets_and_mode_switch_are_exclusive(self):
         with FakeController() as controller:
@@ -526,7 +548,11 @@ class NetworkTest(unittest.TestCase):
             with self.subTest(failed=failed), FakeController() as controller:
                 operator=controller.operator()
                 operator.start_follower(mode='joint')
+                original_udp = operator._connection.joint_udp
                 with patch.object(operator._connection, 'joint_udp') as udp:
+                    # Preserve the real receive descriptor while injecting only
+                    # send failures; the SDK rejection poll still runs normally.
+                    udp.fileno.return_value = original_udp.fileno()
                     if failed:
                         udp.send.side_effect=OSError('UDP unavailable')
                     else:
@@ -1129,13 +1155,14 @@ class DualArmTest(unittest.TestCase):
                 with self.assertRaises(TimeoutError):
                     c.udp.recv(65535)
 
-    def test_unsupported_operations_have_no_network_side_effects(self):
+    def test_unowned_trajectory_and_unsupported_gripper_have_no_network_side_effects(self):
         with FakeController() as c:
             c.motion_override = dual_motion()
             op = c.operator(**self.settings())
-            for method, args in ((op.execute_trajectory, ({'left':[[0]*6],'right':[[0]*6]},)),
-                                 (op.send_gripper, ({'left':0,'right':0},))):
-                with self.assertRaises(NotImplementedError):
+            for method, args, error in (
+                    (op.execute_trajectory, ({'left':[[0]*6],'right':[[0]*6]},), RuntimeError),
+                    (op.send_gripper, ({'left':0,'right':0},), NotImplementedError)):
+                with self.assertRaises(error):
                     method(*args)
             self.assertEqual(c.commands, [])
             with self.assertRaises(TimeoutError):

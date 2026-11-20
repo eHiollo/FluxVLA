@@ -369,6 +369,12 @@ class SharedControl:
             return expected
         if op == 'request' and request['command'].strip() == 'get':
             return self.read_state()
+        if op == 'request' and request['command'].strip() == 'read_motor --all':
+            # Explicit read-only configuration query. Never claim/revoke a
+            # target lease or invalidate an active follower's permissions.
+            with self._control_lock:
+                return self.control.request('read_motor --all', raw=True,
+                                            timeout_s=request.get('timeout_s'))
         if op == 'lease' and request['operation'] == 'status':
             return self.lease_status(session_id)
         if op == 'stop':
@@ -410,10 +416,62 @@ class SharedControl:
                 udp = self.control.joint_udp if mode == 'Axis' else self.control.udp
                 if udp is None:
                     raise ConnectionError('Robot control connection unavailable; reconnect explicitly')
-                return udp.send(packet)
+                started = time.monotonic()
+                sent = udp.send(packet)
+                finished = time.monotonic()
+                if request.get('include_send_timing', False):
+                    # Host socket submission, not controller reception/execution.
+                    return dict(bytes_sent=sent, udp_send_started_s=started,
+                                udp_send_finished_s=finished)
+                return sent
             finally:
                 self._target_lock.release()
         with self._control_lock, self._target_lock:
+            if op == 'motor_acceleration':
+                if request.get('status_channel'):
+                    raise PermissionError('Status-only connections cannot configure motor acceleration')
+                from ..operators.kaanh_commands.motor_acceleration import ensure_motor_acceleration, acceleration_matches
+                from ..operators.kaanh_commands.set_acc import positive_acceleration
+                service = self
+                class MotorAccess:
+                    allow_motion = True
+                    shared_control = None
+                    command_timeout_s = service.timeout_s
+
+                    def get_state(self):
+                        return _controller_state(service.control.request('get', status=True))
+
+                    def read_motor_config(self):
+                        reply = service.control.request('read_motor --all', raw=True)
+                        if reply.get('ret_code') != 0:
+                            raise RuntimeError(f'Motor configuration read failed: {reply}')
+                        data = reply.get('ret_context')
+                        return json.loads(data) if isinstance(data, str) else data
+
+                    def begin_shared_console_operation(self):
+                        if service.owner is not None or service.console_operation not in (None, session_id):
+                            raise PermissionError('Motor configuration requires no motion owner or other console operation')
+
+                    def end_shared_console_operation(self):
+                        pass
+
+                    def send_controller_command(self, command):
+                        if not command.startswith('write_motor --id='):
+                            raise PermissionError('Only prepared motor acceleration writes are permitted')
+                        return service.control.request(command, raw=True)
+
+                started = time.monotonic()
+                acceleration = positive_acceleration(request['acceleration'])
+                if acceleration_matches(MotorAccess().read_motor_config(), acceleration):
+                    result = dict(changed=False, max_acc_deg_s2=acceleration, min_acc_deg_s2=-acceleration)
+                else:
+                    if self.owner is not None or self.console_operation not in (None, session_id):
+                        raise PermissionError('Motor acceleration write requires no follower owner or other console operation')
+                    result = ensure_motor_acceleration(MotorAccess(), acceleration,
+                        output=lambda text: self.note('motor_acceleration_detail', message=text))
+                result['preflight_elapsed_s'] = time.monotonic() - started
+                self.note('motor_acceleration_preflight', session_id=session_id, role=role, **result)
+                return result
             if op == 'speed_override':
                 if self.owner is not None or (session_id in self.revoked
                         and session_id not in self._speed_restore_allowed):

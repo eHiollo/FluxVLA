@@ -59,10 +59,19 @@ def _start_managed_service(connection):
 class _Datagram:
     def __init__(self, connection, mode):
         self.connection, self.mode = connection, mode
+        self.last_send_timing = None
 
     def send(self, packet):
-        return self.connection.call('target', mode=self.mode,
-                                    packet=base64.b64encode(packet).decode('ascii'))
+        self.last_send_timing = None
+        result = self.connection.call('target', mode=self.mode, include_send_timing=True,
+                                      packet=base64.b64encode(packet).decode('ascii'))
+        # Older running relays return only the byte count. Do not mistake the
+        # client RPC completion time for the UDP syscall time in that case.
+        if isinstance(result, dict):
+            self.last_send_timing = {key: result[key] for key in (
+                'udp_send_started_s', 'udp_send_finished_s')}
+            return result['bytes_sent']
+        return result
 
 
 class SharedFollowerConnection:

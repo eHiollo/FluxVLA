@@ -533,7 +533,8 @@ class A10Operator(BaseOperator):
     ``cartesian_wire_format='pe321'`` keeps this public input and encodes signed
     Euler ZYX radians in ``type=321, pe`` to avoid the SDK pq angle wrap.
     ``send_joints({'right': joints})`` expects six absolute joint angles in
-    radians. They are converted to degrees in UDP ``jp --motor_pos=[...]``;
+    radians. Wire values are degrees: legacy ``jp --motor_pos=[...]`` or
+    JSON ``motor_pos`` with a per-packet boolean ``filter`` when configured;
     the gripper remains a separate command. Only the selected follower mode
     may receive targets, after this session's start is confirmed in feedback.
     The opt-in SDK tool interface converts planned base poses separately. Joint feedback
@@ -566,7 +567,8 @@ class A10Operator(BaseOperator):
                  allow_motion=False, arm_name='right', feedback_joint_unit='deg',
                  feedback_position_unit=None, gripper_feedback_path=None,
                  joint_udp_port=9999, command_mode='cartesian',
-                 joint_follower_velocity_percent=None,
+                 joint_follower_velocity_percent=None, joint_follower_filter=None,
+                 motor_acceleration_deg_s2=None,
                  cameras=None, gripper=None, gripper_transport='controller',
                  continue_on_gripper_timeout=False,
                  trajectory_feedback_interval_s=0.1,
@@ -590,6 +592,13 @@ class A10Operator(BaseOperator):
                      or not 1 <= joint_follower_velocity_percent <= 100)):
             raise ValueError('joint_follower_velocity_percent must be an integer within 1..100 or None')
         self.joint_follower_velocity_percent = joint_follower_velocity_percent
+        if joint_follower_filter is not None and type(joint_follower_filter) is not bool:
+            raise ValueError('joint_follower_filter must be bool or None')
+        self.joint_follower_filter = joint_follower_filter
+        if motor_acceleration_deg_s2 is not None:
+            from .kaanh_commands.set_acc import positive_acceleration
+            motor_acceleration_deg_s2 = positive_acceleration(motor_acceleration_deg_s2)
+        self.motor_acceleration_deg_s2 = motor_acceleration_deg_s2
         if command_mode not in _FOLLOWER_MODES:
             raise ValueError('command_mode must be cartesian or joint')
         if cartesian_wire_format not in ('pq', 'pe321'):
@@ -1027,6 +1036,8 @@ class A10Operator(BaseOperator):
             raise ValueError('Send one controller command per line')
         with self._io_lock:
             self._require_motion()
+            if command.split(maxsplit=1)[0] in ('follower_aj', 'follower_aj_tg', 'follower_cart'):
+                self.ensure_motor_acceleration()
             self._require_target_owner()
             state = self.get_state()
             self._confirmed_active = self._start_confirmed = False
@@ -1391,6 +1402,44 @@ class A10Operator(BaseOperator):
         """Read the current Manual/Auto controller speed percentage."""
         return _speed_override(self.get_state())
 
+    def ensure_motor_acceleration(self, value=None, *, output=print):
+        """Read configured limits before motion; never prepare/enable the robot."""
+        value = self.motor_acceleration_deg_s2 if value is None else value
+        if value is None:
+            return None
+        from .kaanh_commands.motor_acceleration import ensure_motor_acceleration
+        from ..communication.a10_shared_connection import SharedFollowerConnection
+        with self._io_lock:
+            self._require_motion()
+            if isinstance(self._connection, SharedFollowerConnection):
+                try:
+                    result = self._connection.call('motor_acceleration', acceleration=value,
+                                                   timeout_s=self.command_timeout_s)
+                except (RuntimeError, ValueError) as exc:
+                    if 'Unknown shared operation' in str(exc):
+                        raise RuntimeError('当前共享服务不支持电机加速度预检；请空闲时退出旧控制台及共享服务，再重新启动。不会自动重启或启动运动。') from exc
+                    raise
+            else:
+                started = time.monotonic()
+                result = ensure_motor_acceleration(self, value, output=output)
+                result['preflight_elapsed_s'] = time.monotonic() - started
+            if result.get('changed'):
+                raise RuntimeError(f'电机加速度已写入并回读为 ±{value:g}°/s²，保持未使能、程序Unloaded。请自行使能后重新启动运动。')
+            return result
+
+    def read_motor_config(self):
+        """Read all motor settings without granting/invalidation of motion rights."""
+        with self._io_lock:
+            reply = self._connection.request('read_motor --all', raw=True)
+        if reply.get('ret_code') != 0:
+            raise A10ControllerError(f'Read motor configuration failed: {reply}')
+        data = reply.get('ret_context')
+        if isinstance(data, str):
+            data = json.loads(data)
+        if not isinstance(data, list) or len(data) != 12:
+            raise A10ProtocolError('Expected twelve motor configurations')
+        return data
+
     def set_speed_override(self, percent, *, expected_mode, expected_percent=None,
                            allow_cancelled=False):
         """Set speed while stopped; cleanup may restore it without clearing cancellation."""
@@ -1491,6 +1540,7 @@ class A10Operator(BaseOperator):
                     self.command_mode = mode
                     return state  # Already in this session's confirmed mode; no duplicate start.
                 raise RuntimeError('This session has a pending follower; stop_follower before switching modes')
+            self.ensure_motor_acceleration()
             if self.shared_control:
                 self._connection.lease('acquire')
             self.last_stop_confirmed = False
@@ -1824,12 +1874,17 @@ class A10Operator(BaseOperator):
             try:
                 if mode == 'Axis':
                     self._check_joint_follower_reply()
+                started = time.monotonic()
                 if udp.send(packet) != len(packet):
                     raise ConnectionError('Incomplete UDP datagram send')
+                finished = time.monotonic()
+                timing = (getattr(udp, 'last_send_timing', None) if self.shared_control
+                          else dict(udp_send_started_s=started, udp_send_finished_s=finished))
             except OSError:
                 self._confirmed_active = False
                 raise
         # UDP has no application ACK. This return does not mean execution.
+        return timing
 
     def _check_joint_follower_reply(self):
         """Surface direct SDK rejection datagrams; silence is not acceptance.
@@ -2135,9 +2190,14 @@ class A10Operator(BaseOperator):
             degrees = np.rad2deg(radians)
         if not np.isfinite(degrees).all():
             raise A10ProtocolError('Joint conversion to degrees must remain finite')
-        values = ','.join(format(float(v), '.17g') for v in degrees)
-        payload = f'jp --motor_pos=[{values}]'.encode('utf-8')
-        self._send_follower_target(_pack(payload, command=False), 'Axis')
+        if self.joint_follower_filter is None:
+            values = ','.join(format(float(v), '.17g') for v in degrees)
+            payload = f'jp --motor_pos=[{values}]'.encode('utf-8')
+        else:
+            payload = json.dumps(dict(motor_pos=degrees.tolist(),
+                                      filter=self.joint_follower_filter),
+                                 separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return self._send_follower_target(_pack(payload, command=False), 'Axis')
 
     def _claim_init_motion(self):
         with self._io_lock:
@@ -2158,6 +2218,7 @@ class A10Operator(BaseOperator):
     def _prepare_init_motion(self):
         with self._io_lock:
             self._require_motion()
+            self.ensure_motor_acceleration()
             state = self.get_state()
             if state.follower_active not in (True, False):
                 raise RuntimeError('Initialization requires known follower state')

@@ -3,7 +3,7 @@ import socket
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fluxvla.engines.operators.a10_operator import A10Operator, _FollowerConnection, A10NotReadyError, A10ControllerError
 from fluxvla.engines.communication.a10_shared_connection import SharedFollowerConnection
@@ -13,6 +13,51 @@ from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init
 
 
 class SharedControlTest(unittest.TestCase):
+    def test_old_relay_byte_count_does_not_fabricate_udp_timestamp(self):
+        from fluxvla.engines.communication.a10_shared_connection import _Datagram
+        connection = Mock()
+        connection.call.return_value = 3
+        udp = _Datagram(connection, 'Axis')
+        self.assertEqual(udp.send(b'abc'), 3)
+        self.assertIsNone(udp.last_send_timing)
+
+    def test_shared_dual_udp_preserves_targets_and_wire_timestamps(self):
+        import numpy as np
+        from test_a10_operator import DUAL_ARMS, dual_motion
+        self.controller.motion_override = dual_motion()
+        client = self.client('inference', arms=DUAL_ARMS,
+            joint_target_order=['left', 'right'], cartesian_target_order=['left', 'right'])
+        client.start_follower()
+        try:
+            state = client.get_state()
+            targets = {name: arm.actual_joints_rad for name, arm in state.arms.items()}
+            for _ in range(3):
+                started = time.monotonic()
+                timing = client.send_joints(targets)
+                finished = time.monotonic()
+                self.assertLessEqual(started, timing['udp_send_started_s'])
+                self.assertLessEqual(timing['udp_send_started_s'], timing['udp_send_finished_s'])
+                self.assertLessEqual(timing['udp_send_finished_s'], finished)
+            packet = self.controller.joint_udp.recv(4096)[40:].decode()
+            values = __import__('json').loads(packet[packet.index('['):])
+            np.testing.assert_allclose(values, np.arange(12)*10, atol=1e-10)
+        finally:
+            client.stop_follower()
+
+    def test_read_motor_config_does_not_claim_or_stop_active_owner(self):
+        import json
+        owner = self.client('teleop')
+        reader = self.client('inference', allow_motion=False)
+        owner.start_follower()
+        motors = [dict(max_acc=1000., min_acc=-1000., slave_id=i+2) for i in range(12)]
+        self.controller.command_replies['read_motor --all'] = dict(
+            ret_code=0, ret_context=json.dumps(motors), ret_msg='')
+        self.assertEqual(reader.read_motor_config(), motors)
+        self.assertEqual(self.robot.owner, owner._connection.session_id)
+        self.assertTrue(self.controller.active)
+        self.assertNotIn('stop_follower', self.controller.commands)
+        owner.stop_follower()
+
     def setUp(self):
         self.controller = FakeController().__enter__()
         self.ws_port = self.controller.server.socket.getsockname()[1]

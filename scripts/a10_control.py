@@ -40,6 +40,7 @@ HELP = """可用指令：
   jog left x 5 right x 5        两臂各沿自身工具 X 轴移动 5 mm
   g_move --pos=毫米数            发送夹爪目标，范围 0..100 mm
   m_init                        回到初始位置，成功后恢复原控制模式与跟随状态
+  set_acc 400 [--id 0|--all]     设置电机±加速度（°/s²），默认全部12轴；卸载程序并掉使能
   stop                          取消当前及排队命令，停止动作下发并请求停止 follower
   其他未注册指令                原文发送到控制器，显示完整回复
   raw 控制器指令                显式透传，可发送与内置名称相同的原生命令
@@ -289,7 +290,7 @@ class A10Console:
         # Keep a multi-step console operation (notably m_init) exclusive until
         # its speed/mode restoration is complete. Queries never claim control.
         shared = getattr(self.robot, 'shared_control', None)
-        controls = (args.command not in ('get', 'help', 'exit', 'reconnect', 'm_init')
+        controls = (args.command not in ('get', 'help', 'exit', 'reconnect', 'm_init', 'set_acc')
                     and not (args.command == 'joints' and not args.targets))
         reserved = (controls and isinstance(shared, dict) and shared.get('role') == 'console'
                     and self.robot.allow_motion and self.robot.is_connected)

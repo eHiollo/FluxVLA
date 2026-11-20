@@ -19,7 +19,7 @@ DEFAULT_CONFIG = HERE.parent / 'configs/a10/a10_visualizer.py'
 # Use the transport from this checkout even when another checkout is installed.
 sys.path.insert(0, str(HERE.parent))
 
-from scripts.a10_visualizer.model import A10MeshModel, rotate
+from scripts.a10_visualizer.model import A10MeshModel, axis_quaternion, compose, rotate
 
 
 def _vectors(values, rows, width, field):
@@ -41,6 +41,19 @@ def _pose(values, position_scale):
 
 def _world_point(pose, offset):
     return [p + d for p, d in zip(pose[:3], rotate(offset, pose[3:]))]
+
+
+def place_arm(arm, settings):
+    side = arm['id']
+    yaw = math.radians(settings.get('display_yaw_deg', (0., 0.))[side])
+    mount = (*settings['display_offsets_m'][side], *axis_quaternion((0., 0., 1.), yaw))
+    arm['base_m'] = _world_point(mount, arm['base_m'])
+    arm['joints_m'] = [_world_point(mount, point) for point in arm['joints_m']]
+    if 'mesh_pq_m' in arm:
+        arm['mesh_pq_m'] = [compose(mount, pose) for pose in arm['mesh_pq_m']]
+    if 'tcp_pq_m' in arm:
+        arm['scene_tcp_pq_m'] = compose(mount, arm['tcp_pq_m'])
+    return arm
 
 
 def decode_frame(reply, settings, model=None):
@@ -68,12 +81,11 @@ def decode_frame(reply, settings, model=None):
         actual_deg = [x * to_deg for x in actual[side]]
         arm = dict(id=side, base_m=poses[0][:3], joints_m=joints,
                    tcp_pq_m=_pose(tcp[side], pos_scale),
-                   offset_m=settings['display_offsets_m'][side],
                    actual_deg=actual_deg,
                    target_deg=[x * to_deg for x in target[side]])
         if model is not None:
             arm['mesh_pq_m'] = model.link_poses(actual_deg, poses[0])
-        arms.append(arm)
+        arms.append(place_arm(arm, settings))
     return dict(arms=arms, mode=robot.get('op_mode'), motor=robot.get('activate'),
                 motion=robot.get('motion'), controller_status=robot.get('status'),
                 follower_active=follower.get('running_state'),
@@ -150,23 +162,41 @@ def connection_for(settings, shared_port):
     return _FollowerConnection(host, status, cartesian, timeout, joint)
 
 
+def joint_pose_frame(actual, target, settings, model):
+    base_pose = (0., 0., 0., 0., 0., 0., 1.)
+    arms = []
+    for side in range(2):
+        meshes = model.link_poses(actual[side], base_pose)
+        arm = dict(id=side, base_m=base_pose[:3],
+                   joints_m=[pose[:3] for pose in meshes[1:]], mesh_pq_m=meshes,
+                   actual_deg=actual[side], target_deg=target[side])
+        arms.append(place_arm(arm, settings))
+    return dict(arms=arms)
+
+
 def decode_joint_replay(data, settings, model):
     if model is None:
         raise ValueError('关节轨迹回放需要 A10_fixed.zip')
     frames = []
-    base_pose = (0., 0., 0., 0., 0., 0., 1.)
     for sample in data['frames']:
         actual = _vectors(sample['actual_deg'], 2, 6, 'actual_deg')
         target = _vectors(sample['target_deg'], 2, 6, 'target_deg')
-        arms = []
-        for side in range(2):
-            meshes = model.link_poses(actual[side], base_pose)
-            arms.append(dict(id=side, base_m=base_pose[:3],
-                             joints_m=[pose[:3] for pose in meshes[1:]],
-                             mesh_pq_m=meshes, offset_m=settings['display_offsets_m'][side],
-                             actual_deg=actual[side], target_deg=target[side]))
-        frames.append(dict(arms=arms, controller_status='历史关节反馈'))
+        frame = joint_pose_frame(actual, target, settings, model)
+        frame['controller_status'] = '历史关节反馈'
+        frames.append(frame)
     return frames
+
+
+def initial_pose_frame(settings, model):
+    if model is None:
+        raise ValueError('初始位姿预览需要 A10_fixed.zip')
+    config_path = DEFAULT_CONFIG.with_name('a10_dual_arm_operator.py')
+    config = runpy.run_path(str(config_path))['operator']
+    arms = sorted(config['arms'], key=lambda name: config['arms'][name]['ee_id'])
+    targets = [[math.degrees(angle) for angle in config['init_position'][arm]] for arm in arms]
+    frame = joint_pose_frame(targets, targets, settings, model)
+    frame['controller_status'] = '初始位姿预览'
+    return frame
 
 
 def replay_frames(path, settings, model=None):
@@ -226,6 +256,7 @@ def main(argv=None):
     parser.add_argument('--model-archive', type=Path, help='A10_fixed URDF 和 STL 的 ZIP 文件')
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--replay', type=Path, help='GET 回包或 a10_joint_feedback_v1 关节轨迹 JSON')
+    source.add_argument('--initial-pose', action='store_true', help='离线预览双臂 m_init 位姿')
     source.add_argument('--shared-port', type=int, help='复用正在运行的本机 A10 状态服务')
     args = parser.parse_args(argv)
     try:
@@ -240,14 +271,20 @@ def main(argv=None):
         for port in (settings['listen_port'], settings['status_port'], args.shared_port):
             if port is not None and not 1 <= port <= 65535:
                 raise ValueError('端口应在 1–65535 内')
-        mode = 'replay' if args.replay else 'live'
-        label = args.replay.name if args.replay else f"{settings['host']}:{settings['status_port']}"
-        state = ViewerState(label, mode, settings['stale_after_s'])
         archive = args.model_archive or HERE.parent / 'others/A10_fixed.zip'
         model = A10MeshModel(archive) if args.model_archive is not None or archive.is_file() else None
         if model is None:
             print(f'未找到实体模型 {archive}，使用骨架显示。', file=sys.stderr)
-        frames = replay_frames(args.replay, settings, model) if args.replay else None
+        if args.initial_pose:
+            mode, label = 'initial', 'm_init'
+            frames = [initial_pose_frame(settings, model)]
+        elif args.replay:
+            mode, label = 'replay', args.replay.name
+            frames = replay_frames(args.replay, settings, model)
+        else:
+            mode, label = 'live', f"{settings['host']}:{settings['status_port']}"
+            frames = None
+        state = ViewerState(label, mode, settings['stale_after_s'])
         viewer_dir = HERE / 'a10_visualizer'
         page = (viewer_dir / 'index.html').read_bytes()
         mesh_script = (viewer_dir / 'mesh.js').read_bytes()

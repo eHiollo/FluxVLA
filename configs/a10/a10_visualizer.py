@@ -11,8 +11,9 @@ viewer = dict(
     timeout_s=2.,
     position_unit='mm',
     joint_unit='deg',
-    # Display-only offsets. Configure actual mounting transforms separately.
-    display_offsets_m=((-1.05, 0., 0.), (1.05, 0., 0.)),
+    # Each A10 base's side opening faces local -Y. Rotate it toward the other base.
+    display_offsets_m=((-0.575, 0., 0.), (0.575, 0., 0.)),
+    display_yaw_deg=(90., -90.),
     # Joint marker positions on the parent parts, in metres, from .198 kaanh.xml.
     # Part indices refer to ground, L1, ..., L6 in each part_pq group.
     joint_markers=(

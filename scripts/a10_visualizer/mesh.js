@@ -100,11 +100,11 @@ async function loadA10Meshes(canvas) {
   }
   const grid = upload(new Float32Array(lines));
 
-  function draw(item, pose, offset, scale, color, mode) {
+  function draw(item, pose, scale, color, mode) {
     gl.bindBuffer(gl.ARRAY_BUFFER, item.buffer);
     gl.vertexAttribPointer(vertex, 3, gl.FLOAT, false, 24, 0);
     gl.vertexAttribPointer(normal, 3, gl.FLOAT, false, 24, 12);
-    gl.uniform3f(uniforms.position, pose[0] + offset[0], pose[1] + offset[1], pose[2] + offset[2]);
+    gl.uniform3f(uniforms.position, pose[0], pose[1], pose[2]);
     gl.uniform4fv(uniforms.rotation, pose.slice(3));
     gl.uniform3fv(uniforms.scale, scale);
     gl.uniform3fv(uniforms.color, color);
@@ -124,13 +124,13 @@ async function loadA10Meshes(canvas) {
     gl.uniform4f(uniforms.camera, Math.cos(view.yaw), Math.sin(view.yaw),
       Math.cos(view.pitch), Math.sin(view.pitch));
     gl.uniform1f(uniforms.feedback, 1);
-    draw(grid, [0, 0, 0, 0, 0, 0, 1], [0, 0, 0], [1, 1, 1], [0.14, 0.20, 0.28], gl.LINES);
+    draw(grid, [0, 0, 0, 0, 0, 0, 1], [1, 1, 1], [0.14, 0.20, 0.28], gl.LINES);
     gl.uniform1f(uniforms.feedback, stale ? 0.57 : 1);
     for (const arm of frame?.arms ?? []) {
       arm.mesh_pq_m.forEach((pose, i) => {
         const item = models[i];
         const color = item.color.map((value, channel) => value * 0.68 + tints[arm.id][channel] * 0.32);
-        draw(item, pose, arm.offset_m, item.scale, color, gl.TRIANGLES);
+        draw(item, pose, item.scale, color, gl.TRIANGLES);
       });
     }
   };

@@ -118,7 +118,7 @@ tbody tr:nth-child(odd) { background: #16202c; }
       </div>
       <div class="legend">
         <span class="arm arm0">ID 0</span><span class="arm arm1">ID 1</span>
-        <small><span id="mesh-mode">加载实体模型…</span> · 示意布局 · 拖动旋转 · 滚轮缩放</small>
+        <small><span id="mesh-mode">加载实体模型…</span> · 基座安装布局 · 拖动旋转 · 滚轮缩放</small>
       </div>
     </section>
     <aside class="panel" aria-labelledby="joints-title">
@@ -157,10 +157,9 @@ const jointPanels = colors.map((_, arm) => {
       <tbody>${Array.from({ length: 6 }, (_, i) => `<tr><td>J${i+1}</td><td>—</td><td>—</td><td>—</td></tr>`).join("")}</tbody>
     </table><p class="tcp">TCP [mm] · —</p>`;
   el("groups").append(section);
-  return { rows: section.querySelectorAll("tbody tr"), tcp: section.querySelector(".tcp") };
+  return { rows: section.querySelectorAll("tbody tr"),
+    valueHeader: section.querySelector("th:nth-child(2)"), tcp: section.querySelector(".tcp") };
 });
-
-function add(a, b) { return a.map((value, i) => value + b[i]); }
 
 function rotate(point, [u, v, w, s]) {
   const [x, y, z] = point;
@@ -209,11 +208,11 @@ function draw() {
   const segments = [], joints = [], tcpAxes = [];
   for (const arm of frame.arms) {
     const color = colors[arm.id];
-    const base = project(add(arm.base_m, arm.offset_m));
-    const tcpXYZ = arm.tcp_pq_m ? add(arm.tcp_pq_m.slice(0, 3), arm.offset_m) : null;
+    const base = project(arm.base_m);
+    const tcpXYZ = arm.scene_tcp_pq_m?.slice(0, 3);
     const tcp = tcpXYZ ? project(tcpXYZ) : null;
     if (!paintMeshes) {
-      const points = [base, ...arm.joints_m.map(point => project(add(point, arm.offset_m)))];
+      const points = [base, ...arm.joints_m.map(project)];
       if (tcp) points.push(tcp);
       dot(base, 9, color);
       points.slice(1).forEach((p, i) => {
@@ -225,7 +224,7 @@ function draw() {
     if (tcp) tcpAxes.push({ tcp, tips: axisColors.map((_, index) => {
       const axis = [0, 0, 0];
       axis[index] = 0.16;
-      return project(add(tcpXYZ, rotate(axis, arm.tcp_pq_m.slice(3))));
+      return project(rotate(axis, arm.scene_tcp_pq_m.slice(3)).map((value, i) => value + tcpXYZ[i]));
     }) });
     ctx.fillStyle = color;
     ctx.font = "bold 12px system-ui";
@@ -287,9 +286,10 @@ function render(report) {
   frame = report.frame;
   stale = report.stale;
   const playback = report.mode === "replay";
-  setText("source", `${playback ? "回放" : "实时"} · ${report.source}`);
+  const initial = report.mode === "initial";
+  setText("source", `${initial ? "初始位姿" : playback ? "回放" : "实时"} · ${report.source}`);
   el("health").classList.toggle("stale", stale);
-  setText("health", stale ? (frame ? "反馈已过期" : "等待反馈") : playback ? "离线回放" : "反馈在线");
+  setText("health", stale ? (frame ? "反馈已过期" : "等待反馈") : initial ? "离线预览" : playback ? "离线回放" : "反馈在线");
   setText("age", report.age_ms == null ? "—" : `${report.age_ms} ms`);
   el("empty").hidden = !!frame;
   setText("mode", label(frame?.mode));
@@ -299,13 +299,15 @@ function render(report) {
     `${frame.follower_active ? "运行中" : "未运行"} · ${label(frame.follower_mode)}`);
   for (const arm of frame?.arms ?? []) {
     const panel = jointPanels[arm.id];
+    panel.valueHeader.textContent = initial ? "预览" : "实际";
     panel.rows.forEach((row, i) => {
-      [arm.actual_deg[i], arm.target_deg[i], arm.target_deg[i] - arm.actual_deg[i]]
-        .forEach((num, j) => { row.cells[j + 1].textContent = num.toFixed(2); });
+      row.cells[1].textContent = arm.actual_deg[i].toFixed(2);
+      row.cells[2].textContent = initial ? "—" : arm.target_deg[i].toFixed(2);
+      row.cells[3].textContent = initial ? "—" : (arm.target_deg[i] - arm.actual_deg[i]).toFixed(2);
     });
     panel.tcp.textContent = arm.tcp_pq_m
       ? `TCP [mm] · ${arm.tcp_pq_m.slice(0, 3).map(x => (x * 1000).toFixed(1)).join(" / ")}`
-      : "TCP 未记录";
+      : initial ? "TCP —" : "TCP 未记录";
   }
   const codes = frame?.driver_codes?.filter(Boolean) ?? [];
   const faultText = frame?.fault ? [

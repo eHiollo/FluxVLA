@@ -64,12 +64,10 @@ def configure_init_motion(robot, *, joint_dofs, init_position,
         robot._init_motion_lock = threading.Lock()
 
 
-def initialize_grippers(robot, targets_mm):
-    """Extension point: future drivers consume named absolute widths in mm.
-
-    False explicitly means no gripper was commanded or confirmed.
-    """
-    return False
+def initialize_grippers(robot, targets_mm, *, cancel_event=None):
+    """Open explicitly configured ZX devices; raw endpoints come from device config."""
+    from .init_grippers import open_configured_grippers
+    return open_configured_grippers(robot, cancel_event=cancel_event)
 
 
 def move_to_init(robot, progress=None, *, cancel_event=None):
@@ -121,6 +119,9 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
         joint_map(robot._read_init_joints(), robot.joint_dofs, 'actual joints')
         robot._traj_stop_event.clear()
         check_cancelled()
+        result['grippers_initialized'] = bool(initialize_grippers(
+            robot, dict(robot.init_gripper_positions), cancel_event=cancel_event))
+        check_cancelled()
         attempted = True
         result['phase'] = 'start_follower'
         if progress:
@@ -154,8 +155,6 @@ def move_to_init(robot, progress=None, *, cancel_event=None):
                     for name in target) else 0)
                 if matches == 3:
                     result['arms_arrived'] = True
-                    result['grippers_initialized'] = bool(
-                        initialize_grippers(robot, dict(robot.init_gripper_positions)))
                     break
                 next_feedback = time.monotonic() + settings['feedback_interval_s']
             if robot._traj_stop_event.is_set():
@@ -258,6 +257,6 @@ def execute(robot, args, output):
     output('执行 FluxVLA 本地 m_init，返回机器人定义的初始位置。')
     result = move_to_init(robot, progress=output)
     output('机械臂初始化到位（实际关节反馈已确认），原 follower 状态、控制模式及速度倍率已恢复。')
-    output('夹爪初始化已完成。' if result['grippers_initialized'] else
+    output('双夹爪已触发打开（不等待夹爪到位）。' if result['grippers_initialized'] else
            '夹爪初始化尚未执行（预留接口，初始开度默认 0 mm）。')
     return result

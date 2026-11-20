@@ -57,7 +57,8 @@ UDP 发出不等于控制器收到或机器人到位；坐标语义需要现场�
 先确认 ee_id 的物理左右对应，再 manual_en、set_jog_coordinate --tool、follower_cart、jog。
 未选择的臂保持；连续 jog 保留累计量；到位检查失败会请求停止整个控制组。
 双臂 pq、g_move 仍拒绝；joints 查询会打印完整关节目标模板。
-m_init 使用 operator 的 init_position；需先 manual_en，夹爪初始化接口暂不执行。
+m_init 使用 operator 的 init_position；需先 manual_en；配置的双夹爪与机械臂同时回位。
+夹爪由 VR 占用时请使用 VR 的 m_init；控制台不会抢占串口或自动使能夹爪。
 Ctrl+C / Ctrl+D 与 exit 一样尝试退出；断网或强制结束无法保证停止。
 断线或启动时设备离线仍保留 a10>；恢复后输入 reconnect，只重连并查询。
 内置指令保留参数检查和反馈确认；其他指令原文透传，不自动重试。

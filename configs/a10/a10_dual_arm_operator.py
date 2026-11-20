@@ -5,10 +5,11 @@ Load the updated controller XML before connecting to 5999; 5867 stays for the pe
 Physical left/right and live GET groups/units still require onsite confirmation.
 Console and VR use one local relay owning a single command/status WS connection.
 No recording or VR calibration. m_init supports the full joint follower group;
-gripper initialization is reserved for a future driver.
+m_init explicitly opens both configured ZX grippers while returning the arms.
 """
 
 operator = dict(
+    init_grippers_config='{{fileDirname}}/a10_dual_devices.py',
     type='A10Operator', host='192.168.0.150',
     ws_port=5999, status_ws_port=5999, udp_port=9998, joint_udp_port=9999,
     status_poll_interval_s=None, timeout_s=2.,

@@ -29,3 +29,6 @@ teleop = dict(
         max_reference_lead_rad=.15,
     ),
 )
+
+# Virtual reset must never inherit the live console USB gripper opening path.
+operator = dict(init_grippers_config=None)

@@ -578,7 +578,7 @@ class A10Operator(BaseOperator):
                  command_timeout_s=60.0, record_trajectory_trace=False, shared_control=None,
                  cartesian_wire_format='pq', arms=None, cartesian_target_order=None,
                  joint_target_order=None, init_position=None,
-                 init_gripper_positions=None, init_motion=None):
+                 init_gripper_positions=None, init_motion=None, init_grippers_config=None):
         super().__init__(sync_warning_enabled=False)
         if not isinstance(host, str) or not host or any(c in host for c in '/?#@'):
             raise ValueError('host must be a controller hostname or IP')
@@ -633,6 +633,7 @@ class A10Operator(BaseOperator):
         self.init_gripper_positions = ({name: 0. for name in self.arm_names}
                                        if init_gripper_positions is None else dict(init_gripper_positions))
         self.init_motion = {} if init_motion is None else dict(init_motion)
+        self.init_grippers_config = init_grippers_config
         self.last_init_motion = None
         if self.is_multi_arm and (gripper is not None or gripper_transport != 'controller'
                                   or gripper_feedback_path is not None):

@@ -58,6 +58,7 @@ class _ZXGripperChannel:
         self._motion_cancel = threading.Event()
         self._reset_requested = threading.Event()
         self._disable_requested = threading.Event()
+        self._init_open_request = None
         self._thread = None
         self._input = (0., 0.)
         self._target = None
@@ -86,7 +87,7 @@ class _ZXGripperChannel:
         if not math.isfinite(axis) or abs(axis) > 1 or not math.isfinite(deadline):
             raise ValueError('ZX joystick must be finite within [-1, 1], with a finite deadline')
         with self._lock:
-            if not self._stop.is_set():
+            if not self._stop.is_set() and self._init_open_request is None:
                 self._input = (float(axis), float(deadline))
                 if abs(axis) <= self.options['deadzone'] and deadline > time.monotonic():
                     self._motion_cancel.clear()  # A fresh neutral sample rearms USB commands.
@@ -120,6 +121,40 @@ class _ZXGripperChannel:
             raise RuntimeError('Invalid action or gripper worker is not running')
         self.pause()
         (self._reset_requested if action == 'reset' else self._disable_requested).set()
+
+    def request_init_open(self, *, cancel_event=None, stop_event=None):
+        """Queue one open command on the current USB owner; no arrival wait."""
+        if self._stop.is_set() or self._thread is None or not self._thread.is_alive():
+            raise RuntimeError(f'ZX {self.side} worker is not running')
+        with self._lock:
+            self._motion_cancel.set()
+            self._input = (0., 0.)
+            self._need_center, self._active = True, False
+            self._init_open_request = (cancel_event, stop_event, time.monotonic() + 1.)
+
+    def _process_init_open(self, state):
+        with self._lock:
+            request = self._init_open_request
+            self._init_open_request = None
+        if request is None:
+            return False
+        cancel_event, stop_event, deadline = request
+        if (time.monotonic() >= deadline or
+                any(event is not None and event.is_set() for event in (cancel_event, stop_event))):
+            return True
+        try:
+            if not state.enabled:
+                raise RuntimeError('m_init does not enable grippers')
+            self.client.set_position_raw(
+                self.device_id, self.opened, speed=self.speed, torque=self.torque,
+                feedback=state, wait=False, motion_cancel_event=cancel_event or stop_event,
+                motion_deadline_s=deadline)
+            self._target = self._last_sent = None
+        except Exception as exc:
+            with self._lock:
+                self._state['init_open_error'] = str(exc)
+            logging.getLogger(__name__).warning('ZX %s m_init 打开指令未完成：%s', self.side, exc)
+        return True
 
     def _communication_failed(self, error):
         # Only this gripper pauses. Never discard CRC or fabricate feedback,
@@ -226,11 +261,13 @@ class _ZXGripperChannel:
                         state, now = self._read()
                     except ZXGripperCommunicationError as exc:
                         self._communication_failed(exc)
+                        self._init_open_request = None
                         self._ready.set()
                         continue  # Poll feedback only; no uncertain write is retried.
                     blocking_alarm = has_blocking_alarm(state.alarm_a, state.alarm_b,
                                                         drop_alarm_policy=self.drop_alarm_policy)
                     if blocking_alarm or self.snapshot().get('alarm_latched'):
+                        self._init_open_request = None
                         first = not self.snapshot().get('alarm_latched')
                         self.pause()
                         with self._lock:
@@ -242,6 +279,8 @@ class _ZXGripperChannel:
                             logging.getLogger(__name__).error('ZX %s 硬件报警，停止新目标并保持只读查询：%s',
                                 self.side, self.snapshot()['error'])
                         continue  # Never auto-clear, disable, or replay an old position.
+                    if self._process_init_open(state):
+                        continue
                     if self._target is None:
                         self._target = float(np.clip(state.position_raw, self.low, self.high))
                     self._ready.set()
@@ -270,6 +309,7 @@ class _ZXGripperChannel:
                 self._state.update(phase='failed', error=f'{type(exc).__name__}: {exc}')
             self._stop.set()
         finally:
+            self._init_open_request = None
             self._ready.set()
 
 
@@ -1298,6 +1338,8 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
                         for side in ('left', 'right')}
             self._zx_channels = channels if self.execute else {}
         self.zx_grippers_enabled = enabled
+        if self.execute and enabled and self.robot is not None:
+            self.robot._open_init_grippers = self._open_grippers_for_init
 
     def connect(self):
         try:
@@ -1386,6 +1428,19 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
             value = action[self.teleoperator.hand_to_arm[side]].get('gripper.pos', 0.)
             channel.submit(float(value) if valid else 0., time.monotonic() + budget - age - elapsed if valid else 0.)
         return result
+
+    def _open_grippers_for_init(self, *, cancel_event=None):
+        """Trigger both opens on existing workers, without waiting for arrival."""
+        if set(self._zx_channels) != {'left', 'right'}:
+            raise RuntimeError('m_init requires both live ZX gripper channels')
+        for channel in self._zx_channels.values():
+            if not channel.check_health() or not channel.snapshot().get('enabled'):
+                raise RuntimeError(f'ZX {channel.side} is not enabled/ready; m_init will not enable it')
+        for channel in self._zx_channels.values():
+            # Normal completion stops the arm follower; it must not cancel an
+            # already queued open before the USB worker has sent it.
+            channel.request_init_open(cancel_event=cancel_event)
+        return True
 
     def _gripper_faults(self):
         faults = {}

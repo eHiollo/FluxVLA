@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A10 双臂查看器</title>
+<style>
+:root {
+  color-scheme: dark;
+  --background: #0c1119;
+  --panel: #111923;
+  --canvas: #0c141f;
+  --edge: #263445;
+  --muted: #99aabd;
+  --text: #edf3f9;
+  --blue: #66dbc9;
+  --gold: #ffbf79;
+  --warning: #ffd28a;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--background); color: var(--text);
+  font: 14px/1.5 system-ui, "Noto Sans CJK SC", sans-serif;
+}
+main { max-width: 1600px; margin: auto; padding: 28px clamp(16px, 4vw, 56px); }
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: clamp(22px, 4vw, 30px); font-weight: 650; letter-spacing: .02em; }
+h2 { font-size: 15px; font-weight: 650; }
+h3 { font-size: 13px; padding: 12px 18px 5px; }
+small, .muted { color: var(--muted); }
+.page-header, .panel-header, .scene-tools, .legend {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.source { display: block; margin-top: 4px; font: 12px ui-monospace, monospace; }
+.status {
+  padding: 6px 10px; border-radius: 6px; border: 1px solid #325b56; color: var(--blue);
+  font-size: 12px; white-space: nowrap;
+}
+.status.stale { color: var(--warning); border-color: #68543a; }
+dl {
+  margin: 22px 0 16px; display: grid; grid-template-columns: repeat(5, 1fr);
+  background: var(--panel); border: 1px solid var(--edge); border-radius: 10px;
+}
+dl div { padding: 10px 14px; border-inline-start: 1px solid var(--edge); min-width: 0; }
+dl div:first-child { border: 0; }
+dt { color: var(--muted); font-size: 12px; }
+dd { margin: 3px 0 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(290px, 340px); gap: 16px; }
+.panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 10px; min-width: 0; overflow: hidden; }
+.panel-header { padding: 11px 14px; border-bottom: 1px solid var(--edge); }
+.scene-tools { gap: 5px; }
+button { color: var(--text); background: #172132; border: 1px solid #334257; border-radius: 5px; cursor: pointer; min-width: 30px; height: 30px; }
+button:hover { background: #233449; }
+button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.stage { position: relative; background: var(--canvas); }
+canvas { display: block; width: 100%; height: clamp(330px, 51vw, 570px); touch-action: none; cursor: grab; }
+canvas:active { cursor: grabbing; }
+.empty {
+  position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+  pointer-events: none; background: #0c141f9c;
+}
+.empty[hidden] { display: none; }
+.legend { justify-content: flex-start; flex-wrap: wrap; padding: 10px 14px; border-top: 1px solid var(--edge); }
+.arm::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: currentColor; }
+.arm0 { color: var(--blue); }
+.arm1 { color: var(--gold); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 3px 12px; text-align: right; }
+th:first-child, td:first-child { text-align: left; padding-left: 18px; }
+th:last-child, td:last-child { padding-right: 18px; }
+th { font-size: 11px; font-weight: 500; color: var(--muted); }
+tbody tr:nth-child(odd) { background: #16202c; }
+.tcp { padding: 8px 18px 12px; font: 11px/1.5 ui-monospace, monospace; color: var(--muted); }
+#diagnostics { margin-top: 14px; padding: 10px 14px; }
+#diagnostics.warning { color: var(--warning); border-color: #68543a; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  .joint-groups { display: grid; grid-template-columns: 1fr 1fr; }
+  .joint-groups section + section { border-left: 1px solid var(--edge); }
+}
+@media (max-width: 480px) {
+  .joint-groups { grid-template-columns: 1fr; }
+  dl { grid-template-columns: repeat(3, 1fr); }
+  dl div { padding-left: 8px; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header class="page-header">
+    <div><h1>A10 双臂查看器</h1><small id="source" class="source">连接本地服务…</small></div>
+    <output id="health" class="status stale">等待反馈</output>
+  </header>
+  <dl>
+    <div><dt>距上次反馈</dt><dd id="age">—</dd></div>
+    <div><dt>操作模式</dt><dd id="mode">—</dd></div>
+    <div><dt>电机使能</dt><dd id="motor">—</dd></div>
+    <div><dt>运动状态</dt><dd id="motion">—</dd></div>
+    <div><dt>Follower</dt><dd id="follower">—</dd></div>
+  </dl>
+  <div class="layout">
+    <section class="panel" aria-labelledby="scene-title">
+      <header class="panel-header">
+        <h2 id="scene-title">三维骨架</h2>
+        <div class="scene-tools">
+          <button id="zoom-out" aria-label="缩小">−</button>
+          <button id="zoom-in" aria-label="放大">+</button>
+          <button id="reset">重置视角</button>
+        </div>
+      </header>
+      <div class="stage">
+        <canvas id="scene" aria-label="双臂三维视图"></canvas>
+        <p class="empty" id="empty">正在等待第一帧</p>
+      </div>
+      <div class="legend">
+        <span class="arm arm0">ID 0</span><span class="arm arm1">ID 1</span>
+        <small>示意布局 · 拖动旋转 · 滚轮缩放</small>
+      </div>
+    </section>
+    <aside class="panel" aria-labelledby="joints-title">
+      <header class="panel-header"><h2 id="joints-title">关节反馈</h2><small>单位 °</small></header>
+      <div class="joint-groups" id="groups"></div>
+    </aside>
+  </div>
+  <p class="panel muted" id="diagnostics" role="status">等待控制器状态</p>
+</main>
+<script>
+"use strict";
+const el = id => document.getElementById(id);
+const canvas = el("scene");
+const ctx = canvas.getContext("2d");
+const colors = ["#66dbc9", "#ffbf79"];
+const axisColors = ["#ff807a", "#7de393", "#94b9fe"];
+const initialView = { yaw: -0.32, pitch: 0.50, zoom: 1 };
+const view = { ...initialView };
+let frame = null;
+let drag = null;
+let stale = true;
+const words = {
+  Manual: "手动", Auto: "自动", Enabled: "已使能", Disabled: "未使能",
+  Stopped: "已停止", Running: "运动中", Normal: "正常",
+  Cart: "笛卡尔", Axis: "关节", None: "未选模式",
+};
+const label = value => words[value] ?? value ?? "—";
+
+const jointPanels = colors.map((_, arm) => {
+  const section = document.createElement("section");
+  section.innerHTML = `<h3 class="arm arm${arm}">ID ${arm}</h3>
+    <table aria-label="ID ${arm} 的关节反馈">
+      <thead><tr><th>轴</th><th>实际</th><th>目标</th><th>目标 − 实际</th></tr></thead>
+      <tbody>${Array.from({ length: 6 }, (_, i) => `<tr><td>J${i+1}</td><td>—</td><td>—</td><td>—</td></tr>`).join("")}</tbody>
+    </table><p class="tcp">TCP [mm] · —</p>`;
+  el("groups").append(section);
+  return { rows: section.querySelectorAll("tbody tr"), tcp: section.querySelector(".tcp") };
+});
+
+function add(a, b) { return a.map((value, i) => value + b[i]); }
+
+function rotate(point, [u, v, w, s]) {
+  const [x, y, z] = point;
+  const tx = 2 * (v * z - w * y), ty = 2 * (w * x - u * z), tz = 2 * (u * y - v * x);
+  return [x + s * tx + v * tz - w * ty, y + s * ty + w * tx - u * tz, z + s * tz + u * ty - v * tx];
+}
+
+function draw() {
+  const { width, height } = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const pixelWidth = Math.round(width * dpr), pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  const size = Math.min(width / 4.35, height / 2.45) * view.zoom;
+  const cy = Math.cos(view.yaw), sy = Math.sin(view.yaw);
+  const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  function project([x, y, z]) {
+    const forward = x * sy + y * cy;
+    return [width / 2 + (x * cy - y * sy) * size,
+      height * 0.61 + (forward * sp - (z - 0.30) * cp) * size,
+      forward * cp + (z - 0.30) * sp];
+  }
+  function line(a, b, color, thickness) {
+    ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]);
+    ctx.strokeStyle = color; ctx.lineWidth = thickness; ctx.lineCap = "round"; ctx.stroke();
+  }
+  function dot(p, radius, color) {
+    ctx.beginPath(); ctx.arc(p[0], p[1], radius, 0, Math.PI * 2);
+    ctx.fillStyle = color; ctx.fill();
+  }
+  for (let i = -6; i <= 6; i++) {
+    const k = i * 0.35;
+    line(project([k, -2.1, 0]), project([k, 2.1, 0]), "#233347", 1);
+    line(project([-2.1, k, 0]), project([2.1, k, 0]), "#233347", 1);
+  }
+  if (!frame) return;
+  ctx.globalAlpha = stale ? 0.60 : 1;
+  const segments = [], joints = [], tcpAxes = [];
+  for (const arm of frame.arms) {
+    const color = colors[arm.id];
+    const base = project(add(arm.base_m, arm.offset_m));
+    const points = [base, ...arm.joints_m.map(point => project(add(point, arm.offset_m)))];
+    const tcpXYZ = add(arm.tcp_pq_m.slice(0, 3), arm.offset_m);
+    const tcp = project(tcpXYZ);
+    dot(base, 9, color);
+    points.push(tcp);
+    points.slice(1).forEach((p, i) => {
+      const previous = points[i];
+      segments.push({ previous, p, depth: p[2] + previous[2], color });
+      if (i < 6) joints.push({ p, color });
+    });
+    tcpAxes.push({ tcp, tips: axisColors.map((_, index) => {
+      const axis = [0, 0, 0];
+      axis[index] = 0.16;
+      return project(add(tcpXYZ, rotate(axis, arm.tcp_pq_m.slice(3))));
+    }) });
+    ctx.fillStyle = color;
+    ctx.font = "bold 12px system-ui";
+    ctx.fillText(`ID ${arm.id}`, base[0] + 13, base[1] + 19);
+  }
+  segments.sort((a, b) => b.depth - a.depth);
+  segments.forEach(({ previous, p, color }) => {
+    line(previous, p, "#0c141f", 13);
+    line(previous, p, color, 8);
+  });
+  for (const { p, color } of joints) {
+    dot(p, 7, "#0c141f");
+    dot(p, 4.5, color);
+  }
+  for (const { tcp, tips } of tcpAxes) {
+    dot(tcp, 4, "#edf3f9");
+    tips.forEach((tip, i) => {
+      line(tcp, tip, axisColors[i], 2);
+      ctx.fillStyle = axisColors[i];
+      ctx.font = "bold 10px system-ui";
+      ctx.fillText("XYZ"[i], tip[0] + 3, tip[1] - 3);
+    });
+  }
+  ctx.globalAlpha = 1;
+}
+
+function zoom(factor) {
+  view.zoom = Math.max(0.55, Math.min(2.6, view.zoom * factor));
+  draw();
+}
+el("zoom-out").onclick = () => zoom(1 / 1.15);
+el("zoom-in").onclick = () => zoom(1.15);
+el("reset").onclick = () => { Object.assign(view, initialView); draw(); };
+canvas.addEventListener("pointerdown", event => {
+  if (drag !== null) return;
+  drag = { x: event.clientX, y: event.clientY, id: event.pointerId };
+  canvas.setPointerCapture(event.pointerId);
+});
+canvas.addEventListener("pointermove", event => {
+  if (drag?.id !== event.pointerId) return;
+  view.yaw += (event.clientX - drag.x) * 0.01;
+  view.pitch = Math.max(-0.9, Math.min(1.35, view.pitch + (event.clientY - drag.y) * 0.01));
+  drag.x = event.clientX;
+  drag.y = event.clientY;
+  draw();
+});
+canvas.addEventListener("lostpointercapture", () => { drag = null; });
+canvas.addEventListener("wheel", event => {
+  event.preventDefault();
+  if (event.deltaY) zoom(event.deltaY < 0 ? 1.10 : 1 / 1.10);
+}, { passive: false });
+new ResizeObserver(draw).observe(canvas);
+
+function setText(id, text) {
+  if (el(id).textContent !== text) el(id).textContent = text;
+}
+
+function render(report) {
+  frame = report.frame;
+  stale = report.stale;
+  const playback = report.mode === "replay";
+  setText("source", `${playback ? "回放" : "实时"} · ${report.source}`);
+  el("health").classList.toggle("stale", stale);
+  setText("health", stale ? (frame ? "反馈已过期" : "等待反馈") : playback ? "离线回放" : "反馈在线");
+  setText("age", report.age_ms == null ? "—" : `${report.age_ms} ms`);
+  el("empty").hidden = !!frame;
+  setText("mode", label(frame?.mode));
+  setText("motor", label(frame?.motor));
+  setText("motion", label(frame?.motion));
+  setText("follower", frame?.follower_active == null ? "—" :
+    `${frame.follower_active ? "运行中" : "未运行"} · ${label(frame.follower_mode)}`);
+  for (const arm of frame?.arms ?? []) {
+    const panel = jointPanels[arm.id];
+    panel.rows.forEach((row, i) => {
+      [arm.actual_deg[i], arm.target_deg[i], arm.target_deg[i] - arm.actual_deg[i]]
+        .forEach((num, j) => { row.cells[j + 1].textContent = num.toFixed(2); });
+    });
+    panel.tcp.textContent = `TCP [mm] · ${arm.tcp_pq_m.slice(0, 3).map(x => (x * 1000).toFixed(1)).join(" / ")}`;
+  }
+  const codes = frame?.driver_codes?.filter(Boolean) ?? [];
+  const faultText = frame?.fault ? [
+    frame.fault_code ? `控制器错误 ${frame.fault_code}` : "控制器报告故障",
+    frame.fault_message,
+    codes.length ? `驱动错误 ${codes.join(", ")}` : "",
+  ].filter(Boolean).join(" · ") : null;
+  el("diagnostics").classList.toggle("warning", !!(report.error || faultText));
+  setText("diagnostics", [report.error, faultText].filter(Boolean).join(" · ") ||
+    (frame ? `控制器状态 · ${label(frame.controller_status)}` : "等待控制器状态"));
+  draw();
+}
+
+async function refresh() {
+  try {
+    const reply = await fetch("/state", { cache: "no-store", signal: AbortSignal.timeout(1500) });
+    if (!reply.ok) throw new Error(String(reply.status));
+    render(await reply.json());
+  } catch {
+    stale = true;
+    el("health").classList.add("stale");
+    setText("health", "网页服务断开");
+    setText("age", "—");
+    el("diagnostics").classList.add("warning");
+    setText("diagnostics", "与本机查看器服务的连接中断");
+    draw();
+  }
+  setTimeout(refresh, 100);
+}
+refresh();
+</script>
+</body>
+</html>

@@ -4,6 +4,7 @@ All pacing is here, not in the runner. Construction is hardware-free.
 """
 
 from contextlib import contextmanager
+import logging
 import math
 import threading
 import time
@@ -229,11 +230,12 @@ class A10DualOperator(BaseOperator):
         if not confirmed:
             raise RuntimeError('Follower stop unconfirmed after tail')
         self.attempted = False
-        self._confirm_tail_stopped(rows[-1])
+        arrived = self._confirm_tail_stopped(rows[-1])
+        # Require new robot and camera samples even when the stopped pose missed the target.
         self._arrival_confirmed_s = self.clock.monotonic()
         self._arrival_pending = False
-        self.trace.finish('arrival_confirmed', self.clock.monotonic())
-        self.log('chunk_complete', cycle=self.cycle, sent=len(packets), physical_arrival_confirmed=True)
+        self.trace.finish('arrival_confirmed' if arrived else 'post_stop_position_error', self._arrival_confirmed_s)
+        self.log('chunk_complete', cycle=self.cycle, sent=len(packets), physical_arrival_confirmed=arrived)
 
     def _wait_tail_arrival(self, target):
         from ..utils.a10_follower_tail import ArrivalMonitor
@@ -279,7 +281,7 @@ class A10DualOperator(BaseOperator):
             raise
 
     def _confirm_tail_stopped(self, target):
-        """Confirm stop and target from new feedback, without a second dwell."""
+        """Require a confirmed stop and report whether the stopped pose is in tolerance."""
         cfg = self.tail_config
         started = self.clock.monotonic()
         while self.clock.monotonic() - started < cfg['arrival_timeout_s']:
@@ -302,14 +304,21 @@ class A10DualOperator(BaseOperator):
             self.log('arrival_feedback', cycle=self.cycle, received_monotonic_s=stamp,
                      actual_joints_rad=actual, max_error_deg=error, max_speed_deg_s=None,
                      motion=feedback['motion'], phase='after_stop', follower_active=False)
-            if feedback['motion'] == 'Stopped' and error <= cfg['position_tolerance_deg']:
-                self.log('arrival_confirmed', cycle=self.cycle, elapsed_s=now-started,
-                         max_error_deg=error, physical_arrival_confirmed=True,
+            if feedback['motion'] == 'Stopped':
+                tolerance = cfg['position_tolerance_deg']
+                arrived = error <= tolerance
+                self.log('arrival_confirmed' if arrived else 'post_stop_position_error',
+                         cycle=self.cycle, elapsed_s=now-started, max_error_deg=error,
+                         position_tolerance_deg=tolerance, physical_arrival_confirmed=arrived,
                          follower_active=False, phase='after_stop',
                          after_last_packet_s=stamp-self._last_packet_send_s)
-                return
+                if not arrived:
+                    logging.getLogger(__name__).warning(
+                        'A10 推理第 %d 轮停稳后最大关节误差 %.3f°，超过 %.3f°，按实测位姿继续推理。',
+                        self.cycle + 1, error, tolerance)
+                return arrived
             self.clock.sleep(1 / cfg['poll_hz'])
-        raise TimeoutError('Post-stop target/Stopped state not confirmed; next observation blocked')
+        raise TimeoutError('Post-stop Stopped state not confirmed; next observation blocked')
 
 
 

@@ -327,19 +327,44 @@ class TailExecutionTests(unittest.TestCase):
         self.assertFalse(d.active)
         self.assertTrue(r.ros_operator._arrival_pending)
 
-    def test_post_stop_drift_blocks_new_observation_without_resending(self):
-        clock,d,r=self.setup_runner()
-        original=d.arrival_feedback
-        def drift():
-            feedback=original()
-            if not d.active:
-                feedback['joints']+=.01
-            return feedback
-        d.arrival_feedback=drift
-        with patch.object(b,'time',clock),self.assertRaisesRegex(TimeoutError,'Post-stop target'):
+    def test_post_stop_drift_warns_and_next_chunk_uses_measured_pose(self):
+        clock, d, r = self.setup_runner()
+        original_stop = d.stop
+
+        def stop_with_drift():
+            confirmed = original_stop()
+            d.joints[1][0] += .01
+            return confirmed
+
+        d.stop = stop_with_drift
+        with patch.object(b, 'time', clock), self.assertLogs(level='WARNING'):
             r.run()
-        self.assertEqual(len(d.packets),40)
-        self.assertEqual(len(d.observations),2)
+        self.assertEqual(len(d.packets), 80)
+        self.assertEqual(len(d.stops_at), 2)
+        self.assertEqual(len(d.observations), 4)
+        self.assertGreater(d.observations[2], d.stops_at[0])
+        self.assertAlmostEqual(d.packets[40][0], d.packets[39][0] + .01)
+        warnings = [c.kwargs for c in r.log.call_args_list if c.args[0] == 'post_stop_position_error']
+        self.assertEqual(len(warnings), 2)
+        self.assertGreater(warnings[0]['max_error_deg'], warnings[0]['position_tolerance_deg'])
+        for result in [c.kwargs for c in r.log.call_args_list if c.args[0] == 'chunk_complete']:
+            self.assertFalse(result['physical_arrival_confirmed'])
+        self.assertFalse(r.ros_operator._arrival_pending)
+
+    def test_post_stop_motion_still_blocks_next_observation(self):
+        clock, d, r = self.setup_runner()
+        original_feedback = d.arrival_feedback
+
+        def still_moving():
+            feedback = original_feedback()
+            feedback['motion'] = 'Running'
+            return feedback
+
+        d.arrival_feedback = still_moving
+        with patch.object(b, 'time', clock), self.assertRaisesRegex(TimeoutError, 'Stopped state not confirmed'):
+            r.run()
+        self.assertEqual(len(d.packets), 40)
+        self.assertEqual(len(d.observations), 2)
         self.assertTrue(r.ros_operator._arrival_pending)
 
     def test_post_stop_cached_sample_does_not_release_observation(self):

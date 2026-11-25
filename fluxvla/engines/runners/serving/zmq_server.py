@@ -350,6 +350,9 @@ def create_server(
             'uptime_s': time.time() - start_time,
             'total_requests': n,
             'avg_infer_time': avg,
+            'model': {key: model_metadata[key] for key in
+                      ('config_path', 'checkpoint_dir', 'checkpoint_path', 'dtype')
+                      if model_metadata and model_metadata.get(key) is not None},
         }
 
     server = PolicyServer(host=host, port=port)

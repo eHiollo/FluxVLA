@@ -1,0 +1,39 @@
+真实模型动作片段（离线导出）
+
+来源：2026-11-23 的双臂叠衣实际推理日志，cycle=1（从 0 开始计数）。
+模型：OpenPI π0.5，pi0.5-cloth-folding-04-1123/2.5k；完整身份与来源见 sample.json。
+
+主要文件：
+actions_executed.csv / .npy：当时实际执行的前 20 个点，[20,14]，30 Hz，名义时长 0.666667 秒。
+actions_full.csv / .npy：完整预测的 30 个点，[30,14]，30 Hz，名义时长 1 秒；后 10 点在该轮未执行。
+model_output_raw.npy：日志中的原始模型返回值，夹爪可能超出 0～1。
+wire_targets_60hz.csv / .npy：日志实际发出的 40 帧目标，每个策略点重复 2 次，60 Hz。
+joints_executed_deg.csv：执行片段的 12 轴角度版本（不含夹爪），列名使用明确的 ee_id。
+initial_state.npy：发送前实测初始状态，[14]；sample.json 中还有对应的角度值。
+sample.json：完整预测、字段顺序、模型身份、单位、周期、初始位置和原日志校验信息。
+source_cycle_events.jsonl：该轮原始日志事件，含实际计划/发送时刻、反馈、停止和到位记录。
+export_sample.py：离线重新导出脚本，不连接机器人。
+
+14 维顺序：
+[左 J1,J2,J3,J4,J5,J6,左夹爪,右 J1,J2,J3,J4,J5,J6,右夹爪]
+关节是绝对目标位置，单位 rad；不是增量、速度或力矩。
+此处“左/右”沿用训练数据定义：左对应控制器 ee_id=1，右对应 ee_id=0。
+这与 operator 配置的 left/right 别名不一致，底层接线请使用 ee_id 核对。
+夹爪为闭合比例，0 全开、1 全闭，不是毫米；原始命令换算 round(clip(x,0,1)*9000)。
+actions_* 已使用日志转换后的值，夹爪限制在 0～1，关节值与原模型输出相同。
+wire_targets_60hz 表示每帧目标，不是可直接发送的 UDP 二进制包，夹爪也不代表每帧实际写入。
+
+CSV 中 step 从 0 开始；time_s 是名义相对时间，不是实测时间，最后一帧还需保持一个周期。
+整块预测不代表全部实际执行；底层复现优先用 actions_executed 或 wire_targets_60hz。
+该轮历史日志确认最终到位。复现前需将初始姿态与 initial_state 核对，不能从任意姿态直接跳到第一点。
+
+读取示例（Python）：
+import numpy as np
+actions = np.load('actions_executed.npy')
+left_joints_rad = actions[:, :6]     # ee_id=1
+right_joints_rad = actions[:, 7:13]  # ee_id=0
+left_closure = actions[:, 6]
+right_closure = actions[:, 13]
+dt = 1 / 30
+
+本目录仅为数据样例，没有启动或控制机器人。

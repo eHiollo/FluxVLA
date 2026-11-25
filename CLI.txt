@@ -117,10 +117,10 @@ python scripts/inference.py --config configs/a10/a10_dual_inference.py --model o
 python scripts/inference.py --config configs/a10/a10_dual_inference.py \
   --cfg-options inference.mode=preview
 
-默认follower倍率12%、手动倍率100%，电机加速度目标±375°/s²。
+默认follower倍率12%、手动倍率100%，电机加速度目标±250°/s²。
 运动前回读加速度，匹配则跳过写入，不匹配由公共预检按控制器权限和状态处理。
 不自动使能或为自动预检停止/卸载其他运动；不满足写入条件时清晰报错。
-遥操作和m_init使用双臂基础配置的加速度目标±1000°/s²。
+双臂控制台的 m_init 临时使用 ±375°/s² 和 5% 手动倍率，停止后回读确认原加速度已恢复。需要切换加速度时，控制器须为厂家权限、手动、已使能、已停止、follower 未运行、程序已卸载。遥操作配置的加速度目标为 ±1000°/s²。
 每块保留20个30Hz策略点，每点重复两遍，以60Hz发送40包；不做客户端规划或均值补偿。
 发完后保持follower运行，实际12轴误差≤0.5°即停止，无固定稳定等待；
 停止及停止后新反馈核验通过后，才取得新观测。到位超时默认30秒。
@@ -190,3 +190,18 @@ work_dirs/a10/motor_acc_commands/<时间戳>/。
 结束保持未使能、Unloaded，不自动加载程序或使能；此电机限制也影响其他运动方式。
 Python调用：from fluxvla.engines.operators.kaanh_commands.set_acc import set_acceleration
 控制台角色operator在新命令上下文调用 set_acceleration(robot, 400, motor_id=None)。
+
+
+====模型推理测试====
+cd /home/robot/VLA/openpi
+
+env -u LD_LIBRARY_PATH \
+  XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 \
+  XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  JAX_PLATFORMS=cuda \
+  HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  .venv-thor/bin/python scripts/serve_policy.py \
+  --port=8001 \
+  policy:checkpoint \
+  --policy.config=pi05_cloth_folding_04 \
+  --policy.dir=/home/robot/VLA/FluxVLA/checkpoints/pi0.5-cloth-folding-04-1123/.openpi-cli/100k

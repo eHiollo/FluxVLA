@@ -40,7 +40,7 @@ def parse_args():
         required=True,
         help='Path to the configuration file.',
     )
-    parser.add_argument("--model", choices=["fluxvla", "openpi"], default=None,
+    parser.add_argument("--model", choices=["fluxvla", "openpi", "longwam"], default=None,
                         help="Select the model backend in the common dual A10 config")
     parser.add_argument(
         '--ckpt-path',

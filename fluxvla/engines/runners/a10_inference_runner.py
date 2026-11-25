@@ -478,8 +478,12 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         if (isinstance(action_dt, bool) or not isinstance(action_dt, (int, float))
                 or not math.isfinite(action_dt) or action_dt <= 0):
             raise ValueError('action_dt must be positive and finite')
-        if action_chunk != 30 or state_dim != 14:
-            raise ValueError('Dual A10 policy requires action_chunk=30 and state_dim=14')
+        longwam = remote_inference.get('protocol') == 'longwam_http'
+        expected_chunk = 32 if longwam else 30
+        if action_chunk not in (30, expected_chunk) or state_dim != 14:
+            raise ValueError(f'Dual A10 policy requires action_chunk={expected_chunk} and state_dim=14')
+        if longwam and not math.isclose(action_dt, 1 / 30):
+            raise ValueError('LongWAM requires action_dt=1/30')
         if async_execution is not False:
             raise ValueError('Dual A10 framework baseline requires async_execution=False')
         if publish_rate is not None and (isinstance(publish_rate, bool)
@@ -508,6 +512,8 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             trace_inference_feedback=trace_inference_feedback,
             follower_tail=follower_tail,
         )
+        if longwam:
+            self.settings['longwam_history'] = True
         self._policy = None
         self._external_runtime = False
         self._cycle = 0
@@ -517,7 +523,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             cfg=cfg, remote_inference=self.remote,
             operator=dict(type='A10DualOperator', config=self.config,
                           settings=self.settings, mode=mode),
-            state_dim=14, action_chunk=30, publish_rate=1 / action_dt,
+            state_dim=14, action_chunk=expected_chunk, publish_rate=1 / action_dt,
             camera_names=['base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb'],
             task_suite_name=task_suite_name, task_descriptions=task_descriptions,
             task_pose_sequences=task_pose_sequences, enable_mixed_precision=False)
@@ -537,6 +543,8 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             if key == 'trace_inference_feedback':
                 if type(value) is not bool:
                     raise ValueError('trace_inference_feedback must be bool')
+                continue
+            if key == 'longwam_history':
                 continue
             if key == "prompt":
                 continue
@@ -558,8 +566,10 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             or timeout <= 0
         ):
             raise ValueError("remote timeout_s must be positive and finite")
-        if self.remote.get("protocol") not in ("openpi_ws", "fluxvla_zmq"):
-            raise ValueError("remote protocol must be openpi_ws or fluxvla_zmq")
+        if self.remote.get("protocol") not in ("openpi_ws", "fluxvla_zmq", "longwam_http"):
+            raise ValueError("remote protocol must be openpi_ws, fluxvla_zmq or longwam_http")
+        if self.remote.get('protocol') == 'longwam_http' and self.mode == 'simulate':
+            raise ValueError('LongWAM requires real camera history; use read_only or preview')
         if type(self.remote.get("server_port")) is not int or not 1 <= self.remote["server_port"] <= 65535:
             raise ValueError("Invalid server port")
         for side, device in self.config.get("grippers", {}).items():
@@ -611,14 +621,30 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         instruction = inputs.get('task_description')
         if instruction is not None:
             wire['prompt'] = instruction
+        if self.remote['protocol'] == 'longwam_http':
+            history = inputs['image_history']
+            wire['image_history'] = {alias: [frame['image'] for frame in history[name]]
+                                     for name, alias in control.CAMERAS.items()}
+            self.log('history_window', cycle=self._cycle,
+                     camera_times={name: [frame['received_monotonic_s'] for frame in frames]
+                                   for name, frames in history.items()},
+                     sequences={name: [frame['sequence'] for frame in frames]
+                                for name, frames in history.items()})
         with self.ros_operator.inference_feedback():
             started = self._clock.monotonic()
             self.log('inference_start', cycle=self._cycle, started_s=started,
                      observation_received_s=inputs['robot_time'])
             response = self._policy.infer(wire)
             finished = self._clock.monotonic()
+            timing = {}
+            if self.remote['protocol'] == 'openpi_ws':
+                timing['response_received_s'] = getattr(self._policy, 'response_received_s', None)
+                timing['server_timing'] = response.get('server_timing')
+                if (self.remote.get('server_host') in ('localhost', '127.0.0.1', '::1')
+                        and isinstance(timing['server_timing'], dict)):
+                    timing['server_response_pack_started_s'] = timing['server_timing'].get('response_pack_started_s')
             self.log('inference_end', cycle=self._cycle, finished_s=finished,
-                     request_s=finished - started)
+                     request_s=finished - started, **timing)
         ready = self._clock.monotonic()
         self.log('inference_feedback_end', cycle=self._cycle, ready_s=ready,
                  sampler_shutdown_s=ready - finished)
@@ -628,7 +654,13 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         return response
 
     def _postprocess_actions(self, raw_action):
-        actions, clipped = self.ros_operator.bridge.actions_from_response(raw_action)
+        if self.remote['protocol'] == 'longwam_http':
+            actions, clipped = self.ros_operator.bridge.actions_from_response(raw_action, action_count=32)
+            self.log('longwam_response', cycle=self._cycle,
+                     **{key: raw_action[key] for key in ('obs_id', 'checkpoint', 'step_hz',
+                                                        'first_step_offset', 'server_ms', 'inference_ms')})
+        else:
+            actions, clipped = self.ros_operator.bridge.actions_from_response(raw_action)
         self.log('prediction', cycle=self._cycle,
                  request_s=self._action_ctx.inference_finished - self._action_ctx.inference_start,
                  raw_actions=raw_action['actions'], converted_actions=actions,
@@ -699,9 +731,18 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                     if client_root and not Path(client_root).is_absolute():
                         client_root = str(control.ROOT / client_root)
                     self._policy = control.RemotePolicy(*args, client_root=client_root)
+                elif remote['protocol'] == 'longwam_http':
+                    from fluxvla.projects.a10.longwam import LongWamPolicy
+                    self._policy = LongWamPolicy(*args, jpeg_quality=remote.get('jpeg_quality', 90))
                 else:
                     self._policy = control.ZmqPolicy(*args, prompt=self.settings['prompt'])
-                self.log('connected', metadata=self._policy.metadata, mode=self.mode)
+                server_metadata = self._policy.metadata
+                model = server_metadata.get('model') if isinstance(server_metadata, dict) else None
+                model = control.plain(model) if isinstance(model, dict) and model else None
+                identity = dict(backend=remote['protocol'], server=self._server_address,
+                                source='server' if model else 'unavailable', model=model)
+                (directory / 'model.json').write_text(json.dumps(identity, indent=2) + '\n')
+                self.log('connected', metadata=server_metadata, mode=self.mode, model_identity=identity)
                 self.ros_operator.connect()
             instruction = self.settings['prompt'] if initial_instruction is None else initial_instruction
             while self._cycle < self.cycles:

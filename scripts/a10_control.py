@@ -570,7 +570,11 @@ def main(argv=None, *, operator_factory=None, input_fn=input, output=print):
             operator_factory = A10Operator
         from mmengine import Config
         config_path = args.config or Path(__file__).resolve().parents[1] / 'configs/a10/a10_single_operator.py'
-        settings = dict(Config.fromfile(str(config_path))['operator'])
+        config = Config.fromfile(str(config_path))
+        settings = dict(config['operator'])
+        console_init_motion = config.get('console_init_motion')
+        if console_init_motion:
+            settings['init_motion'] = {**(settings.get('init_motion') or {}), **console_init_motion}
         if settings.pop('type', 'A10Operator') != 'A10Operator':
             raise CommandError('控制台配置必须使用 A10Operator')
         overrides = dict(host=args.host, ws_port=args.ws_port, udp_port=args.udp_port,

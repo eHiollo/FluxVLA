@@ -119,11 +119,11 @@ class SharedFollowerConnection:
             self.close()
             raise
 
-    def call(self, op, *, timeout_s=None, **data):
+    def call(self, op, *, timeout_s=None, allow_cancelled=False, **data):
         with self._lock:
-            if (self.command_cancelled is not None and self.command_cancelled.is_set()
+            if (not allow_cancelled and self.command_cancelled is not None and self.command_cancelled.is_set()
                     and op in ('command', 'request')
-                    and data.get('command', '').split(maxsplit=1)[0] not in ('get', 'stop_follower', 'manual_stop')):
+                    and data.get('command', '').split(maxsplit=1)[0] not in ('get', 'read_motor', 'stop_follower', 'manual_stop')):
                 raise InterruptedError('当前命令已取消，未发送共享控制命令')
             if self._sock is None:
                 raise ConnectionError('Shared A10 connection is closed')
@@ -170,8 +170,9 @@ class SharedFollowerConnection:
             except OSError:
                 pass
 
-    def request(self, command, *, status=False, timeout_s=None, raw=False):
-        return self.call('request', command=command, status=status, raw=raw, timeout_s=timeout_s)
+    def request(self, command, *, status=False, timeout_s=None, raw=False, allow_cancelled=False):
+        return self.call('request', command=command, status=status, raw=raw, timeout_s=timeout_s,
+                         allow_cancelled=allow_cancelled)
 
     def send_command(self, command):
         self.call('command', command=command)

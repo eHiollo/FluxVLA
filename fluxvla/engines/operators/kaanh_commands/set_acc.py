@@ -60,6 +60,19 @@ def _verify(actual, expected):
                 raise RuntimeError(f'电机 {index} 回读字段 {key} 与预期不符')
 
 
+def _write_verified_motor_row(robot, index, desired, expected, send):
+    _context(robot.get_state(), writable=True)
+    _verify(robot.read_motor_config(), expected)
+    command = f'write_motor --id={index} --data=' + json.dumps(
+        desired[index], ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    send(command)
+    expected[index] = copy.deepcopy(desired[index])
+    _context(robot.get_state(), writable=True)
+    actual = robot.read_motor_config()
+    _verify(actual, expected)
+    return actual
+
+
 def set_acceleration(robot, acceleration, *, motor_id=None, output=print, backup_root=None):
     """Set symmetric acceleration bounds; no enable, reload, retry or rollback.
 
@@ -139,14 +152,7 @@ def set_acceleration(robot, acceleration, *, motor_id=None, output=print, backup
             robot.disable()
         save('state_writable.json', read(writable=True).raw)
         for i in ids:
-            read(writable=True)
-            _verify(robot.read_motor_config(), expected)
-            command = f'write_motor --id={i} --data=' + json.dumps(
-                desired[i], ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-            native(command)
-            expected[i] = copy.deepcopy(desired[i])
-            read(writable=True)
-            actual = robot.read_motor_config();_verify(actual, expected)
+            actual = _write_verified_motor_row(robot, i, desired, expected, native)
             completed.append(i);save('after_partial.json', actual)
             output(f'电机 {i}（slave_id={actual[i]["slave_id"]}）：max_acc={acceleration:g}、min_acc={-acceleration:g} °/s²，回读一致')
         actual = robot.read_motor_config();_verify(actual, desired)

@@ -892,12 +892,14 @@ class ConfiguredInferenceTests(unittest.TestCase):
         data = io.BytesIO()
         np.save(data, np.tile(obs["observation/state"], (1, 30, 1)), allow_pickle=False)
         socket = Mock()
-        socket.recv.side_effect = [msgpack.packb({"action_data": data.getvalue()}), zmq.Again()]
+        socket.recv.side_effect = [msgpack.packb({"status": "ready"}),
+                                   msgpack.packb({"action_data": data.getvalue()}), zmq.Again()]
         context = Mock()
         context.socket.return_value = socket
         with patch("zmq.Context", return_value=context):
             policy = b.ZmqPolicy("127.0.0.1", 5556, 0.2)
             try:
+                self.assertNotIn("model", policy.metadata)
                 result = policy.infer(obs)
                 np.testing.assert_allclose(result["actions"][0], obs["observation/state"])
                 _, encoded, _ = decode_predict_request(socket.send.call_args.args[0])

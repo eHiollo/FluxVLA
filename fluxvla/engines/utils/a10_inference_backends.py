@@ -1,4 +1,4 @@
-"""Model-only selection for the common dual A10 control loop."""
+"""Backend selection for dual A10 control; LongWAM starts read-only."""
 
 from copy import deepcopy
 from pathlib import Path
@@ -10,8 +10,12 @@ def backend_settings(name, checkpoint_dir):
         return dict(remote_inference=dict(
             protocol='openpi_ws', server_host='127.0.0.1', server_port=8001,
             client_root='../openpi/packages/openpi-client/src'), prompt=None)
+    if name == 'longwam':
+        return dict(remote_inference=dict(
+            protocol='longwam_http', server_host='127.0.0.1', server_port=8765),
+            prompt='Fold the clothes.')
     if name != 'fluxvla':
-        raise ValueError('model_backend must be fluxvla or openpi')
+        raise ValueError('model_backend must be fluxvla, openpi or longwam')
     root = Path(checkpoint_dir)
     stats = str(root / 'dataset_statistics.json')
     return dict(
@@ -30,7 +34,8 @@ def backend_settings(name, checkpoint_dir):
 def select_a10_backend(cfg, backend=None, overrides=None):
     """Resolve a CLI backend override after mmengine's general config overrides.
 
-    Control settings and explicit endpoint/timeout overrides remain intact.
+    LongWAM starts read-only unless the CLI explicitly overrides its mode.
+    Other control settings and explicit endpoint/timeout overrides remain intact.
     Replacing the transport also replaces its default port and wire-specific
     client settings; the model checkpoint belongs exclusively to the server.
     """
@@ -50,6 +55,8 @@ def select_a10_backend(cfg, backend=None, overrides=None):
         for key in ('dataset', 'denormalize_action', 'task_suite_name'):
             cfg.inference.pop(key, None)
         cfg.inference.prompt = settings['prompt']
+        if selected == 'longwam':
+            cfg.inference.mode = 'read_only'
         for key, value in settings.items():
             if key not in ('remote_inference', 'prompt'):
                 cfg.inference[key] = deepcopy(value)
@@ -62,7 +69,7 @@ def select_a10_backend(cfg, backend=None, overrides=None):
                 for key in keys:
                     if cfg.inference[section].get(key) == previous[section][key]:
                         cfg.inference[section][key] = settings[section][key]
-    if selected == 'openpi':
+    if selected != 'fluxvla':
         cfg.pop('inference_model', None)
         for key in ('dataset', 'denormalize_action', 'task_suite_name'):
             cfg.inference.pop(key, None)
@@ -76,6 +83,7 @@ def select_a10_backend(cfg, backend=None, overrides=None):
     model_options = {key: value for key, value in (overrides or {}).items()
                      if key.startswith('inference.remote_inference.')
                      or key == 'inference.prompt'
+                     or key == 'inference.mode'
                      or (selected == 'fluxvla' and key.startswith(
                          ('inference.dataset.', 'inference.denormalize_action.', 'inference_model.')))}
     if model_options:

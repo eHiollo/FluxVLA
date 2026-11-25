@@ -8,6 +8,8 @@ No recording or VR calibration. m_init supports the full joint follower group;
 m_init explicitly opens both configured ZX grippers while returning the arms.
 """
 
+console_init_motion = dict(motor_acceleration_deg_s2=375.)
+
 operator = dict(
     init_grippers_config='{{fileDirname}}/a10_dual_devices.py',
     type='A10Operator', host='192.168.0.150',
@@ -17,7 +19,7 @@ operator = dict(
     shared_control=dict(mode='managed', host='127.0.0.1', port=5870, role='teleop'),
     joint_follower_velocity_percent=100,  # follower_aj parameter; not set_jog_vel.
     joint_follower_filter=False,  # Updated SDK requires JSON motor_pos packets.
-    motor_acceleration_deg_s2=1000.,  # Console/m_init/teleoperation motor limits.
+    motor_acceleration_deg_s2=1000.,  # Default for follower/teleoperation.
     allow_motion=False, command_mode='cartesian', cartesian_wire_format='pe321',
     feedback_joint_unit='deg', feedback_position_unit='mm',
     # Keep the existing VR aliases and GET mappings; physical hand binding is defined by VR.

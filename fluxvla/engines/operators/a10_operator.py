@@ -436,10 +436,10 @@ class _FollowerConnection:
             self.close()
             raise
 
-    def send_command(self, command):
-        if (self.command_cancelled is not None and self.command_cancelled.is_set()
+    def send_command(self, command, *, allow_cancelled=False):
+        if (not allow_cancelled and self.command_cancelled is not None and self.command_cancelled.is_set()
                 and command.split(maxsplit=1)[0] not in (
-                    'get', 'stop_follower', 'manual_stop', 'set_jog_vel', 'set_pgm_vel')):
+                    'get', 'read_motor', 'stop_follower', 'manual_stop', 'set_jog_vel', 'set_pgm_vel')):
             raise InterruptedError('当前命令已取消，未发送控制器命令')
         if self.ws is None:
             raise ConnectionError('A10 operator is not connected')
@@ -452,12 +452,15 @@ class _FollowerConnection:
             self.close()
             raise
 
-    def request(self, command, *, status=False, timeout_s=None, raw=False):
+    def request(self, command, *, status=False, timeout_s=None, raw=False, allow_cancelled=False):
         budget = self.timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + budget
         self._request_pending.set()
         try:
-            self.send_command(command)
+            if allow_cancelled:
+                self.send_command(command, allow_cancelled=True)
+            else:
+                self.send_command(command)
             for _ in range(32):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1370,12 +1373,17 @@ class A10Operator(BaseOperator):
         """Request manual_ds in Manual mode; this is not an emergency stop."""
         return self._set_manual_enable(False)
 
-    def _set_manual_enable(self, enabled):
+    def _set_manual_enable(self, enabled, *, init_switch=False, init_cleanup=False):
+        if init_cleanup and enabled:
+            raise ValueError('m_init cleanup may only request disable')
         with self._io_lock:
-            self._require_motion()
+            self._require_motion(allow_cancelled=init_cleanup)
             self._prepare_shared_console_command()
             state = self.get_state()
             info = state.raw['ret_context'].get('robot_msg', {})
+            if init_switch:
+                from .kaanh_commands.m_init_acceleration import _idle_activation
+                _idle_activation(state)
             if info.get('op_mode') != 'Manual':
                 raise RuntimeError('Manual enable/disable requires Manual mode; no automatic mode switch')
             if enabled:
@@ -1384,7 +1392,10 @@ class A10Operator(BaseOperator):
                 if info.get('motion') != 'Stopped' or state.follower_active is not False:
                     raise RuntimeError('Enable requires Stopped feedback and inactive follower')
             self._confirmed_active = False
-            self._connection.request('manual_en' if enabled else 'manual_ds')
+            if init_cleanup:
+                self._connection.request('manual_ds', allow_cancelled=True)
+            else:
+                self._connection.request('manual_en' if enabled else 'manual_ds')
             expected = 'Enabled' if enabled else 'Disabled'
             deadline = time.monotonic() + self.timeout_s
             while time.monotonic() < deadline:
@@ -1485,9 +1496,11 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             return self._connection.lease('acknowledge')
 
-    def begin_shared_console_operation(self):
+    def begin_shared_console_operation(self, *, require_idle=False):
         if self.shared_control and self.shared_control.get('role') == 'console':
-            self._connection.lease('begin_console')
+            result = self._connection.lease('begin_idle_console' if require_idle else 'begin_console')
+            if require_idle and result.get('idle_console_reserved') is not True:
+                raise RuntimeError('共享控制服务未加载 m_init 加速度切换支持，请更新并重新启动共享服务')
 
     def end_shared_console_operation(self):
         if self.shared_control and self.shared_control.get('role') == 'console' and self.is_connected:
@@ -1524,7 +1537,7 @@ class A10Operator(BaseOperator):
                 time.sleep(min(.02, max(0., deadline - time.monotonic())))
             raise TimeoutError(f'{coordinate} jog coordinate was not confirmed')
 
-    def start_follower(self, mode=None):
+    def start_follower(self, mode=None, *, motor_acceleration_deg_s2=None):
         """Start cartesian (default) or joint follower; never send an initial target."""
         mode = self.command_mode if mode is None else mode
         if mode not in _FOLLOWER_MODES:
@@ -1541,7 +1554,7 @@ class A10Operator(BaseOperator):
                     self.command_mode = mode
                     return state  # Already in this session's confirmed mode; no duplicate start.
                 raise RuntimeError('This session has a pending follower; stop_follower before switching modes')
-            self.ensure_motor_acceleration()
+            self.ensure_motor_acceleration(motor_acceleration_deg_s2)
             if self.shared_control:
                 self._connection.lease('acquire')
             self.last_stop_confirmed = False
@@ -2216,21 +2229,23 @@ class A10Operator(BaseOperator):
         finally:
             self._trajectory_lock.release()
 
-    def _prepare_init_motion(self):
+    def _prepare_init_motion(self, *, original_state=None):
         with self._io_lock:
             self._require_motion()
-            self.ensure_motor_acceleration()
+            self.ensure_motor_acceleration(self.init_motion.get('motor_acceleration_deg_s2'))
             state = self.get_state()
             if state.follower_active not in (True, False):
                 raise RuntimeError('Initialization requires known follower state')
-            snapshot = dict(follower_active=state.follower_active,
-                            follower_mode=state.follower_mode,
-                            jog_coordinate=state.raw['ret_context']['motion_msg'].get('jog_coordinate'))
-            if state.follower_active and state.follower_mode not in ('Axis', 'Cart'):
+            original = state if original_state is None else original_state
+            snapshot = dict(follower_active=original.follower_active,
+                            follower_mode=original.follower_mode,
+                            jog_coordinate=original.raw['ret_context']['motion_msg'].get('jog_coordinate'))
+            if original.follower_active and original.follower_mode not in ('Axis', 'Cart'):
                 raise RuntimeError('Cannot restore an unknown follower mode')
             # Reserve only after capturing the original mode/activation, so
             # console m_init retains its existing restoration semantics.
-            if self.shared_control and self.shared_control.get('role') == 'console':
+            if (not self._init_shared_reserved and self.shared_control
+                    and self.shared_control.get('role') == 'console'):
                 self.begin_shared_console_operation()
                 self._init_shared_reserved = True
             self._prepare_shared_console_command()
@@ -2264,7 +2279,8 @@ class A10Operator(BaseOperator):
                 # Select the original plan without sending a UDP target, then
                 # stop it again if the follower was originally inactive.
                 self._traj_stop_event.clear()
-                self.start_follower('joint' if mode == 'Axis' else 'cartesian')
+                self.start_follower('joint' if mode == 'Axis' else 'cartesian',
+                                    motor_acceleration_deg_s2=self.init_motion.get('motor_acceleration_deg_s2'))
                 if not snapshot['follower_active']:
                     self.stop_follower()
             self._require_motion()

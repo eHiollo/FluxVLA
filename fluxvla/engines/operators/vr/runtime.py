@@ -1430,17 +1430,25 @@ class DualVRTeleopRuntime(VRTeleopRuntime):
         return result
 
     def _open_grippers_for_init(self, *, cancel_event=None):
-        """Trigger both opens on existing workers, without waiting for arrival."""
+        """Trigger opens on healthy workers, without waiting for arrival."""
         if set(self._zx_channels) != {'left', 'right'}:
             raise RuntimeError('m_init requires both live ZX gripper channels')
+        ready = []
         for channel in self._zx_channels.values():
-            if not channel.check_health() or not channel.snapshot().get('enabled'):
+            healthy = channel.check_health()
+            state = channel.snapshot()
+            if state.get('alarm_latched'):
+                logging.getLogger(__name__).warning('m_init 跳过 %s 夹爪的打开动作：%s',
+                                                    channel.side, state['error'])
+                continue
+            if not healthy or not state.get('enabled'):
                 raise RuntimeError(f'ZX {channel.side} is not enabled/ready; m_init will not enable it')
-        for channel in self._zx_channels.values():
+            ready.append(channel)
+        for channel in ready:
             # Normal completion stops the arm follower; it must not cancel an
             # already queued open before the USB worker has sent it.
             channel.request_init_open(cancel_event=cancel_event)
-        return True
+        return len(ready) == len(self._zx_channels)
 
     def _gripper_faults(self):
         faults = {}

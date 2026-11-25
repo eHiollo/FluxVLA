@@ -228,6 +228,10 @@ class CameraOperator:
         self.close()
 
 
+class CameraHistoryNotReady(RuntimeError):
+    pass
+
+
 class BufferedCameraOperator:
     """Bounded RGB histories with HOST receive times (not exposure timestamps).
 
@@ -281,6 +285,40 @@ class BufferedCameraOperator:
                 raise RuntimeError('Waiting for all three camera streams')
             return {name: dict(min(frames, key=lambda f: abs(f['received_monotonic_s']-reference_time)))
                     for name, frames in self.histories.items()}
+
+    def snapshot_window(self, reference_time, anchor='base_0_rgb', tolerance_s=.04):
+        with self._lock:
+            if self.errors:
+                raise RuntimeError(f'Camera errors: {self.errors}')
+            histories = {name: list(frames) for name, frames in self.histories.items()}
+        if any(len(frames) < 49 for frames in histories.values()):
+            raise CameraHistoryNotReady('Waiting for 49 original frames on all cameras')
+        latest = min(histories[anchor], key=lambda frame: abs(frame['received_monotonic_s'] - reference_time))
+        by_sequence = {frame['sequence']: frame for frame in histories[anchor]}
+        sequences = range(latest['sequence'] - 48, latest['sequence'] + 1, 4)
+        if any(sequence not in by_sequence for sequence in sequences):
+            raise CameraHistoryNotReady('Incomplete LongWAM history')
+        anchors = [by_sequence[sequence] for sequence in sequences]
+        end_time = latest['received_monotonic_s']
+        result = {}
+        for name, frames in histories.items():
+            selected = [min(frames, key=lambda frame: abs(
+                frame['received_monotonic_s'] - source['received_monotonic_s'])) for source in anchors]
+            if any(next_frame['sequence'] <= frame['sequence']
+                   for frame, next_frame in zip(selected, selected[1:])):
+                raise RuntimeError(f'{name}: duplicate/out-of-order LongWAM frames')
+            for index, frame in enumerate(selected):
+                expected = end_time + (index - 12) * 4 / 30
+                if abs(frame['received_monotonic_s'] - expected) > tolerance_s:
+                    raise RuntimeError(f'{name}: LongWAM history cadence/synchronization gap')
+            if abs(selected[-1]['received_monotonic_s'] - reference_time) > tolerance_s:
+                raise RuntimeError(f'{name}: LongWAM latest image is not aligned with state')
+            result[name] = selected
+        for index in range(13):
+            stamps = [frames[index]['received_monotonic_s'] for frames in result.values()]
+            if max(stamps) - min(stamps) > tolerance_s:
+                raise RuntimeError('LongWAM camera group synchronization gap')
+        return result
 
     def close(self):
         self._stop.set()

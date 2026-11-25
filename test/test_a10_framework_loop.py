@@ -109,7 +109,7 @@ class FrameworkParityTests(unittest.TestCase):
 
     def test_production_simulate_writes_complete_async_log_without_hardware(self):
         policy = Policy()
-        policy.metadata = {'test': True}
+        policy.metadata = {'model': {'config': 'pi05', 'checkpoint_name': '100k'}}
         with tempfile.TemporaryDirectory() as root, \
                 patch('fluxvla.projects.a10.inference.RemotePolicy', return_value=policy), \
                 patch('fluxvla.projects.a10.inference.LiveDevices') as hardware:
@@ -120,6 +120,10 @@ class FrameworkParityTests(unittest.TestCase):
             hardware.assert_not_called()
             directory = next(Path(root).iterdir())
             events = [json.loads(s) for s in (directory / 'events.jsonl').read_text().splitlines()]
+            identity = json.loads((directory / 'model.json').read_text())
+            self.assertEqual(identity, dict(backend='openpi_ws', server='openpi_ws://127.0.0.1:8001',
+                                            source='server', model=policy.metadata['model']))
+            self.assertEqual(next(e for e in events if e['event'] == 'connected')['model_identity'], identity)
             counts = {kind: sum(e['event'] == kind for e in events)
                       for kind in ('sent', 'complete', 'tail_execution', 'chunk_boundary')}
             self.assertEqual(counts, dict(sent=4, complete=1, tail_execution=2, chunk_boundary=1))
@@ -306,7 +310,8 @@ class InferenceSamplingTests(unittest.TestCase):
 class TransportLoopbackTests(unittest.TestCase):
     def test_native_zmq_preserves_observation_and_absolute_action_contract(self):
         import zmq
-        from fluxvla.engines.runners.serving.serializers import decode_predict_request, encode_predict_response
+        from fluxvla.engines.runners.serving.serializers import (
+            MsgSerializer, decode_predict_request, encode_predict_response)
 
         ctx = zmq.Context()
         sock = ctx.socket(zmq.REP)
@@ -314,8 +319,11 @@ class TransportLoopbackTests(unittest.TestCase):
         sock.setsockopt(zmq.LINGER, 0)
         port = sock.bind_to_random_port('tcp://127.0.0.1')
         received, errors = [], []
+        model = {'checkpoint_dir': '/tmp/fluxvla-checkpoint'}
         def serve():
             try:
+                self.assertEqual(MsgSerializer.from_bytes(sock.recv())['endpoint'], 'get_status')
+                sock.send(MsgSerializer.to_bytes({'status': 'ready', 'model': model}))
                 for _ in range(2):
                     fmt, obs, _ = decode_predict_request(sock.recv())
                     received.append(obs)
@@ -337,6 +345,7 @@ class TransportLoopbackTests(unittest.TestCase):
             worker.join(4)
             ctx.term()
         self.assertFalse(errors)
+        self.assertEqual(policy.metadata['model'], model)
         self.assertEqual(len(received), 2)
         self.assertEqual(received[0]['task_description'], 'native instruction')
         np.testing.assert_allclose(received[0]['qpos'], [.1] * 6 + [.25] + [-.2] * 6 + [.75])

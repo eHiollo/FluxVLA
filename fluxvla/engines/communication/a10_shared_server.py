@@ -487,13 +487,17 @@ class SharedControl:
                 self.note('controller_speed_override', session_id=session_id, confirmed=result)
                 return result
             if op == 'lease':
-                if request['operation'] == 'begin_console':
+                if request['operation'] in ('begin_console', 'begin_idle_console'):
                     if role != 'console' or self.console_operation not in (None, session_id):
                         raise PermissionError('Another console command is still running')
+                    if request['operation'] == 'begin_idle_console' and self.owner is not None:
+                        raise PermissionError('电机加速度切换要求共享 follower 无控制者')
                     if self.owner != session_id:
                         self.stop_owner('console_command_begin')
                     self.console_operation = session_id
                     self.console_operation_depth += 1
+                    if request['operation'] == 'begin_idle_console':
+                        return dict(self.lease_status(session_id), idle_console_reserved=True)
                 elif request['operation'] == 'end_console':
                     if self.console_operation == session_id:
                         self.console_operation_depth -= 1
@@ -519,6 +523,8 @@ class SharedControl:
                 elif request['operation'] == 'prepare_command':
                     if role != 'console':
                         raise PermissionError('Only the console may preempt for a control command')
+                    if self.console_operation not in (None, session_id):
+                        raise PermissionError('Another console command is still running')
                     self.stop_owner('console_command_preflight')
                     # A newly requested console command may set its temporary speed
                     # after the old follower was stopped; target ownership stays empty.
@@ -555,6 +561,8 @@ class SharedControl:
                 return self.control.request(command)
             if role != 'console':
                 raise PermissionError('Arbitrary controller commands require the console role')
+            if self.console_operation not in (None, session_id):
+                raise PermissionError('Another console command is still running')
             self._speed_restore_allowed.clear()
             if self.owner is not None:
                 self.stop_owner('console_command:' + name)

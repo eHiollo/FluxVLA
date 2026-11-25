@@ -1,7 +1,7 @@
 """Common dual A10 inference control; select only the remote model backend.
 
-Default: FluxVLA cloth-folding 50k. Switch with --model openpi or
-A10_MODEL_BACKEND=openpi, without changing any robot control parameters.
+Default: FluxVLA cloth-folding 50k. Select openpi or longwam with --model or
+A10_MODEL_BACKEND. LongWAM starts read-only; robot motion limits stay shared.
 """
 import os
 from pathlib import Path
@@ -24,17 +24,17 @@ _base_ = ["./a10_dual_arm_operator.py", "./a10_dual_devices.py"]
 # Robot-side follower upper limits come from the shared operator config.
 # Speed uses operator.joint_follower_velocity_percent; acceleration uses motor XML.
 
-# With motor acceleration 375 deg/s^2 and manual speed 100%:
-# follower 12% => 129.9 deg/s^2 and 18 / 21.6 deg/s.
+# With motor acceleration 250 deg/s^2 and manual speed 100%:
+# follower 12% => 86.6 deg/s^2 and 18 / 21.6 deg/s.
 operator = dict(joint_follower_filter=False, joint_follower_velocity_percent=12,
-                motor_acceleration_deg_s2=375)
+                motor_acceleration_deg_s2=250)
 
 # Inference-only alarm handling; teleoperation and console defaults are unchanged.
 grippers = dict(left=dict(drop_alarm_policy="warn"), right=dict(drop_alarm_policy="warn"))
 
 inference = dict(
     type="A10DualInferenceRunner",
-    mode="motion",
+    mode="read_only" if model_backend == "longwam" else "motion",
     manual_speed_percent=100,
     cycles=1_000_000,
     remote_inference=dict(**_model["remote_inference"], timeout_s=3600.0),

@@ -58,6 +58,26 @@ class SharedControlTest(unittest.TestCase):
         self.assertNotIn('stop_follower', self.controller.commands)
         owner.stop_follower()
 
+    def test_console_motor_switch_reservation_requires_idle_and_blocks_other_writes(self):
+        owner, console, other = self.client('inference'), self.client('console'), self.client('console')
+        owner.start_follower()
+        with self.assertRaisesRegex(PermissionError, '共享 follower 无控制者'):
+            console.begin_shared_console_operation(require_idle=True)
+        self.assertTrue(owner.get_state().follower_active)
+        self.assertNotIn('stop_follower', self.controller.commands)
+        owner.stop_follower()
+        console.begin_shared_console_operation(require_idle=True)
+        try:
+            with self.assertRaisesRegex(PermissionError, 'Another console command'):
+                other.disable()
+            with self.assertRaisesRegex(PermissionError, 'Another console command'):
+                other._connection.request('manual_ds')
+            self.assertNotIn('manual_ds', self.controller.commands)
+        finally:
+            console.end_shared_console_operation()
+        other.disable()
+        self.assertIn('manual_ds', self.controller.commands)
+
     def setUp(self):
         self.controller = FakeController().__enter__()
         self.ws_port = self.controller.server.socket.getsockname()[1]

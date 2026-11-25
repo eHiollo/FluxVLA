@@ -98,7 +98,9 @@ class RemotePolicy:
 
     def infer(self, observation):
         self.ws.send(self.codec.packb(observation))
-        return self.decode(self.ws.recv(timeout=self.timeout))
+        message = self.ws.recv(timeout=self.timeout)
+        self.response_received_s = time.monotonic()
+        return self.decode(message)
 
     def close(self):
         self.ws.close()
@@ -131,10 +133,10 @@ def observation(sample, settings):
     return result
 
 
-def actions_from_response(response):
+def actions_from_response(response, action_count=30):
     raw = np.asarray(response["actions"])
-    if raw.shape != (30, 14) or raw.dtype.kind not in "fiu" or not np.isfinite(raw).all():
-        raise ValueError("Expected finite numeric actions [30,14]")
+    if raw.shape != (action_count, 14) or raw.dtype.kind not in "fiu" or not np.isfinite(raw).all():
+        raise ValueError(f"Expected finite numeric actions [{action_count},14]")
     actions = np.array(raw, dtype=np.float64, copy=True)
     before = actions[:, [6, 13]].copy()
     actions[:, [6, 13]] = np.clip(before, 0, 1)
@@ -222,7 +224,9 @@ class LiveDevices:
         if settings["shared_control"].get("mode") != "managed":
             raise ValueError("Managed shared follower required")
         self.robot = A10Operator(**settings)
-        self.cameras = BufferedCameraOperator(config["cameras"])
+        self.longwam_history = config['bridge'].get('longwam_history', False)
+        self.cameras = BufferedCameraOperator(config["cameras"],
+                                             history_size=64 if self.longwam_history else 4)
         self.grips = {}
         self.feedback = {}
         self.error = None
@@ -401,7 +405,7 @@ class LiveDevices:
             callback(state, started)
         return state
 
-    def sample(self, *, state=None):
+    def sample(self, *, state=None, include_history=False):
         if self.error:
             raise RuntimeError("Gripper worker failed") from self.error
         with self.lock:
@@ -409,7 +413,10 @@ class LiveDevices:
                 raise GripperFault(f"Gripper fault requires acknowledgement: {self.gripper_faults}")
         if state is None:
             state = self._robot_state()
-        images = self.cameras.snapshot(state.received_monotonic_s)
+        history = (self.cameras.snapshot_window(state.received_monotonic_s)
+                   if include_history and getattr(self, 'longwam_history', False) else None)
+        images = ({name: frames[-1] for name, frames in history.items()} if history is not None
+                  else self.cameras.snapshot(state.received_monotonic_s))
         with self.lock:
             feedback = dict(self.feedback)
         return dict(
@@ -420,6 +427,7 @@ class LiveDevices:
             has_error=state.has_error,
             images={name: value["image"] for name, value in images.items()},
             camera_times={name: value["received_monotonic_s"] for name, value in images.items()},
+            image_history=history,
         )
 
     def start(self):
@@ -595,6 +603,7 @@ class ZmqPolicy:
 
     def __init__(self, host, port, timeout_s=120.0, prompt=None):
         import zmq
+        from fluxvla.engines.runners.serving.serializers import MsgSerializer
 
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
@@ -604,6 +613,14 @@ class ZmqPolicy:
         self.socket.connect(f"tcp://{host}:{port}")
         self.prompt = prompt or "Fold the garment neatly using both arms."
         self.metadata = dict(protocol="fluxvla_zmq", host=host, port=port)
+        try:
+            self.socket.send(MsgSerializer.to_bytes({'endpoint': 'get_status'}))
+            status = MsgSerializer.from_bytes(self.socket.recv())
+            if isinstance(status, dict) and isinstance(status.get('model'), dict):
+                self.metadata['model'] = status['model']
+        except BaseException:
+            self.close()
+            raise
 
     def infer(self, observation):
         import io

@@ -63,10 +63,21 @@ class A10DualOperator(BaseOperator):
         self.trace.observe(actual, state.received_monotonic_s,
                            query_started_s=query_started_s, controller_target=target)
 
-    def get_frame(self, slop=None):
+    def get_frame(self, slop=None, *, include_history=True):
         if self._arrival_pending:
             raise RuntimeError('Previous target arrival unconfirmed; observation blocked')
-        sample = self.devices.sample()
+        from .camera_operator import CameraHistoryNotReady
+        sample_options = ({'include_history': True}
+                          if include_history and self.settings.get('longwam_history') else {})
+        deadline = self.clock.monotonic() + 10.
+        while True:
+            try:
+                sample = self.devices.sample(**sample_options)
+                break
+            except CameraHistoryNotReady:
+                if self._traj_stop_event.is_set() or self.clock.monotonic() >= deadline:
+                    raise TimeoutError('LongWAM camera history warmup timed out')
+                self.clock.sleep(1 / 30)
         # Buffered cameras may still contain a frame from before confirmation.
         deadline = self.clock.monotonic() + 2.
         while self._arrival_confirmed_s is not None and (
@@ -75,17 +86,19 @@ class A10DualOperator(BaseOperator):
             if self._traj_stop_event.is_set() or self.clock.monotonic() >= deadline:
                 raise TimeoutError('No fresh post-arrival observation')
             self.clock.sleep(1 / self.tail_config['poll_hz'])
-            sample = self.devices.sample()
+            sample = self.devices.sample(**sample_options)
         obs = self.bridge.observation(sample, self.settings)
         frame = dict(qpos=obs['observation/state'].copy(), has_error=False,
                      received_monotonic_s=sample['robot_time'],
                      robot_time=sample['robot_time'], camera_times=sample['camera_times'],
                      gripper_times=sample['gripper_times'], **sample['images'])
+        if sample.get('image_history') is not None:
+            frame['image_history'] = sample['image_history']
         self.last_frame = frame
         return frame
 
     def validate_actions(self, actions):
-        current = self.get_frame()['qpos']
+        current = self.get_frame(include_history=False)['qpos']
         self.bridge.check_steps(actions, current, self.settings['max_joint_step_rad'])
         return current
 

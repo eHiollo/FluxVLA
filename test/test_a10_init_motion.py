@@ -146,7 +146,7 @@ class A10InitMotionTest(unittest.TestCase):
             self.assertIn('机器人定义的初始位置', '\n'.join(output))
             self.assertFalse(c.active)
 
-    def test_dual_console_init_keeps_375_through_joint_start_and_cart_restore(self):
+    def test_dual_console_init_ignores_motor_limits_through_joint_start_and_cart_restore(self):
         profile = Path(__file__).resolve().parents[1] / 'configs/a10/a10_dual_arm_operator.py'
         with FakeController(initial_active=True) as c:
             c.motion_override = dual_motion()
@@ -161,7 +161,7 @@ class A10InitMotionTest(unittest.TestCase):
 
             def factory(**settings):
                 self.assertEqual(settings['motor_acceleration_deg_s2'], 1000.)
-                self.assertEqual(settings['init_motion']['motor_acceleration_deg_s2'], 375.)
+                self.assertNotIn('motor_acceleration_deg_s2', settings.get('init_motion') or {})
                 settings.pop('init_grippers_config')
                 op = c.operator(**settings)
                 op.init_position = {name: arm.actual_joints_rad.copy()
@@ -174,12 +174,12 @@ class A10InitMotionTest(unittest.TestCase):
                                    '--joint-udp-port', str(c.joint_udp.getsockname()[1]), 'm_init'],
                                   operator_factory=factory, output=output.append), 0, '\n'.join(output))
             self.assertTrue(c.operators[-1].last_init_motion['completed'])
-            self.assertEqual(c.commands.count('read_motor --all'), 4)
+            self.assertNotIn('read_motor --all', c.commands)
             self.assertIn('set_jog_vel --vel_percent=5', c.commands)
             self.assertIn('follower_cart', c.commands)
             self.assertFalse(any(cmd.startswith('write_motor') for cmd in c.commands))
 
-    def test_console_init_temporarily_switches_and_restores_mixed_acceleration(self):
+    def test_console_init_preserves_mixed_acceleration_on_success_failure_cancel_and_shared(self):
         for outcome in ('complete', 'failed', 'cancelled', 'shared'):
             with (self.subTest(outcome=outcome), FakeController() as c,
                   TemporaryDirectory() as directory, ExitStack() as resources):
@@ -206,7 +206,7 @@ class A10InitMotionTest(unittest.TestCase):
                     return dict(ret_code=0, ret_context='')
 
                 def start_joint():
-                    if current != temporary or c.activation != 'Enabled' or c.jog_vel != 5:
+                    if current != snapshot or c.activation != 'Enabled' or c.jog_vel != 5:
                         return dict(ret_code=-1, ret_context='incorrect initialization profile')
                     c.active, c.mode = True, 'Axis'
                     return dict(ret_code=0, ret_context='')
@@ -260,12 +260,14 @@ class A10InitMotionTest(unittest.TestCase):
                         with patch.object(op, 'send_joints', side_effect=motion_error):
                             with self.assertRaisesRegex((RuntimeError, InterruptedError), 'simulated'):
                                 console.execute(parse_command(['m_init']))
-                self.assertEqual(writes, list(range(12)) * 2)
+                self.assertEqual(writes, [])
+                self.assertNotIn('read_motor --all', c.commands)
+                self.assertNotIn('manual_ds', c.commands)
                 self.assertEqual(current, snapshot)
                 self.assertFalse(c.active)
-                self.assertEqual(c.activation, 'Disabled' if outcome == 'cancelled' else 'Enabled')
+                self.assertEqual(c.activation, 'Enabled')
                 self.assertIn('set_jog_vel --vel_percent=5', c.commands)
-                self.assertEqual(json.loads(next(Path(directory).glob('*/after.json')).read_text()), snapshot)
+                self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_local_one_shot_and_raw_escape(self):
         with FakeController() as c:

@@ -465,6 +465,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         debug_log=None,
         trace_inference_feedback=False,
         follower_tail=None,
+        timed_aj=None,
         task_descriptions=None,
         task_pose_sequences=None,
         action_chunk=30,
@@ -511,6 +512,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             prompt=prompt,
             trace_inference_feedback=trace_inference_feedback,
             follower_tail=follower_tail,
+            timed_aj=timed_aj,
         )
         if longwam:
             self.settings['longwam_history'] = True
@@ -538,7 +540,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         if type(horizon) is not int or not 1 <= horizon <= 30:
             raise ValueError("execute_horizon must be 1..30")
         for key, value in self.settings.items():
-            if key == 'follower_tail':
+            if key in ('follower_tail', 'timed_aj'):
                 continue
             if key == 'trace_inference_feedback':
                 if type(value) is not bool:
@@ -558,6 +560,21 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         tail = tail_config(self.settings['follower_tail'])
         if tail['enabled'] and horizon != 20:
             raise ValueError('follower_tail requires execute_horizon=20')
+        from ..communication.a10_timed_aj import timed_config
+        timed = timed_config(self.settings['timed_aj'])
+        self.settings['timed_aj'] = timed
+        if timed['enabled']:
+            if not math.isclose(self.settings['action_dt'], 1 / 30, rel_tol=0., abs_tol=1e-12):
+                raise ValueError('timed_aj requires the original 30 Hz time axis')
+            if tail['enabled']:
+                raise ValueError('timed_aj ordinary blocks must not wait for arrival or stop')
+            if (self.settings['manual_speed_percent'] is not None
+                    or self.config.get('operator', {}).get('motor_acceleration_deg_s2') is not None
+                    or self.config.get('operator', {}).get('joint_follower_velocity_percent') is not None):
+                raise ValueError('timed_aj must preserve site speed and motor acceleration settings')
+            if (tail['speed_tolerance_deg_s'] is None or tail['speed_tolerance_deg_s'] > .5
+                    or tail['stable_duration_s'] < .04):
+                raise ValueError('timed_aj requires actual feedback speed <=0.5 deg/s stable for >=40 ms')
         timeout = self.remote.get("timeout_s", 120.0)
         if (
             isinstance(timeout, bool)
@@ -573,6 +590,16 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         if type(self.remote.get("server_port")) is not int or not 1 <= self.remote["server_port"] <= 65535:
             raise ValueError("Invalid server port")
         for side, device in self.config.get("grippers", {}).items():
+            for key, default, upper in (("io_hz", 20., 100.),
+                                        ("serial_timeout_s", .2, 1.)):
+                value = device.get(key, default)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or not 0 < value <= upper):
+                    raise ValueError(f"grippers.{side}.{key} must be within (0, {upper}]")
+            if device.get("feedback_mode", "full") not in ("full", "motion"):
+                raise ValueError(f"grippers.{side}.feedback_mode must be full or motion")
+            if type(device.get("compact_trigger", False)) is not bool:
+                raise ValueError(f"grippers.{side}.compact_trigger must be bool")
             policy = device.get("drop_alarm_policy", "stop")
             if policy not in ("stop", "warn"):
                 raise ValueError(
@@ -679,6 +706,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                  joint_motion_since_observation_rad=current[joints] - self._action_ctx.state[joints],
                  first_target_error_rad=actions[0, joints] - current[joints])
         selected = actions[:self.execute_horizon]
+        self.ros_operator.stream_final = self._cycle + 1 >= self.cycles
         self.ros_operator.execute_trajectory(
             arm_trajectories={'left': selected[:, :6], 'right': selected[:, 7:13]},
             gripper_trajectories={'left': selected[:, 6], 'right': selected[:, 13]},
@@ -758,6 +786,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                 if paused:
                     self.log('paused', cycles=self._cycle)
                     break
+            self.ros_operator.finish_timed_stream()
             completed = True
         except BaseException as exc:
             self.log('error', error=str(exc), type=type(exc).__name__)

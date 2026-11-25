@@ -14,6 +14,7 @@ from websockets.exceptions import ConnectionClosed
 
 from ..operators.a10_operator import _FollowerConnection, _parse_state, _set_controller_speed
 from .a10_shared_connection import ControlTransferredError
+from .a10_timed_aj import TimedAjTransport
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,10 @@ class SharedControl:
         self.console_operation_depth = 0
         self.stopped = set()
         self.stop_requests = set()
+        self.timed_owner = None
+        self.timed = TimedAjTransport(
+            lambda *a, **k: self.control.request(*a, **k), self.read_state,
+            host, ws_port, status_ws_port, timeout_s)
         self._speed_restore_allowed = set()
         self.recorder = None
         self._snapshot_lock = threading.Lock()
@@ -275,10 +280,14 @@ class SharedControl:
         self.revoked.add(owner)
         if reason.startswith('console'):
             self.preempted.add(owner)
-        state = _controller_state(self.read_state())
-        if (state.follower_active is not False
-                or state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped'):
-            self.mode_command('stop_follower', False)
+        if self.timed_owner == owner:
+            self.timed.stop()
+            self.timed_owner = None
+        else:
+            state = _controller_state(self.read_state())
+            if (state.follower_active is not False
+                    or state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped'):
+                self.mode_command('stop_follower', False)
         self.owner = None
         self.stopped.add(owner)
         if reason == 'explicit_stop':
@@ -304,7 +313,8 @@ class SharedControl:
             self.stop_owner('console_takeover')
         if self.owner is None:
             state = _controller_state(self.read_state())
-            if state.follower_active is not False:
+            if (state.follower_active is not False
+                    or state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped'):
                 raise PermissionError('An unmanaged follower is active; the shared service will not take it over')
         self.revoked.discard(session_id)
         self.preempted.discard(session_id)
@@ -329,6 +339,10 @@ class SharedControl:
         with self._control_lock, self._target_lock:
             if self.owner != session_id:
                 raise ControlTransferredError('Control changed; no stop sent to the new owner')
+            if self.timed_owner == session_id:
+                # The timed path retains its lease until stop is confirmed.
+                self.stop_owner('explicit_stop')
+                return dict(requested=True, confirmed=True)
             # Do not reconnect or replay on a failed send.
             self.control.send_command('stop_follower')
             self.owner = None
@@ -377,6 +391,52 @@ class SharedControl:
                                             timeout_s=request.get('timeout_s'))
         if op == 'lease' and request['operation'] == 'status':
             return self.lease_status(session_id)
+        if op == 'timed_status':
+            with self._control_lock:
+                return self.timed.status()
+        if op == 'timed_target':
+            if request.get('status_channel'):
+                raise PermissionError('Status-only connections cannot control timed_aj')
+            # No command lock and no WS request: a concurrent read-only GET
+            # must not turn a UDP submission into a blocking transaction.
+            with self._target_lock:
+                if (self.owner != session_id or self.timed_owner != session_id
+                        or session_id in self.revoked):
+                    raise ControlTransferredError('timed_aj target ownership revoked')
+                with self._poll_lock:
+                    if self._poll_error is not None:
+                        raise self._poll_error
+                try:
+                    return self.timed.send(request['position_rad'], request['final'])
+                except BaseException:
+                    self.revoked.add(session_id)
+                    raise
+        if op in ('timed_start', 'timed_stop'):
+            if request.get('status_channel'):
+                raise PermissionError('Status-only connections cannot control timed_aj')
+            with self._control_lock, self._target_lock:
+                if op == 'timed_start':
+                    if self.owner == session_id:
+                        raise RuntimeError('Stop the owned stream before starting another')
+                    self.claim(session_id, role)
+                    self.timed_owner = session_id
+                    try:
+                        result = self.timed.start(request['options'])
+                    except BaseException:
+                        self.revoked.add(session_id)
+                        if not self.timed.start_attempted:
+                            self.timed.close()
+                            self.timed_owner = self.owner = None
+                            self.stopped.add(session_id)
+                        raise
+                    self.note('timed_started', session_id=session_id, stream_id=result['stream_id'])
+                    return result
+                if self.owner != session_id or self.timed_owner != session_id:
+                    if op == 'timed_stop' and session_id in self.stopped:
+                        return dict(active=False, stopped_by_service=True)
+                    raise ControlTransferredError('This session no longer owns timed_aj')
+                self.stop_owner('explicit_stop')
+                return dict(active=False, stopped_by_service=True)
         if op == 'stop':
             if role != 'console':
                 raise PermissionError('Only the console may issue a global stop')
@@ -385,6 +445,10 @@ class SharedControl:
                 self.revoked.add(owner)
                 if owner != session_id:
                     self.preempted.add(owner)
+            if self.timed_owner is not None:
+                with self._control_lock, self._target_lock:
+                    self.stop_owner('console_stop')
+                    return self.read_state()
             # A native command may be holding the control lock while awaiting
             # a long reply. Isolate that socket before obtaining the lock.
             self.control.interrupt()
@@ -400,6 +464,8 @@ class SharedControl:
             while not self._target_lock.acquire(timeout=.02):
                 if self.owner != session_id or session_id in self.revoked:
                     raise ControlTransferredError('Control was transferred to the console; no target sent')
+                if self.timed_owner is not None:
+                    raise PermissionError('Legacy targets cannot be sent to a timed_aj lease')
             try:
                 with self._poll_lock:
                     feedback_error = self._poll_error
@@ -506,6 +572,8 @@ class SharedControl:
                 elif request['operation'] == 'acquire':
                     self.claim(session_id, role, require_feedback=request.get('require_feedback', True))
                 elif request['operation'] == 'acknowledge':
+                    if self.timed_owner is not None:
+                        raise PermissionError('Confirm timed_aj stop before acknowledging ownership')
                     if (self.console_operation is not None or (self.owner is not None
                             and self.owner != session_id and self.owner not in self.revoked)):
                         raise PermissionError('Another session still owns control')
@@ -535,6 +603,8 @@ class SharedControl:
             command = request['command']
             name = command.split(maxsplit=1)[0]
             if name in ('follower_aj', 'follower_aj_tg', 'follower_cart'):
+                if self.timed_owner == session_id:
+                    raise PermissionError('Stop timed_aj before starting a native follower')
                 self.claim(session_id, role)
                 return self.mode_command(command, True)
             if name == 'stop_follower':
@@ -594,6 +664,7 @@ class SharedControl:
             try:
                 self.stop_owner('service_shutdown')
             finally:
+                self.timed.close()
                 self.control.close()
                 self.status.close()
                 if self.recorder is not None:

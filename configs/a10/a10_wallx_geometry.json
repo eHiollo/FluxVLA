@@ -1,0 +1,48 @@
+{
+  "schema": "a10_wallx_geometry_v1",
+  "confirmed_by_user": "2026-11-25",
+  "rig_frame": {
+    "origin": "midpoint_between_base_mount_centres",
+    "x": "forward_towards_worktable",
+    "y": "towards_physical_left_arm",
+    "z": "up"
+  },
+  "base_spacing_m": 1.15,
+  "grasp_point_in_tool0_m": [0.0, 0.0, 0.295],
+  "grasp_rotation_in_tool0_xyzw": [0.0, 0.0, 0.0, 1.0],
+  "arms": {
+    "left": {
+      "ee_id": 1,
+      "operator_alias": "right",
+      "base_in_rig_m": [0.0, 0.575, 0.0],
+      "base_yaw_in_rig_rad": 0.0,
+      "wrist_camera": "left_wrist_0_rgb"
+    },
+    "right": {
+      "ee_id": 0,
+      "operator_alias": "left",
+      "base_in_rig_m": [0.0, -0.575, 0.0],
+      "base_yaw_in_rig_rad": 3.141592653589793,
+      "wrist_camera": "right_wrist_0_rgb"
+    }
+  },
+  "table": {
+    "width_m": 1.5,
+    "depth_m": 1.0,
+    "height_above_base_mount_m": 0.2,
+    "near_edge_x_in_rig_m": null,
+    "depth_confirmation_pending": false
+  },
+  "gripper": {
+    "open_raw": 0,
+    "closed_raw": 9000,
+    "closure_fraction": "raw / 9000"
+  },
+  "model_contract": {
+    "embodiment": null,
+    "model_frame_from_rig": null,
+    "model_ee_in_grasp_m_xyzw": null,
+    "model_gripper_from_closure": null,
+    "verified": false
+  }
+}

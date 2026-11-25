@@ -914,6 +914,34 @@ class A10Operator(BaseOperator):
             raise TimeoutError(f'A10 status feedback older than {self.status_max_age_s:.3f}s')
         return state
 
+    def timed_aj_status(self):
+        from ..communication.a10_shared_connection import SharedFollowerConnection
+        if not isinstance(self._connection, SharedFollowerConnection):
+            raise RuntimeError('timed_aj requires the managed shared control service')
+        return self._connection.call('timed_status', allow_cancelled=True)
+
+    def start_timed_aj(self, options):
+        with self._io_lock:
+            self._require_motion()
+            from ..communication.a10_shared_connection import SharedFollowerConnection
+            if not isinstance(self._connection, SharedFollowerConnection):
+                raise RuntimeError('timed_aj requires the managed shared control service')
+            return self._connection.call('timed_start', options=options)
+
+    def send_timed_joint_target(self, position_rad, *, final=False):
+        with self._io_lock:
+            self._require_motion()
+            from ..communication.a10_timed_aj import encode_target
+            # Validate before RPC; the service validates again before the UDP syscall.
+            encode_target(1, 0, position_rad, final)  # IDs are private to the relay.
+            return self._connection.call('timed_target',
+                                         position_rad=list(map(float, position_rad)), final=final)
+
+    def stop_timed_aj(self):
+        with self._io_lock:
+            self._require_motion(allow_cancelled=True)
+            return self._connection.call('timed_stop', allow_cancelled=True)
+
     def _require_motion(self, *, allow_cancelled=False):
         if not self.allow_motion:
             raise PermissionError('A10 allow_motion is false')
@@ -1554,7 +1582,13 @@ class A10Operator(BaseOperator):
                     self.command_mode = mode
                     return state  # Already in this session's confirmed mode; no duplicate start.
                 raise RuntimeError('This session has a pending follower; stop_follower before switching modes')
-            self.ensure_motor_acceleration(motor_acceleration_deg_s2)
+            # m_init holds both ownership and the init lock through Cart/Axis
+            # restoration. Preserve site motor limits for that entire scope.
+            init_lock = getattr(self, '_init_motion_lock', None)
+            in_init = (init_lock is not None and init_lock.locked()
+                       and self._trajectory_owner == threading.get_ident())
+            if not in_init:
+                self.ensure_motor_acceleration(motor_acceleration_deg_s2)
             if self.shared_control:
                 self._connection.lease('acquire')
             self.last_stop_confirmed = False
@@ -2232,7 +2266,6 @@ class A10Operator(BaseOperator):
     def _prepare_init_motion(self, *, original_state=None):
         with self._io_lock:
             self._require_motion()
-            self.ensure_motor_acceleration(self.init_motion.get('motor_acceleration_deg_s2'))
             state = self.get_state()
             if state.follower_active not in (True, False):
                 raise RuntimeError('Initialization requires known follower state')
@@ -2279,8 +2312,7 @@ class A10Operator(BaseOperator):
                 # Select the original plan without sending a UDP target, then
                 # stop it again if the follower was originally inactive.
                 self._traj_stop_event.clear()
-                self.start_follower('joint' if mode == 'Axis' else 'cartesian',
-                                    motor_acceleration_deg_s2=self.init_motion.get('motor_acceleration_deg_s2'))
+                self.start_follower('joint' if mode == 'Axis' else 'cartesian')
                 if not snapshot['follower_active']:
                     self.stop_follower()
             self._require_motion()

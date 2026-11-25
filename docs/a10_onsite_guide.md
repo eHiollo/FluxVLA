@@ -1,5 +1,7 @@
 # A10 现场接入操作说明
 
+
+新版双臂推理已切换 timed_aj，参见 [接入说明](a10_timed_aj.md)。本页单臂、VR与旧follower控制台流程继续保留；不要把其UDP9999、倍率或块尾等待规则套入新版双臂推理。
 > 当前入口：`configs/a10/a10_dual_vr.py`，配置分工见[配置索引](../configs/a10/README.md)，运行命令见[CLI.txt](../CLI.txt)。下文保留当时的接入/开发记录，旧路径和双臂默认行为以当前入口为准。
 
 2026-10-26 整合说明：旧单臂推理与共享控制台保持兼容，双臂配置控制台默认直连。
@@ -578,17 +580,17 @@ python scripts/inference.py \
 | `action_chunk=30` | 模型一次预测 30 步，和 checkpoint metadata 对齐 |
 | `execute_horizon=15` | 每轮只发送前 15 步，然后重新拍照、读取状态、预测 |
 | `action_dt=1/30` | 原数据每秒 30 帧，每个模型目标的持续时间约 33.3ms |
-| `joint_target_repeat=2` | 当前默认：每个关节目标以约 16.7ms 间隔发两遍，UDP 60Hz；USB夹爪仍每个模型目标发一次。设为1恢复30Hz |
+| `joint_target_repeat=1` | 每个模型目标只发一次，UDP 30Hz；USB夹爪每个模型目标发一次 |
 | `max_publish_step=3000` | 本次运行累计选择 3000 步后结束 |
 | `max_joint_step_rad` | 检查第一步相对实际观测，以及随后各步的关节目标变化 |
 | `gripper_mm_range=(0,85)` | 默认 USB 夹爪工作范围；模型预测超出范围时限制到边界并打印提示，不把毫米当速度 |
 
 `execute_trajectory()` 按模型时间逐行发送；当前每行前六个关节数通过 UDP 9999
-在 `t` 和 `t+1/60秒` 各发一次，下一行在 `t+1/30秒` 开始；夹爪仅第一遍写本机USB。
-15个模型目标对应30个UDP包，计划时长仍为0.5秒（另加状态检查耗时），不是把动作加速两倍。
-日志保留模型 `selected/sent` 计数，并增加 `joint_packets_sent`、`gripper_targets_sent`、
-`joint_publish_hz`、逐包 `action_index/repeat_index`，用于核对60Hz实际间隔。
-超时/取消后不突发补发重复包。推理等待期间的跨块发包空档仍存在。
+只发一次，下一行在 `t+1/30秒` 开始；夹爪每个模型目标写一次本机USB。
+15个模型目标对应15个UDP包，计划时长为0.5秒。
+日志保留模型 `selected/sent` 计数、`joint_packets_sent`、`gripper_targets_sent`、
+`joint_publish_hz` 和逐包 `action_index/repeat_index`，用于核对30Hz实际间隔。
+推理等待期间的跨块发包空档仍存在。
 机器人内部插补/运动规划由控制器负责；UDP没有每帧ACK，发送结束不证明实际到位。
 提高刷新频率是否改善跟随须现场对比，不能仅据频率认定运动速度加倍。
 

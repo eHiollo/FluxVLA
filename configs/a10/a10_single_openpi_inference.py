@@ -61,7 +61,7 @@ inference = dict(
                                              width=640, height=480, fps=30, rotate_180=True))),
     task_suite_name='a10', instruction='Reach the yellow lemon',
     action_chunk=30, execute_horizon=10, action_dt=1.0 / 30.0,
-    joint_target_repeat=2,  # 60 Hz UDP; model timing stays at 30 Hz.
+    joint_target_repeat=1,  # Send each original model target once at 30 Hz.
     max_publish_step=30, gripper_mm_range=(0., 85.), dry_run=True, max_joint_step_rad=None,
     # Plain mode uses FP32. Accelerated mode owns BF16 fused compute.
     # Keep source parameters FP32 in both modes.

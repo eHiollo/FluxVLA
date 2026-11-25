@@ -1,0 +1,28 @@
+{
+  "embodiment": "teletwin_desktop/gripper-g",
+  "verified": false,
+  "purpose": "Read-only cross-embodiment experiment; not an A10 model calibration",
+  "model_frame_from_rig": {
+    "left": [0.0, -0.575, 0.0, 0.0, 0.0, 0.0, 1.0],
+    "right": [0.0, -0.575, 0.0, 0.0, 0.0, 1.0, 0.0]
+  },
+  "model_ee_in_grasp_m_xyzw": {
+    "left": [0.0, 0.0, -0.295, 0.0, 0.0, 0.0, 1.0],
+    "right": [0.0, 0.0, -0.295, 0.0, 0.0, 0.0, 1.0]
+  },
+  "model_gripper_from_closure": {
+    "left": [1.526, 0.0],
+    "right": [1.526, 0.0]
+  },
+  "assumptions": [
+    "Experimental model coordinates use each A10 native base rather than its shared rig frame",
+    "Experimental model EE is represented by A10 tool0, not its grasp centre",
+    "A10 raw closure fraction maps linearly to model gripper opening in radians",
+    "Protocol and transform roundtrip checks do not validate policy transfer to A10"
+  ],
+  "sources": [
+    "https://github.com/X-Square-Robot/xr-harness/blob/main/xr-cerebellum/docs/reference/VLA_BACKENDS.md",
+    "https://github.com/X-Square-Robot/xr-harness/blob/main/xr-cerebellum/docs/reference/VLA_POLICY_FRAMES.md",
+    "https://x2robot.com/docs/quantax1pro/v1/model-development/wallx-api/api-usage-instruction"
+  ]
+}

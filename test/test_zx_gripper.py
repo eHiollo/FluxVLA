@@ -50,6 +50,8 @@ class FakeSerial:
             if function == 16:
                 high, low = struct.unpack('>HH', request[7:11])
                 self.target = (high << 16) | low
+                if count == 7 and self.follow:
+                    self.position = self.target
             elif address == 0x0108 and count == 1 and self.follow:
                 self.position = self.target
             elif address == 0x0100:
@@ -324,6 +326,50 @@ class ZXGripperTests(unittest.TestCase):
                          [0x0108, 0x0102, 0x0108])
         self.assertEqual(self.fake.position, 4500)
         self.assertEqual(self.fake.enabled, 1)
+
+    def test_motion_read_uses_only_position_speed_current_without_health_reads(self):
+        self.client.connect()
+        state = self.client.read_motion_state(1)
+        self.assertEqual(len(self.fake.writes), 1)
+        self.assertEqual(self.fake.writes[0][2:6], bytes.fromhex('04 18 00 04'))
+        self.assertEqual((state.position_raw, state.speed_raw, state.current_raw), (4820, 10, 12))
+        self.assertFalse(hasattr(state, 'enabled'))
+        self.assertFalse(hasattr(state, 'alarm_a'))
+
+    def test_motion_read_drops_bad_crc_without_retry(self):
+        self.client.connect()
+        self.fake.override = bytes.fromhex('01 03 08 00 00 00 01 00 00 00 00 00 00')
+        with self.assertRaises(zx.ZXGripperCRCError):
+            self.client.read_motion_state(1)
+        self.assertEqual(len(self.fake.writes), 1)
+        self.assertEqual(self.client.crc_error_count, 1)
+        self.assertEqual(self.client.crc_read_retry_count, 0)
+
+    def test_compact_trigger_sets_target_in_one_acknowledged_write(self):
+        self.fake.alarms = (0, 0)
+        self.client.connect()
+        state = self.client.read_state(1)
+        self.fake.writes.clear()
+        first = self.client.set_position_raw(1, 4500, speed=30, feedback=state, compact_trigger=True)
+        self.assertEqual(len(self.fake.writes), 1)
+        request = self.fake.writes[0]
+        self.assertEqual(request[1:7], bytes.fromhex('10 01 02 00 07 0e'))
+        self.assertEqual(struct.unpack('>7H', request[7:-2]), (0, 4500, 30, 60, 1000, 1000, 1))
+        self.assertEqual(self.fake.position, 4500)
+        self.assertEqual(self.client.set_position_raw(1, 4500, speed=30, feedback=state,
+                                                     compact_trigger=True), first)
+        self.assertEqual(len(self.fake.writes), 1)
+
+    def test_compact_write_failure_is_not_retried_or_cached(self):
+        self.fake.alarms = (0, 0)
+        self.client.connect()
+        state = self.client.read_state(1)
+        self.fake.writes.clear()
+        self.fake.override = frame(bytes.fromhex('01 10 01 02 00 06'))
+        with self.assertRaisesRegex(zx.ZXGripperError, 'acknowledgement'):
+            self.client.set_position_raw(1, 4500, feedback=state, compact_trigger=True)
+        self.assertEqual(len(self.fake.writes), 1)
+        self.assertNotIn(1, self.client._commands)
 
     def test_live_disabled_feedback_still_enables_before_trigger(self):
         self.fake.alarms = (0, 0)

@@ -123,15 +123,13 @@ class TailExecutionTests(unittest.TestCase):
             bridge=SimpleNamespace(**vars(b)))
         return clock, d, runner
 
-    def test_two_chunks_send_exactly_40_each_and_observe_only_after_arrival(self):
+    def test_two_chunks_send_exactly_20_each_and_observe_only_after_arrival(self):
         clock, d, r = self.setup_runner()
         with patch.object(b, 'time', clock):
             r.run()
-        self.assertEqual(len(d.packets), 80)
+        self.assertEqual(len(d.packets), 40)
         self.assertEqual(len(d.stops_at), 2)
         self.assertGreaterEqual(d.feedback_calls, 30)
-        for c in (0, 1):
-            np.testing.assert_array_equal(d.packets[c*40+39], d.packets[c*40+38])
         # Two observations per cycle (policy input and pre-send check), none while waiting.
         self.assertEqual(len(d.observations), 4)
         self.assertGreater(d.observations[2], d.stops_at[0])
@@ -156,7 +154,7 @@ class TailExecutionTests(unittest.TestCase):
             enabled=True,  arrival_timeout_s=1.5))
         with patch.object(b, 'time', clock):
             r.run()
-        self.assertEqual(len(d.packets), 80)
+        self.assertEqual(len(d.packets), 40)
         self.assertEqual(len(d.stops_at), 2)
         self.assertEqual(len(d.observations), 4)
         self.assertGreater(d.observations[2], d.stops_at[0])
@@ -164,27 +162,38 @@ class TailExecutionTests(unittest.TestCase):
             if call.args[0] == 'sent':
                 self.assertEqual(call.kwargs['point_role'], 'policy')
             if call.args[0] == 'follower_tail':
-                self.assertEqual(call.kwargs['total_packets'], 40)
+                self.assertEqual(call.kwargs['total_packets'], 20)
                 self.assertNotIn('compensation', call.kwargs)
         self.assertFalse(r.ros_operator._arrival_pending)
 
-    def test_twice_repeated_policy_keeps_duration_and_arrival_before_stop_gate(self):
+    def test_policy_points_send_once_at_original_rate_before_arrival_gate(self):
         clock, d, r = self.setup_runner(follower_tail=dict(
             enabled=True,  arrival_timeout_s=1.5))
+        actions = np.tile(np.r_[d.joints[1], .25, d.joints[0], .75], (30, 1))
+        actions[:, 0] += np.arange(30)*.001
+        r._policy = Policy(action=actions)
         with patch.object(b, 'time', clock):
             r.run()
-        self.assertEqual(len(d.packets), 80)
+        self.assertEqual(len(d.packets), 40)
         self.assertEqual(len(d.stops_at), 2)
-        for i in range(0, 80, 2):
-            np.testing.assert_array_equal(d.packets[i], d.packets[i+1])
+        predictions = [x.kwargs['converted_actions'] for x in r.log.call_args_list
+                       if x.args[0] == 'prediction']
+        for cycle, prediction in enumerate(predictions):
+            np.testing.assert_array_equal(d.packets[cycle*20:(cycle+1)*20], prediction[:20])
         calls = r.log.call_args_list
         starts = [x.kwargs['started_s'] for x in calls if x.args[0]=='execution_start']
         ends = [x.kwargs['finished_s'] for x in calls if x.args[0]=='execution_end']
         for start, end in zip(starts, ends):
             self.assertAlmostEqual(end-start, 20/30)
         sent = [x.kwargs for x in calls if x.args[0]=='sent']
-        self.assertEqual([x['policy_frame'] for x in sent[:40]], [i for i in range(1,21) for _ in range(2)])
-        self.assertEqual([x['repeat_index'] for x in sent[:40]], [1,2]*20)
+        self.assertEqual([x['policy_frame'] for x in sent], list(range(1, 21))*2)
+        self.assertEqual([x['repeat_index'] for x in sent], [1]*40)
+        for cycle in (0, 1):
+            stamps = [x['scheduled_s'] for x in sent[cycle*20:(cycle+1)*20]]
+            np.testing.assert_allclose(np.diff(stamps), 1/30, rtol=0, atol=1e-12)
+        self.assertTrue(all(x['send_hz'] == 30 for x in sent))
+        tail = [x.kwargs for x in calls if x.args[0] == 'follower_tail']
+        self.assertTrue(all(x['point_repeat'] == 1 and x['packet_hz'] == 30 for x in tail))
         self.assertGreater(d.observations[2],d.stops_at[0])
 
     def test_unfiltered_timeout_still_blocks_next_observation(self):
@@ -193,7 +202,7 @@ class TailExecutionTests(unittest.TestCase):
         d.fail_arrival = True
         with patch.object(b, 'time', clock), self.assertRaises(TimeoutError):
             r.run()
-        self.assertEqual(len(d.packets), 40)
+        self.assertEqual(len(d.packets), 20)
         self.assertEqual(len(d.observations), 2)
         with self.assertRaisesRegex(RuntimeError, 'observation blocked'):
             r.ros_operator.get_frame()
@@ -203,7 +212,7 @@ class TailExecutionTests(unittest.TestCase):
         d.fail_arrival = True
         with patch.object(b, 'time', clock), self.assertRaisesRegex(TimeoutError, 'next observation blocked'):
             r.run()
-        self.assertEqual(len(d.packets), 40)
+        self.assertEqual(len(d.packets), 20)
         self.assertEqual(len(d.observations), 2)
         with self.assertRaisesRegex(RuntimeError, 'observation blocked'):
             r.ros_operator.get_frame()
@@ -218,7 +227,7 @@ class TailExecutionTests(unittest.TestCase):
         with patch.object(b, 'time', clock), self.assertRaisesRegex(RuntimeError, 'stale arrival'):
             r.run()
         self.assertEqual(len(d.observations), 2)
-        self.assertEqual(d.sent, 40)
+        self.assertEqual(d.sent, 20)
 
 
     def test_motor_bounds_rejected_before_start_and_preserve_physical_mapping(self):
@@ -242,7 +251,7 @@ class TailExecutionTests(unittest.TestCase):
         d.stop = Mock(return_value=False)
         with patch.object(b, 'time', clock), self.assertRaisesRegex(RuntimeError, 'stop unconfirmed'):
             r._run_action_chunk('fold')
-        self.assertEqual(d.sent, 40)
+        self.assertEqual(d.sent, 20)
         with self.assertRaisesRegex(RuntimeError, 'observation blocked'):
             r.ros_operator.get_frame()
         d.stop = lambda: True
@@ -257,7 +266,7 @@ class TailExecutionTests(unittest.TestCase):
         d.arrival_feedback = feedback
         with patch.object(b, 'time', clock), self.assertRaisesRegex(InterruptedError, 'cancelled'):
             r.run()
-        self.assertEqual(d.sent, 40)
+        self.assertEqual(d.sent, 20)
         self.assertEqual(len(d.observations), 2)
 
     def test_post_arrival_observation_rejects_old_buffered_camera_frames(self):
@@ -302,7 +311,7 @@ class TailExecutionTests(unittest.TestCase):
             stable_duration_s=0,arrival_timeout_s=1.5))
         with patch.object(b,'time',clock):
             r._run_action_chunk('fold')
-        self.assertEqual(len(d.packets),40)
+        self.assertEqual(len(d.packets),20)
         self.assertGreaterEqual(d.stops_at[0]-d.last_send_at,d.arrival_delay)
         self.assertLessEqual(d.stops_at[0]-d.last_send_at,d.arrival_delay+2/30)
         records=[call for call in r.log.call_args_list if call.args[0]=='target_arrival_confirmed']
@@ -339,11 +348,11 @@ class TailExecutionTests(unittest.TestCase):
         d.stop = stop_with_drift
         with patch.object(b, 'time', clock), self.assertLogs(level='WARNING'):
             r.run()
-        self.assertEqual(len(d.packets), 80)
+        self.assertEqual(len(d.packets), 40)
         self.assertEqual(len(d.stops_at), 2)
         self.assertEqual(len(d.observations), 4)
         self.assertGreater(d.observations[2], d.stops_at[0])
-        self.assertAlmostEqual(d.packets[40][0], d.packets[39][0] + .01)
+        self.assertAlmostEqual(d.packets[20][0], d.packets[19][0] + .01)
         warnings = [c.kwargs for c in r.log.call_args_list if c.args[0] == 'post_stop_position_error']
         self.assertEqual(len(warnings), 2)
         self.assertGreater(warnings[0]['max_error_deg'], warnings[0]['position_tolerance_deg'])
@@ -363,7 +372,7 @@ class TailExecutionTests(unittest.TestCase):
         d.arrival_feedback = still_moving
         with patch.object(b, 'time', clock), self.assertRaisesRegex(TimeoutError, 'Stopped state not confirmed'):
             r.run()
-        self.assertEqual(len(d.packets), 40)
+        self.assertEqual(len(d.packets), 20)
         self.assertEqual(len(d.observations), 2)
         self.assertTrue(r.ros_operator._arrival_pending)
 
@@ -396,19 +405,22 @@ class TailExecutionTests(unittest.TestCase):
         from mmengine import Config
         cfg = Config.fromfile(ROOT / 'configs/a10/a10_dual_openpi_remote.py')
         self.assertNotIn('trajectory_planner', cfg.inference)
-        self.assertTrue(cfg.inference.follower_tail.enabled)
+        self.assertFalse(cfg.inference.follower_tail.enabled)
         self.assertNotIn('mean_compensation', cfg.inference.follower_tail)
         self.assertNotIn('point_repeat', cfg.inference.follower_tail)
         self.assertNotIn('point_stride', cfg.inference.follower_tail)
         self.assertEqual(cfg.inference.mode, 'motion')
         self.assertEqual(cfg.inference.cycles, 1_000_000)
         self.assertEqual(cfg.inference.remote_inference.timeout_s, 3600)
-        self.assertEqual(cfg.operator.joint_follower_velocity_percent, 12)
-        self.assertEqual(cfg.operator.motor_acceleration_deg_s2, 375)
+        self.assertIsNone(cfg.operator.joint_follower_velocity_percent)
+        self.assertIsNone(cfg.operator.motor_acceleration_deg_s2)
+        self.assertIsNone(cfg.inference.manual_speed_percent)
+        self.assertTrue(cfg.inference.timed_aj.enabled)
+        self.assertTrue(cfg.inference.timed_aj.network_ready)
         self.assertEqual(cfg.grippers.left.drop_alarm_policy, 'warn')
         self.assertEqual(cfg.grippers.right.drop_alarm_policy, 'warn')
-        self.assertEqual(cfg.inference.follower_tail.stable_duration_s, 0)
-        self.assertIsNone(cfg.inference.follower_tail.speed_tolerance_deg_s)
+        self.assertEqual(cfg.inference.follower_tail.stable_duration_s, .04)
+        self.assertEqual(cfg.inference.follower_tail.speed_tolerance_deg_s, .5)
         self.assertIs(cfg.operator.joint_follower_filter, False)
         self.assertEqual(cfg.inference.execute_horizon, 20)
 

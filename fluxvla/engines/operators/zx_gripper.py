@@ -136,6 +136,22 @@ class ZXGripperState:
         return bool(self.alarm_a or self.alarm_b)
 
 
+@dataclass(frozen=True)
+class ZXGripperMotionState:
+    """One read of 0x0418..0x041B; contains no alarm/enable measurement.
+
+    target_raw is the last acknowledged host command, not device readback.
+    """
+
+    device_id: int
+    position_raw: int
+    position: float
+    target_raw: int | None
+    speed_raw: int
+    current_raw: int
+    timestamp: float
+
+
 def has_blocking_alarm(alarm_a, alarm_b, *, drop_alarm_policy='stop'):
     """Only the documented B/0x1000 drop bit may be downgraded; retain raw alarms."""
     if drop_alarm_policy not in ('stop', 'warn'):
@@ -322,6 +338,28 @@ class ZXGripper:
                                   status, alarm_a, alarm_b, bool(enabled), speed,
                                   current, time.monotonic(), completion)
 
+    def read_motion_state(self, device_id=1):
+        """Read position, speed and current in one RTU exchange, without retry.
+
+        A missed sample propagates to the streaming worker, which keeps the
+        previous sample's timestamp and skips the failed polling slot.
+        """
+        device_id = _integer(device_id, 'device_id', 1, 247)
+        with self._io_lock:
+            body = struct.pack('>BBHH', device_id, 3, 0x0418, 4)
+            try:
+                response = self._transaction_locked(device_id, body, read_count=4)
+            except ZXGripperCRCError as exc:
+                self.crc_error_count += 1
+                self.last_crc_error = str(exc)
+                raise
+            high, low, speed, current = struct.unpack('>4H', response[3:-2])
+            raw = (high << 16) | low
+            command = self._commands.get(device_id)
+            return ZXGripperMotionState(device_id, raw, raw / self.max_position_raw,
+                                        command[0] if command else None,
+                                        speed, current, time.monotonic())
+
     def disable(self, device_id=1):
         """Explicit torque release; may drop an object. Never invoked by timeouts."""
         with self._io_lock:
@@ -341,7 +379,8 @@ class ZXGripper:
             device_id, int(position * self.max_position_raw + 0.5), **options)
 
     def set_position_raw(self, device_id, position, *, speed=10, torque=60,
-                         wait=False, move_timeout=10, motion_deadline_s=None, motion_cancel_event=None, feedback=None):
+                         wait=False, move_timeout=10, motion_deadline_s=None, motion_cancel_event=None,
+                         feedback=None, compact_trigger=False):
         """Update the latest target, returning a command ID or (wait=True) state.
 
         wait=False waits for bounded serial ACKs only, not mechanical motion.
@@ -350,6 +389,8 @@ class ZXGripper:
         before motion writes. Expiry does not undo a target already triggered.
         Teleop may reuse its just-read feedback to avoid another alarm read
         and an enable write when the device is already confirmed enabled.
+        compact_trigger is opt-in for the onsite units with a self-clearing
+        trigger: enabled feedback permits one combined parameter/trigger write.
         """
         device_id = _integer(device_id, 'device_id', 1, 247)
         position = _integer(position, 'position', 0, self.max_position_raw)
@@ -357,6 +398,8 @@ class ZXGripper:
         torque = _integer(torque, 'torque', 1, 100)
         if type(wait) is not bool:
             raise ValueError('wait must be bool')
+        if type(compact_trigger) is not bool:
+            raise ValueError('compact_trigger must be bool')
         _wait_timeout(move_timeout)
         if motion_deadline_s is not None and (isinstance(motion_deadline_s, bool) or
                 not isinstance(motion_deadline_s, Real) or not math.isfinite(motion_deadline_s)):
@@ -381,15 +424,21 @@ class ZXGripper:
             if previous is None or previous[:3] != signature:
                 # An uncertain partial write must not leave a reusable cached target.
                 self._commands.pop(device_id, None)
-                self.write_register(device_id, 0x0108, 0)
-                check_deadline()
-                self.write_registers(device_id, 0x0102,
-                                     (position >> 16, position & 0xFFFF, speed, torque, 1000, 1000))
-                check_deadline()
-                if feedback is None or not feedback.enabled:
-                    self.write_register(device_id, 0x0100, 1)
-                check_deadline()
-                self.write_register(device_id, 0x0108, 1)
+                parameters = (position >> 16, position & 0xFFFF, speed, torque, 1000, 1000)
+                if compact_trigger and feedback is not None and feedback.enabled:
+                    # Both onsite units auto-clear 0x0108 after accepting a
+                    # trigger. One acknowledged frame loads parameters and
+                    # triggers, including when replacing a moving target.
+                    self.write_registers(device_id, 0x0102, (*parameters, 1))
+                else:
+                    self.write_register(device_id, 0x0108, 0)
+                    check_deadline()
+                    self.write_registers(device_id, 0x0102, parameters)
+                    check_deadline()
+                    if feedback is None or not feedback.enabled:
+                        self.write_register(device_id, 0x0100, 1)
+                    check_deadline()
+                    self.write_register(device_id, 0x0108, 1)
                 self._command_sequence += 1
                 self._commands[device_id] = (*signature, self._command_sequence, time.monotonic())
             command_id = self._commands[device_id][3]

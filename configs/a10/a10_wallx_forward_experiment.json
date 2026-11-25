@@ -1,0 +1,28 @@
+{
+  "embodiment": "teletwin_desktop/gripper-g",
+  "verified": false,
+  "purpose": "Read-only experiment: per-base origins, both model axes aligned with the forward rig frame",
+  "model_frame_from_rig": {
+    "left": [0.0, -0.575, 0.0, 0.0, 0.0, 0.0, 1.0],
+    "right": [0.0, 0.575, 0.0, 0.0, 0.0, 0.0, 1.0]
+  },
+  "model_ee_in_grasp_m_xyzw": {
+    "left": [0.0, 0.0, -0.295, 0.0, 0.0, 0.0, 1.0],
+    "right": [0.0, 0.0, -0.295, 0.0, 0.0, 0.0, 1.0]
+  },
+  "model_gripper_from_closure": {
+    "left": [1.526, 0.0],
+    "right": [1.526, 0.0]
+  },
+  "assumptions": [
+    "Each model origin is its own physical A10 base centre; both axis sets match the rig: x forward, y left, z up",
+    "This deliberately removes the A10 right native base's 180 degree yaw from model positions AND orientations",
+    "Model EE is represented by A10 tool0, not its grasp centre",
+    "A10 raw closure fraction maps linearly to model gripper opening in radians",
+    "The native-base trial produced state_coordinate_origin_ood and a 0.305m right first-step jump; this is a hypothesis for read-only validation, not a calibration"
+  ],
+  "sources": [
+    "https://github.com/X-Square-Robot/xr-harness/blob/main/xr-cerebellum/docs/reference/VLA_POLICY_FRAMES.md",
+    "work_dirs/a10/wallx_inference/20261125_180300_ee64d388/events.jsonl"
+  ]
+}

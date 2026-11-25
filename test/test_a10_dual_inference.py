@@ -393,6 +393,7 @@ class BridgeTests(unittest.TestCase):
         d.cancel = threading.Event()
         d.feedback = {}
         d.error = None
+        d.log = lambda *args, **kwargs: None
         d.gripper_faults, d.gripper_pause_required = {}, False
         row = np.zeros(14)
         row[6] = 0.25
@@ -417,10 +418,10 @@ class BridgeTests(unittest.TestCase):
                 self.done = True
 
         d.quit = Quit()
-        d._gripper_worker("left", dict(device_id=1, speed=5, torque=60))
+        d._gripper_worker("left", dict(device_id=1, speed=5, torque=60, io_hz=100))
         self.assertIsNone(d.error)
         self.assertEqual(writes[0][0], (1, 2250))
-        self.assertAlmostEqual(waits[0], 0.05, delta=0.01)
+        self.assertAlmostEqual(waits[0], .01, delta=.005)
         self.assertIs(writes[0][1]["motion_cancel_event"], d.cancel)
         writes.clear()
         d.cancel.set()
@@ -481,8 +482,10 @@ class BridgeTests(unittest.TestCase):
                 self.assertIsNone(d.error)
                 self.assertEqual(grip.read_state.call_count, 3)
                 self.assertEqual(attempts, [0, 4500])
-                d.log.assert_called_once()
-                self.assertEqual(d.log.call_args.kwargs["cancelled"], cancelled)
+                discarded = [call for call in d.log.call_args_list
+                             if call.args[0] == "gripper_target_discarded"]
+                self.assertEqual(len(discarded), 1)
+                self.assertEqual(discarded[0].kwargs["cancelled"], cancelled)
 
     def test_gripper_faults_keep_polling_and_latch_pause(self):
         from types import SimpleNamespace
@@ -754,11 +757,17 @@ class ConfiguredInferenceTests(unittest.TestCase):
         base = Config.fromfile(ROOT / "configs/a10/a10_dual_arm_operator.py")
         config = Config.fromfile(ROOT / "configs/a10/a10_dual_openpi_remote.py")
         self.assertEqual(base.operator.joint_follower_velocity_percent, 100)
-        self.assertEqual(config.operator.joint_follower_velocity_percent, 12)
-        self.assertEqual(config.inference.manual_speed_percent, 100)
-        self.assertTrue(config.inference.follower_tail.enabled)
+        self.assertIsNone(config.operator.joint_follower_velocity_percent)
+        self.assertIsNone(config.inference.manual_speed_percent)
+        self.assertFalse(config.inference.follower_tail.enabled)
         config.inference.cfg = config
         runner = build_runner_from_cfg(config.inference)
+        runner.run_setup()
+        runner.settings['manual_speed_percent'] = 70
+        with self.assertRaisesRegex(ValueError, 'preserve site'):
+            runner.run_setup()
+        # Legacy path still validates its optional explicit speed override.
+        runner.settings['timed_aj'] = dict(enabled=False)
         for percent in (None, 1, 70, 100):
             runner.settings["manual_speed_percent"] = percent
             runner.run_setup()

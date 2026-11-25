@@ -38,11 +38,17 @@ class A10DualOperator(BaseOperator):
         self.last_target = self.last_target_step = None
         self._last_packet_send_s = None
         self._last_packet_clock = None
+        self.stream_final = False
         from ..utils.a10_follower_tail import tail_config
         self.tail_config = tail_config(self.settings.get('follower_tail'))
         self._lifecycle_lock = threading.RLock()
         if devices is not None:
             self._attach_feedback()
+
+    @property
+    def timed_enabled(self):
+        # simulate remains the existing hardware-free model loop simulator.
+        return self.mode == 'motion' and (self.settings.get('timed_aj') or {}).get('enabled', False)
 
     def _attach_feedback(self):
         self.devices.feedback_callback = self._on_feedback
@@ -138,38 +144,47 @@ class A10DualOperator(BaseOperator):
             self._trajectory_lock.release()
 
     def _execute_rows(self, rows, dt):
+        if self.timed_enabled:
+            return self._send_rows(rows, dt)
         if self.tail_config['enabled']:
             return self._execute_follower_tail(rows, dt)
         return self._send_rows(rows, dt)
 
     def _send_rows(self, rows, dt):
         n = len(rows)
-        repeat = 2
         self._traj_stop_event.clear()
         self.start_follower()
         period = dt
         sent = 0
+        # A new block may follow an arbitrary inference/hold gap. Only its
+        # local 30 Hz pacing starts here; target numbering stays in the client.
         start = self.clock.monotonic()
         self.log('execution_start', cycle=self.cycle, started_s=start, selected=n)
         slot = 0
         while True:
             if self._traj_stop_event.is_set():
                 raise InterruptedError('Dual A10 trajectory cancelled')
+            checking = self.clock.monotonic()
             deadline = start + slot * period
             self.clock.sleep(max(0., deadline - self.clock.monotonic()))
-            if self.clock.monotonic() - deadline > self.settings['max_send_lag_s']:
+            lag_limit = self.settings['max_send_lag_s']
+            if self.clock.monotonic() - deadline > lag_limit:
                 raise RuntimeError('Joint send deadline missed')
-            checking = self.clock.monotonic()
-            self.devices.check()
+            if not self.timed_enabled:
+                checking = self.clock.monotonic()
+                self.devices.check()
             checked = self.clock.monotonic()
+            if self.timed_enabled:
+                checking = checked  # There was no feedback query in this slot.
             lag = checked - deadline
-            if lag > self.settings['max_send_lag_s']:
+            if lag > lag_limit:
                 self.log('send_deadline_missed', cycle=self.cycle, frame=sent + 1,
                          phase='feedback_check', check_s=checked - checking, lag_s=lag)
                 raise RuntimeError('Feedback check exceeded joint send deadline')
             row = rows[sent]
             send_started = self.clock.monotonic()
-            timing = self.devices.send(row)
+            timing = (self.devices.send(row, final=self.stream_final and sent == n - 1) if self.timed_enabled
+                      else self.devices.send(row))
             finished = self.clock.monotonic()
             wire_time = timing.get('udp_send_started_s') if isinstance(timing, dict) else None
             self._last_packet_send_s = finished if wire_time is None else wire_time
@@ -192,13 +207,16 @@ class A10DualOperator(BaseOperator):
                      send_started_s=send_started, send_finished_s=finished,
                      check_s=checked - checking, send_s=finished - send_started,
                      check_lag_s=lag, send_hz=1/dt,
-                     point_role=('policy' if self.tail_config['enabled'] else None),
-                     policy_frame=(min(20, (sent-1)//repeat+1)
-                                   if self.tail_config['enabled'] else None),
-                     repeat_index=((sent-1)%repeat+1
-                                   if self.tail_config['enabled'] else None),
+                     point_role=('policy' if self.timed_enabled or self.tail_config['enabled'] else None),
+                     policy_frame=(sent if self.timed_enabled or self.tail_config['enabled'] else None),
+                     repeat_index=(1 if self.timed_enabled or self.tail_config['enabled'] else None),
+                     stream_id=timing.get('stream_id') if isinstance(timing, dict) else None,
+                     stream_index=timing.get('index') if isinstance(timing, dict) else None,
+                     final=timing.get('final') if isinstance(timing, dict) else None,
                      udp_send_started_s=timing.get('udp_send_started_s') if isinstance(timing, dict) else None,
                      udp_send_finished_s=timing.get('udp_send_finished_s') if isinstance(timing, dict) else None)
+            if self.timed_enabled and self._last_packet_send_s - deadline > lag_limit:
+                raise RuntimeError('timed_aj UDP submission exceeded send deadline; no retry')
             done = sent >= n
             if done:
                 self.trace.arm(self.cycle, row, finished)
@@ -208,10 +226,19 @@ class A10DualOperator(BaseOperator):
         self.log('execution_end', cycle=self.cycle, sent=sent,
                  finished_s=self.clock.monotonic(), physical_arrival_confirmed=False)
 
+    def finish_timed_stream(self):
+        """Only the true end of a run drains final before releasing the Plan."""
+        if not self.timed_enabled or not self.attempted or not self.stream_final:
+            return
+        self._arrival_pending = True
+        self._wait_tail_arrival(self.last_target)
+        self.stop_trajectory('stream_finished')
+        self._arrival_pending = False
+
     def _execute_follower_tail(self, rows, dt):
         if rows.shape != (20, 14) or not np.isfinite(rows).all():
             raise ValueError('Follower arrival mode requires twenty finite [14] targets')
-        if self.mode == 'motion' and self.config['operator'].get('joint_follower_filter') is not False:
+        if self.mode == 'motion' and not self.timed_enabled and self.config['operator'].get('joint_follower_filter') is not False:
             raise ValueError('Follower arrival mode requires joint_follower_filter=False')
         packets = rows.copy()
         origin = self.last_frame['qpos']
@@ -229,12 +256,10 @@ class A10DualOperator(BaseOperator):
             targets = np.rad2deg(packets[:, JOINTS])
             if np.any(targets < bounds[0]) or np.any(targets > bounds[1]):
                 raise ValueError('Follower target exceeds motor position limits; chunk rejected')
-        repeat = 2
-        packets = np.repeat(packets, repeat, axis=0)
         self.log('follower_tail', cycle=self.cycle, policy_points=20, total_packets=len(packets),
-                 point_repeat=repeat, policy_hz=1/dt, packet_hz=repeat/dt, final_target=rows[-1])
+                 point_repeat=1, policy_hz=1/dt, packet_hz=1/dt, final_target=rows[-1])
         self._arrival_pending = True
-        self._send_rows(packets, dt/repeat)
+        self._send_rows(packets, dt)
         # Keep follower running until it has consumed the tail and reached it.
         # Stopping earlier can freeze its target at an older queued waypoint.
         self._wait_tail_arrival(rows[-1])
@@ -255,6 +280,9 @@ class A10DualOperator(BaseOperator):
         cfg = self.tail_config
         started = self.clock.monotonic()
         monitor = ArrivalMonitor(target[JOINTS], started, cfg)
+        command_cfg = dict(cfg, position_tolerance_deg=.3, speed_tolerance_deg_s=.5,
+                           stable_duration_s=.04)
+        command_monitor = ArrivalMonitor(target[JOINTS], started, command_cfg)
         first_position_stamp = None
         self.log('arrival_wait_start', cycle=self.cycle, target=target, phase='before_stop', **cfg)
         try:
@@ -262,11 +290,28 @@ class A10DualOperator(BaseOperator):
                 if self._traj_stop_event.is_set():
                     raise InterruptedError('Arrival wait cancelled')
                 feedback = self.devices.arrival_feedback()
-                if (feedback['has_error'] is not False or feedback['follower_active'] is not True
-                        or feedback.get('follower_mode') != 'Axis' or feedback['activation'] != 'Enabled'):
+                running = (feedback.get('operation_mode') == 'Manual' and feedback.get('robot_status') == 'Normal'
+                           if self.timed_enabled else feedback['follower_active'] is True
+                           and feedback.get('follower_mode') == 'Axis')
+                if (feedback['has_error'] is not False or not running or feedback['activation'] != 'Enabled'):
+                    if self.timed_enabled:
+                        raise RuntimeError('Robot health or timed stream invalid during final drain')
                     raise RuntimeError('Robot fault or active Axis follower lost during arrival wait')
                 arrived, error, speed = monitor.observe(
                     feedback['joints'], feedback['stamp'], self.clock.monotonic())
+                if self.timed_enabled:
+                    if not feedback['reference_finished']:
+                        monitor = ArrivalMonitor(target[JOINTS], started, cfg)
+                        command_monitor = ArrivalMonitor(target[JOINTS], started, command_cfg)
+                        arrived = False
+                    else:
+                        commands_arrived, command_error, command_speed = command_monitor.observe(
+                            feedback['command_joints'], feedback['stamp'], self.clock.monotonic())
+                        self.log('timed_completion_gate', cycle=self.cycle,
+                                 status=feedback['timed_status'], command_error_deg=command_error,
+                                 command_speed_deg_s=command_speed, actual_arrived=arrived,
+                                 command_arrived=commands_arrived)
+                        arrived = arrived and commands_arrived
                 self.log('arrival_feedback', cycle=self.cycle, received_monotonic_s=feedback['stamp'],
                          actual_joints_rad=feedback['joints'], max_error_deg=error,
                          max_speed_deg_s=speed, motion=feedback['motion'], phase='before_stop',
@@ -282,7 +327,8 @@ class A10DualOperator(BaseOperator):
                 if arrived:
                     self.log('target_arrival_confirmed', cycle=self.cycle,
                              elapsed_s=self.clock.monotonic() - started, max_error_deg=error,
-                             max_speed_deg_s=speed, physical_arrival_confirmed=True, follower_active=True,
+                             max_speed_deg_s=speed, physical_arrival_confirmed=True,
+                             follower_active=feedback['follower_active'],
                              last_packet_sent_s=self._last_packet_send_s,
                              after_last_packet_s=feedback['stamp']-self._last_packet_send_s,
                              extra_wait_after_position_s=feedback['stamp']-first_position_stamp)
@@ -302,7 +348,9 @@ class A10DualOperator(BaseOperator):
                 raise InterruptedError('Arrival stop confirmation cancelled')
             # Query immediately; only wait another period if the sample is not usable.
             feedback = self.devices.arrival_feedback()
-            if (feedback['has_error'] is not False or feedback['follower_active'] is not False
+            inactive = (feedback['timed_status']['active'] is False if self.timed_enabled
+                        else feedback['follower_active'] is False)
+            if (feedback['has_error'] is not False or not inactive
                     or feedback['activation'] != 'Enabled'):
                 raise RuntimeError('Robot fault or follower reactivated after arrival stop')
             stamp, now = feedback['stamp'], self.clock.monotonic()
@@ -326,6 +374,8 @@ class A10DualOperator(BaseOperator):
                          follower_active=False, phase='after_stop',
                          after_last_packet_s=stamp-self._last_packet_send_s)
                 if not arrived:
+                    if self.timed_enabled:
+                        raise RuntimeError('Actual endpoint moved outside tolerance after timed_aj stop')
                     logging.getLogger(__name__).warning(
                         'A10 推理第 %d 轮停稳后最大关节误差 %.3f°，超过 %.3f°，按实测位姿继续推理。',
                         self.cycle + 1, error, tolerance)
@@ -388,6 +438,8 @@ class A10DualOperator(BaseOperator):
             if not confirmed:
                 raise RuntimeError('Follower stop unconfirmed')
             self.attempted = False
+            if self.timed_enabled:
+                self.last_target = self.last_target_step = None
 
     def is_trajectory_running(self):
         return getattr(self, '_trajectory_running', False)

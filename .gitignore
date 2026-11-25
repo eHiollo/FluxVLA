@@ -99,3 +99,6 @@ FluxBisim/
 /知行.zip
 /FluxVLA
 /.~lock.*#
+
+# Personal Wall-X credentials (never commit)
+/.env.wallx

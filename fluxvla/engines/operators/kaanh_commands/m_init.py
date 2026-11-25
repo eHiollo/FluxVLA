@@ -4,7 +4,6 @@ import math
 import threading
 import time
 from collections.abc import Mapping
-from contextlib import ExitStack
 
 import numpy as np
 
@@ -54,12 +53,11 @@ def configure_init_motion(robot, *, joint_dofs, init_position,
         raise ValueError('Init grippers require a nonnegative finite width in mm per arm')
     defaults = dict(publish_hz=30., tolerance_rad=.01, arrival_timeout_s=60., feedback_interval_s=.1)
     options = {} if init_motion is None else dict(init_motion)
-    acceleration = options.pop('motor_acceleration_deg_s2', None)
+    # Accept old profiles without inspecting or changing site motor limits.
+    options.pop('motor_acceleration_deg_s2', None)
     if set(options) - set(defaults):
         raise ValueError(f'Unknown init_motion options: {set(options) - set(defaults)}')
     defaults.update(options)
-    if acceleration is not None:
-        defaults['motor_acceleration_deg_s2'] = acceleration
     if any(isinstance(v, bool) or not math.isfinite(v) or v <= 0
            for v in defaults.values()):
         raise ValueError('init_motion settings must be positive and finite')
@@ -74,7 +72,7 @@ def initialize_grippers(robot, targets_mm, *, cancel_event=None):
     return open_configured_grippers(robot, cancel_event=cancel_event)
 
 
-def move_to_init(robot, progress=None, *, cancel_event=None, temporary_acceleration=False):
+def move_to_init(robot, progress=None, *, cancel_event=None):
     """Return to init, then restore the prior follower mode and activation."""
     configure_init_motion(
         robot, joint_dofs=robot.joint_dofs,
@@ -102,19 +100,11 @@ def move_to_init(robot, progress=None, *, cancel_event=None, temporary_accelerat
                   control_restore_error=None)
     robot.last_init_motion = result
     failure = None
-    acceleration_scope = ExitStack()
     try:
         robot._claim_init_motion()
         claimed = True
         check_cancelled()
-        acceleration = robot.init_motion.get('motor_acceleration_deg_s2')
-        original_state = None
-        if temporary_acceleration and acceleration is not None:
-            from .m_init_acceleration import temporary_init_acceleration
-            original_state = acceleration_scope.enter_context(temporary_init_acceleration(
-                robot, acceleration, may_reenable=lambda: result['stop_error'] is None,
-                progress=progress, cancel_event=cancel_event))
-        control_restore = robot._prepare_init_motion(original_state=original_state)
+        control_restore = robot._prepare_init_motion()
         result['original_control_state'] = control_restore
         check_cancelled()
         result['phase'] = 'setting_speed'
@@ -139,9 +129,7 @@ def move_to_init(robot, progress=None, *, cancel_event=None, temporary_accelerat
         if progress:
             progress('正在启动关节 follower；确认前不发送目标。输入 stop 可取消。')
         settings = robot.init_motion
-        acceleration = settings.get('motor_acceleration_deg_s2')
-        follower_options = {} if acceleration is None else dict(motor_acceleration_deg_s2=acceleration)
-        robot.start_follower(mode='joint', **follower_options)
+        robot.start_follower(mode='joint')
         deadline = time.monotonic() + settings['arrival_timeout_s']
         result['phase'] = 'sending'
         check_cancelled()
@@ -251,15 +239,12 @@ def move_to_init(robot, progress=None, *, cancel_event=None, temporary_accelerat
                                                       result['joint_packets_sent']) from restore_error
                         raise
             finally:
+                robot.command_mode = previous_mode
                 try:
-                    acceleration_scope.close()
+                    if claimed:
+                        robot._release_init_motion()
                 finally:
-                    robot.command_mode = previous_mode
-                    try:
-                        if claimed:
-                            robot._release_init_motion()
-                    finally:
-                        robot._init_motion_lock.release()
+                    robot._init_motion_lock.release()
     result['completed'] = (result['arms_arrived'] and result['follower_stopped']
                            and result['speed_restored'] and result['control_state_restored'])
     if not result['completed']:
@@ -274,7 +259,7 @@ def configure_parser(parser):
 
 def execute(robot, args, output):
     output('执行 FluxVLA 本地 m_init，返回机器人定义的初始位置。')
-    result = move_to_init(robot, progress=output, temporary_acceleration=True)
+    result = move_to_init(robot, progress=output)
     output('机械臂初始化到位（实际关节反馈已确认），原 follower 状态、控制模式及速度倍率已恢复。')
     output('双夹爪已触发打开（不等待夹爪到位）。' if result['grippers_initialized'] else
            '夹爪初始化尚未执行完毕（未配置夹爪或已跳过报警侧）。')

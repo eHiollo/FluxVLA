@@ -31,6 +31,10 @@ def free_port():
 class SingleClientController(FakeController):
     def __init__(self):
         super().__init__()
+        # Live VR retains its own acceleration preflight. Model the configured
+        # SDK limits so m_init restoration can be tested alongside VR takeover.
+        self.command_replies['read_motor --all'] = dict(ret_code=0, ret_context=[
+            dict(motion_type='rotatory', max_acc=1000., min_acc=-1000.) for _ in range(12)])
         self.current_connections = self.total_connections = self.max_connections = 0
 
     def handle(self, ws):

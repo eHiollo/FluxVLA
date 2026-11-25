@@ -1,0 +1,9 @@
+{
+  "archive": "timed_aj_upstream_protocol.zip",
+  "sha256": "0b2877ff5719ca1b709bb40b1b1293260c5a2828d3c08c190cb8fc8d7569829d",
+  "files": {
+    "FluxVLA新版接入协议.txt": "e745af4736c93f8201b167859fea5aabf0fe4861e8ba8cff9fe0fb60218b4ad5",
+    "timed_client.py": "6cebc061e84cde72ce2c36fe5d4c21cfa830572f32d0e085e83e04e17c54b2c6",
+    "client.py": "2ffa595cdabca3df8a0b20928e06bedaa6c37210a23ce3ffc9bb1a238cd577b7"
+  }
+}

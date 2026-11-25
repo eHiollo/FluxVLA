@@ -8,7 +8,8 @@ No recording or VR calibration. m_init supports the full joint follower group;
 m_init explicitly opens both configured ZX grippers while returning the arms.
 """
 
-console_init_motion = dict(motor_acceleration_deg_s2=375.)
+# m_init preserves the site motor configuration, including acceleration.
+console_init_motion = dict()
 
 operator = dict(
     init_grippers_config='{{fileDirname}}/a10_dual_devices.py',

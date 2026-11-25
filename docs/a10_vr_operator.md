@@ -37,6 +37,8 @@ python scripts/teleoperate.py --config configs/a10/a10_dual_vr.py
 
 ## 双臂电机加速度
 
-遥操作与 `m_init` 使用 `operator.motor_acceleration_deg_s2=1000`，推理使用375，单位为°/s²。
+遥操作的独立加速度预检继续由 `operator.motor_acceleration_deg_s2=1000` 配置。
+`m_init` 不读取、核对、改写或恢复电机加速度，旧init配置中的加速度字段忽略；
+关节回位及原Cart/Axis模式恢复都沿用现场设置。推理timed_aj的动态上限由下游固定A管理。
 启动运动前回读匹配；不匹配时仅在厂家权限、手动、未使能、Stopped、follower退出且程序Unloaded时修正并核验。
 修正后保持未使能，需要手动使能后重新启动；程序不自动使能。完整操作见 [推理与加速度说明](a10_dual_fold.md)。

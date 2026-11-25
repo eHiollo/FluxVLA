@@ -210,7 +210,7 @@ class GripperFault(RuntimeError):
 
 
 class LiveDevices:
-    def __init__(self, config, log, motion=False):
+    def __init__(self, config, log, motion=False, *, command_mode="joint"):
         from fluxvla.engines.operators.a10_operator import A10Operator
         from fluxvla.engines.operators.camera_operator import BufferedCameraOperator
         from fluxvla.engines.operators.zx_gripper import ZXGripper
@@ -219,7 +219,9 @@ class LiveDevices:
         self.cfg = config
         settings = dict(config["operator"])
         settings.pop("type", None)
-        settings.update(command_mode="joint", allow_motion=motion, cameras=None)
+        if command_mode not in ("joint", "cartesian"):
+            raise ValueError("command_mode must be joint or cartesian")
+        settings.update(command_mode=command_mode, allow_motion=motion, cameras=None)
         settings["shared_control"] = dict(settings["shared_control"], role="inference")
         if settings["shared_control"].get("mode") != "managed":
             raise ValueError("Managed shared follower required")
@@ -244,7 +246,7 @@ class LiveDevices:
         self._speed_restore = None
         try:
             self.robot.connect()
-            if motion:
+            if motion and command_mode == "joint" and not self.timed_enabled:
                 self.robot.ensure_motor_acceleration()
             self.cameras.start()
             for side, device in config["grippers"].items():
@@ -255,7 +257,7 @@ class LiveDevices:
                 grip = ZXGripper(
                     device["port"],
                     baudrate=device["baudrate"],
-                    timeout=0.2,
+                    timeout=device.get("serial_timeout_s", .2),
                     max_position_raw=9000,
                     expected_usb_serial=identity["serial"],
                     expected_usb_interface=identity["usb_interface"],
@@ -285,71 +287,114 @@ class LiveDevices:
 
     def _gripper_worker(self, side, device):
         from fluxvla.engines.operators.zx_gripper import (
-            ZXGripperError, ZXGripperInputExpired, has_blocking_alarm,
+            ZXGripperCommunicationError, ZXGripperError, ZXGripperInputExpired,
+            has_blocking_alarm,
         )
 
         grip = self.grips[side]
+        motion_only = device.get("feedback_mode", "full") == "motion"
+        health = None
+        health_received_s = None
         last_warning = None
+        last_command_id = None
+        period = 1 / device.get("io_hz", 20.)
         try:
             while not self.quit.is_set():
                 started = time.monotonic()
                 try:
                     grip.connect()
-                    state = grip.read_state(device["device_id"])
-                    if state.has_error and has_blocking_alarm(
-                        state.alarm_a, state.alarm_b,
-                        drop_alarm_policy=device.get("drop_alarm_policy", "stop"),
-                    ):
-                        raise ZXGripperError(
-                            f"{side} gripper alarm A=0x{state.alarm_a:04X} B=0x{state.alarm_b:04X}"
-                        )
-                    warning = (state.alarm_a, state.alarm_b) if state.has_error else None
-                    if warning and warning != last_warning:
-                        self.log("gripper_alarm_warning", side=side, alarm_a=warning[0], alarm_b=warning[1])
-                        print(f"[A10] {side} gripper warning A=0x{warning[0]:04X} B=0x{warning[1]:04X}; continuing", flush=True)
-                    last_warning = warning
+                    if motion_only and health is not None:
+                        state = grip.read_motion_state(device["device_id"])
+                        sampled_health = False
+                    else:
+                        state = grip.read_state(device["device_id"])
+                        health, health_received_s = state, time.monotonic()
+                        sampled_health = True
+                        if state.has_error and has_blocking_alarm(
+                            state.alarm_a, state.alarm_b,
+                            drop_alarm_policy=device.get("drop_alarm_policy", "stop"),
+                        ):
+                            raise ZXGripperError(
+                                f"{side} gripper alarm A=0x{state.alarm_a:04X} B=0x{state.alarm_b:04X}"
+                            )
+                        warning = (state.alarm_a, state.alarm_b) if state.has_error else None
+                        if warning and warning != last_warning:
+                            self.log("gripper_alarm_warning", side=side, alarm_a=warning[0], alarm_b=warning[1])
+                            print(f"[A10] {side} gripper warning A=0x{warning[0]:04X} B=0x{warning[1]:04X}; continuing", flush=True)
+                        last_warning = warning
                 except ZXGripperError as exc:
+                    with self.lock:
+                        previous = self.feedback.get(side)
+                    # A bad motion sample is dropped, never replaced with a
+                    # fresh timestamp or retried. Prolonged loss still pauses.
+                    if (motion_only and health is not None
+                            and isinstance(exc, ZXGripperCommunicationError)
+                            and previous is not None
+                            and time.monotonic() - previous[1] <=
+                            self.cfg["bridge"].get("max_gripper_age_s", .2)):
+                        self.log("gripper_feedback_dropped", side=side, error=str(exc))
+                        self.quit.wait(max(0., period - (time.monotonic() - started)))
+                        continue
                     self._gripper_fault(side, exc)
+                    health = None
                     grip.disconnect()
                     self.quit.wait(0.2)
                     continue
+                received_s = time.monotonic()
                 with self.lock:
                     self.gripper_faults.pop(side, None)
-                    self.feedback[side] = (
-                        state.position_raw,
-                        time.monotonic(),
-                        state.enabled,
-                    )
+                    # In motion-only mode enabled is the startup check. Its
+                    # age is recorded separately, never presented as fresh.
+                    self.feedback[side] = (state.position_raw, received_s, health.enabled)
                     target = self.target
+                self.log("gripper_feedback", side=side,
+                         position_raw=state.position_raw, received_s=received_s,
+                         target_raw=getattr(state, "target_raw", None),
+                         speed_raw=getattr(state, "speed_raw", None),
+                         current_raw=getattr(state, "current_raw", None),
+                         enabled=health.enabled if sampled_health else None,
+                         health_received_s=health_received_s,
+                         status=getattr(state, "status", None),
+                         alarm_a=getattr(state, "alarm_a", None),
+                         alarm_b=getattr(state, "alarm_b", None))
                 if target is not None and not self.cancel.is_set():
                     row, deadline = target
                     index = 6 if side == "left" else 13
                     if time.monotonic() < deadline:
-                        if not state.enabled:
+                        if not health.enabled:
                             self._gripper_fault(side, "Gripper must already be enabled; no automatic enable")
                             self.quit.wait(0.2)
                             continue
                         with self.write_locks[side]:
                             try:
-                                grip.set_position_raw(
+                                write_started = time.monotonic()
+                                options = (dict(compact_trigger=True)
+                                           if device.get("compact_trigger", False) else {})
+                                command_id = grip.set_position_raw(
                                     device["device_id"],
                                     int(round(row[index] * 9000)),
-                                    speed=device["speed"],
-                                    torque=device["torque"],
-                                    feedback=state,
+                                    speed=device["speed"], torque=device["torque"],
+                                    feedback=health,
                                     motion_deadline_s=deadline,
-                                    motion_cancel_event=self.cancel,
+                                    motion_cancel_event=self.cancel, **options,
                                 )
+                                if command_id != last_command_id:
+                                    self.log("gripper_command", side=side,
+                                             target_raw=int(round(row[index] * 9000)),
+                                             command_id=command_id,
+                                             write_started_s=write_started,
+                                             acknowledged_s=time.monotonic(),
+                                             speed=device["speed"], torque=device["torque"])
+                                last_command_id = command_id
                             except ZXGripperInputExpired as exc:
-                                # stop() can cancel an in-flight write at each
-                                # chunk boundary. Keep feedback polling alive;
-                                # never extend or retry the expired write here.
                                 self.log("gripper_target_discarded", side=side,
                                          error=str(exc), cancelled=self.cancel.is_set())
                             except ZXGripperError as exc:
                                 self._gripper_fault(side, exc)
+                                health = None
                                 grip.disconnect()
-                self.quit.wait(max(0, 0.05 - (time.monotonic() - started)))
+                # No catch-up burst after a slow read/write; use latest target.
+                self.quit.wait(max(0., period - (time.monotonic() - started)))
         except BaseException as exc:
             self.error = exc
             self.cancel.set()
@@ -430,6 +475,10 @@ class LiveDevices:
             image_history=history,
         )
 
+    @property
+    def timed_enabled(self):
+        return (self.cfg['bridge'].get('timed_aj') or {}).get('enabled', False)
+
     def start(self):
         self._checked_state = None
         if not self.motion:
@@ -437,9 +486,24 @@ class LiveDevices:
         with self.lock:
             if self.gripper_pause_required:
                 raise GripperFault("Gripper fault before follower start")
-        self._apply_manual_speed()
-        self.attempted = True
-        self.robot.start_follower("joint")
+        if self.timed_enabled:
+            from fluxvla.engines.communication.a10_timed_aj import timed_config
+            cfg = timed_config(self.cfg['bridge']['timed_aj'])
+            if not cfg['network_ready']:
+                raise RuntimeError('timed_aj UDP loopback entry is not remotely reachable; '
+                                   'configure NIC listening/forwarding before network_ready=True')
+            # Production fixed_A limits are downstream code constants. Neither
+            # derive tracking limits from XML nor rewrite site motor settings.
+            self._timed_initial_state = self._robot_state()
+            self.attempted = True  # Also clean up an uncertain asynchronous start.
+            status = self.robot.start_timed_aj(cfg)
+            self._timed_stream_id, self._timed_index = status['stream_id'], 0
+            self._timed_final = False
+            self.log('timed_stream_start', status=status, independent_block=False)
+        else:
+            self._apply_manual_speed()
+            self.attempted = True
+            self.robot.start_follower("joint")
         with self.lock:
             if self.gripper_pause_required:
                 raise GripperFault("Gripper fault during follower start")
@@ -488,9 +552,15 @@ class LiveDevices:
             raise RuntimeError("Gripper worker failed") from self.error
         state = self._robot_state()
         observation(self.sample(state=state), self.cfg["bridge"])
-        if (state.has_error or state.follower_active is not True or state.follower_mode != "Axis"
-                or state.raw["ret_context"]["robot_msg"].get("activate") != "Enabled"):
+        info = state.raw['ret_context']['robot_msg']
+        active = (True if self.timed_enabled else
+                  state.follower_active is True and state.follower_mode == 'Axis')
+        if (state.has_error or not active or info.get('activate') != 'Enabled'
+                or (self.timed_enabled and (info.get('op_mode') != 'Manual' or info.get('status') != 'Normal'))):
             raise RuntimeError("Follower feedback fault/inactive")
+        if self.timed_enabled:
+            from fluxvla.engines.communication.a10_timed_aj import require_stream
+            require_stream(self.robot.timed_aj_status(), self._timed_stream_id, accepting=True)
         now = time.monotonic()
         with self.lock:
             feedback = dict(self.feedback)
@@ -498,21 +568,40 @@ class LiveDevices:
             raise RuntimeError("Stale gripper feedback")
         self._checked_state = state
 
-    def send(self, row):
+    def send(self, row, *, final=False):
         # A10Operator verifies current ownership before every UDP target.
-        if self._checked_state is None:
-            self.check()
-        state, self._checked_state = self._checked_state, None
-        # Recheck ages and asynchronous gripper faults immediately before send,
-        # without another network query. A delayed send must fail closed.
-        observation(self.sample(state=state), self.cfg["bridge"])
+        if self.timed_enabled:
+            # This path submits targets only. Acquisition/health checks belong
+            # to observation and stream startup, never the 30 Hz send loop.
+            state = self._timed_initial_state
+            if self.error:
+                raise RuntimeError('Gripper worker failed') from self.error
+        else:
+            if self._checked_state is None:
+                self.check()
+            state, self._checked_state = self._checked_state, None
+            observation(self.sample(state=state), self.cfg["bridge"])
         mapping = {arm.ee_id: name for name, arm in state.arms.items()}
         if set(mapping) != {0, 1}:
             raise RuntimeError("Missing dual arm mapping")
         with self.lock:
             if self.gripper_pause_required:
                 raise GripperFault("Gripper fault before joint send")
-            timing = self.robot.send_joints({mapping[1]: row[:6], mapping[0]: row[7:13]})
+            if self.timed_enabled:
+                from fluxvla.engines.communication.a10_timed_aj import ROW_TO_PHYSICAL
+                if self._timed_index == 0:
+                    arms = {a.ee_id: a for a in state.arms.values()}
+                    commands = [arms[i].target_joints_rad for i in (0, 1)]
+                    if any(q is None for q in commands):
+                        raise RuntimeError('timed_aj requires current command positions for initial continuity')
+                    if np.max(np.abs(np.concatenate(commands) - row[ROW_TO_PHYSICAL])) > .035:
+                        raise RuntimeError('timed_aj first point exceeds 0.035 rad command continuity; no target sent')
+                timing = self.robot.send_timed_joint_target(
+                    row[ROW_TO_PHYSICAL], final=final)
+                self._timed_index += 1
+                self._timed_final = final
+            else:
+                timing = self.robot.send_joints({mapping[1]: row[:6], mapping[0]: row[7:13]})
             self.target = (row.copy(), time.monotonic() + 0.1)
         return timing
 
@@ -528,10 +617,26 @@ class LiveDevices:
         if set(arms) != {0, 1}:
             raise RuntimeError('Missing dual arm arrival feedback')
         info = state.raw['ret_context']['robot_msg']
-        return dict(joints=np.r_[arms[1].actual_joints_rad, arms[0].actual_joints_rad],
+        result = dict(joints=np.r_[arms[1].actual_joints_rad, arms[0].actual_joints_rad],
                     stamp=state.received_monotonic_s, has_error=state.has_error,
                     follower_active=state.follower_active, follower_mode=state.follower_mode,
                     activation=info.get('activate'), motion=info.get('motion'))
+        if self.timed_enabled:
+            from fluxvla.engines.communication.a10_timed_aj import require_stream
+            status = self.robot.timed_aj_status()
+            if self.attempted:
+                require_stream(status, self._timed_stream_id)
+            elif status['stream_id'] != self._timed_stream_id or status['active']:
+                raise RuntimeError('timed_aj restarted externally after stop')
+            commands = [arms[i].target_joints_rad for i in (1, 0)]
+            if any(q is None for q in commands):
+                raise RuntimeError('Missing timed_aj command position feedback')
+            result.update(timed_status=status, command_joints=np.concatenate(commands),
+                          reference_finished=(status['final_reference_reached'] and status['reason'] == 0
+                                              and status['consumed'] == self._timed_index
+                                              and self._timed_final),
+                          operation_mode=info.get('op_mode'), robot_status=info.get('status'))
+        return result
 
     def stop(self):
         self._checked_state = None
@@ -544,11 +649,19 @@ class LiveDevices:
                 pass
         if not self.attempted:
             return True
-        state = self.robot.stop_follower()
-        confirmed = state.follower_active is False
+        if self.timed_enabled:
+            result = self.robot.stop_timed_aj()
+            confirmed = result.get('active') is False
+        else:
+            state = self.robot.stop_follower()
+            confirmed = state.follower_active is False
         if not confirmed:
             raise RuntimeError("Follower stop unconfirmed")
         self.attempted = False
+        if self.timed_enabled:
+            self._timed_initial_state = None
+            self._timed_index = 0
+            self._timed_final = False
         return confirmed
 
     def close(self):

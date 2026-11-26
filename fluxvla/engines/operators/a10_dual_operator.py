@@ -40,6 +40,11 @@ class A10DualOperator(BaseOperator):
         self._last_packet_clock = None
         self.stream_final = False
         self.action_fusion = ExponentialActionFusion(self.settings.get('action_fusion'))
+        from ..utils.chunk_execution import StreamReferenceClock
+        self.reference_clock = StreamReferenceClock(self.settings.get('action_dt', 1/30))
+        self._stream_mailbox_lock = threading.Lock()
+        self._stream_pending = None
+        self._stream_accepting = False
         from ..utils.a10_follower_tail import tail_config
         self.tail_config = tail_config(self.settings.get('follower_tail'))
         self._lifecycle_lock = threading.RLock()
@@ -113,7 +118,12 @@ class A10DualOperator(BaseOperator):
     def start_follower(self):
         if not self.attempted:
             self.attempted = True  # A failed start may already have taken effect.
-            self.devices.start()
+            try:
+                self.devices.start()
+            except PermissionError:
+                if getattr(self.devices, 'attempted', None) is False:
+                    self.attempted = False
+                raise
 
     def execute_trajectory(self, arm_trajectories, gripper_trajectories=None,
                            head_trajectory=None, dt=1 / 30, async_exec=False,
@@ -152,12 +162,16 @@ class A10DualOperator(BaseOperator):
                 if async_exec:
                     origin = self.last_target if self.last_target is not None else self.last_frame['qpos']
                     published, raw, start = rows, None, None
+                    continuous = (self.action_fusion.config['enabled']
+                                  and self.action_fusion.config['continuous_clock'])
                     if self.action_fusion.config['enabled']:
                         # The previous writer has joined. Align only once, to
                         # the next permitted wire slot, before fusing forecasts.
                         from ..utils.trajectory_utils import resample_remaining
                         start = self.clock.monotonic()
-                        if self._last_packet_send_s is not None:
+                        if continuous:
+                            start = self.reference_clock.next_slot(start)
+                        elif self._last_packet_send_s is not None:
                             start = max(start, self._last_packet_send_s + dt)
                         raw = (resample_remaining(rows, max(0., (start-reference_time)/dt))
                                if reference_time is not None else rows)
@@ -169,7 +183,7 @@ class A10DualOperator(BaseOperator):
                                  raw_targets=raw, fused_targets=published, **info)
                     self.bridge.check_steps(published, origin, self.settings['max_joint_step_rad'])
                     self._send_rows(published, dt, stop_event=stop_event, cycle=cycle,
-                                    final=final, start_s=start, raw_rows=raw)
+                                    final=final, start_s=start, raw_rows=raw, continuous_clock=continuous)
                 else:
                     self._execute_rows(rows, dt, stop_event=stop_event, cycle=cycle, final=final)
             finally:
@@ -178,7 +192,63 @@ class A10DualOperator(BaseOperator):
         with self._trajectory_submission_lock:
             if self.closed:
                 raise RuntimeError('A10 operator is closed')
+            if (async_exec and self.action_fusion.config['enabled']
+                    and self.action_fusion.config['continuous_clock']
+                    and self.action_fusion.config['persistent_sender']):
+                return self._submit_stream_plan(dict(rows=rows, cycle=cycle, final=final,
+                                                     reference_time=reference_time), dt)
             return self._submit_trajectory(publish, async_exec=async_exec)
+
+    def _submit_stream_plan(self, packet, dt):
+        """One latest prediction mailbox; a replacement never stops the writer."""
+        self.raise_trajectory_error()
+        with self._stream_mailbox_lock:
+            if self._stream_accepting:
+                self._stream_pending = packet
+                return
+        # A drained publisher may still be leaving its finalizer. Join it
+        # without holding the mailbox lock needed by that finalizer.
+        self._cancel_trajectory_worker()
+        self.raise_trajectory_error()
+        with self._stream_mailbox_lock:
+            self._stream_pending = packet
+            self._stream_accepting = True
+
+        def stream(stop_event):
+            self._trajectory_running = True
+            try:
+                self.start_follower()
+                start = self.reference_clock.next_slot(self.clock.monotonic())
+                self.log('stream_publisher_start', thread_id=threading.get_ident(), started_s=start)
+                self._send_rows(np.empty((0, 14)), dt, stop_event=stop_event,
+                                start_s=start, continuous_clock=True, stream_updates=True)
+            finally:
+                with self._stream_mailbox_lock:
+                    self._stream_accepting = False
+                self._trajectory_running = False
+
+        return self._submit_trajectory(stream, async_exec=True)
+
+    def _take_stream_plan(self, start, dt):
+        with self._stream_mailbox_lock:
+            packet, self._stream_pending = self._stream_pending, None
+        if packet is None:
+            return None
+        from ..utils.trajectory_utils import resample_remaining
+        preparing = self.clock.monotonic()
+        reference = packet['reference_time']
+        raw = (resample_remaining(packet['rows'], max(0., (start-reference)/dt))
+               if reference is not None else packet['rows'])
+        if not len(raw):
+            raise RuntimeError('Prediction expired before stream adoption; no target sent')
+        origin = self.last_target if self.last_target is not None else self.last_frame['qpos']
+        self.bridge.check_steps(raw, origin, self.settings['max_joint_step_rad'])
+        plan, info = self.action_fusion.fuse(raw, start_s=start, dt=dt)
+        self.bridge.check_steps(plan, origin, self.settings['max_joint_step_rad'])
+        self.log('action_fusion', cycle=packet['cycle'], reference_time=reference,
+                 raw_targets=raw, fused_targets=plan,
+                 preparation_s=self.clock.monotonic()-preparing, **info)
+        return plan, raw, packet['cycle'], packet['final']
 
     def _execute_rows(self, rows, dt, *, stop_event=None, cycle=None, final=None):
         if self.timed_enabled:
@@ -188,7 +258,7 @@ class A10DualOperator(BaseOperator):
         return self._send_rows(rows, dt, stop_event=stop_event, cycle=cycle, final=final)
 
     def _send_rows(self, rows, dt, *, stop_event=None, cycle=None, final=None,
-                   start_s=None, raw_rows=None):
+                   start_s=None, raw_rows=None, continuous_clock=False, stream_updates=False):
         n = len(rows)
         if stop_event is None:
             stop_event = self._traj_stop_event
@@ -198,24 +268,64 @@ class A10DualOperator(BaseOperator):
         self.start_follower()
         period = dt
         sent = 0
-        # A new block may follow an arbitrary inference/hold gap. Only its
-        # local 30 Hz pacing starts here; target numbering stays in the client.
+        # Legacy blocks restart local pacing after a gap. Continuous-clock
+        # async blocks arrive with a slot on the stream's original grid.
         start = self.clock.monotonic() if start_s is None else start_s
         if start_s is None and self._last_packet_send_s is not None:
             start = max(start, self._last_packet_send_s + period)
-        self.log('execution_start', cycle=cycle, started_s=start, selected=n)
-        slot = 0
+        if n:
+            self.log('execution_start', cycle=cycle, started_s=start, selected=n)
+        index = 0
         while True:
             if stop_event.is_set():
                 raise InterruptedError('Dual A10 trajectory cancelled')
             checking = self.clock.monotonic()
-            deadline = start + slot * period
-            self._sleep_publishing(max(0., deadline - self.clock.monotonic()), stop_event)
+            deadline = start + index * period
+            not_before = deadline
+            if continuous_clock and self._last_packet_send_s is not None:
+                # A stalled send must not be followed by a catch-up burst.
+                # Leave at least half a period; expired slots below are skipped.
+                not_before = max(not_before, self._last_packet_send_s+period/2)
+            self._sleep_publishing(max(0., not_before - self.clock.monotonic()), stop_event)
             if stop_event.is_set():
                 raise InterruptedError('Dual A10 trajectory cancelled')
             lag_limit = self.settings['max_send_lag_s']
             if self.clock.monotonic() - deadline > lag_limit:
                 raise RuntimeError('Joint send deadline missed')
+            if stream_updates:
+                replacement = self._take_stream_plan(deadline, dt)
+                if replacement is not None:
+                    if n:
+                        self.log('execution_end', cycle=cycle, sent=sent,
+                                 finished_s=self.clock.monotonic(), replaced=True,
+                                 physical_arrival_confirmed=False)
+                    rows, raw_rows, cycle, final = replacement
+                    n, start, index, sent = len(rows), deadline, 0, 0
+                    self.log('execution_start', cycle=cycle, started_s=start, selected=n,
+                             persistent_sender=True)
+                if index >= n:
+                    # Do not lose an update arriving while the last plan is
+                    # draining. Either keep this worker or atomically close
+                    # admission so the submitter starts its successor.
+                    with self._stream_mailbox_lock:
+                        if self._stream_pending is not None:
+                            continue
+                        self._stream_accepting = False
+                    break
+            if continuous_clock:
+                advanced = min(n-1, max(index, math.floor((self.clock.monotonic()-start)/period+1e-8)))
+                if advanced > index:
+                    # Skip expired reference slots, never burst or slow the
+                    # model clock to drain them. Keep wire indices consecutive.
+                    self.log('reference_slots_skipped', cycle=cycle, first_frame=index+1,
+                             next_frame=advanced+1, skipped=advanced-index)
+                    origin = self.last_target if self.last_target is not None else self.last_frame['qpos']
+                    self.bridge.check_steps(rows[advanced:advanced+1], origin,
+                                            self.settings['max_joint_step_rad'])
+                    index = advanced
+                    deadline = start+index*period
+            if stop_event.is_set():
+                raise InterruptedError('Dual A10 trajectory cancelled')
             if not self.timed_enabled:
                 checking = self.clock.monotonic()
                 self.devices.check()
@@ -224,17 +334,19 @@ class A10DualOperator(BaseOperator):
                 checking = checked  # There was no feedback query in this slot.
             lag = checked - deadline
             if lag > lag_limit:
-                self.log('send_deadline_missed', cycle=cycle, frame=sent + 1,
+                self.log('send_deadline_missed', cycle=cycle, frame=index + 1,
                          phase='feedback_check', check_s=checked - checking, lag_s=lag)
                 raise RuntimeError('Feedback check exceeded joint send deadline')
-            row = rows[sent]
+            row = rows[index]
             send_started = self.clock.monotonic()
-            timing = (self.devices.send(row, final=final and sent == n - 1) if self.timed_enabled
+            timing = (self.devices.send(row, final=final and index == n - 1) if self.timed_enabled
                       else self.devices.send(row))
             finished = self.clock.monotonic()
             wire_time = timing.get('udp_send_started_s') if isinstance(timing, dict) else None
             self._last_packet_send_s = finished if wire_time is None else wire_time
             self._last_packet_clock = ('send_finished_fallback' if wire_time is None else 'host_udp_send_started')
+            if continuous_clock:
+                self.reference_clock.record(deadline)
             if sent == 0:
                 if self.last_target is not None:
                     jump = row[JOINTS] - self.last_target[JOINTS]
@@ -249,13 +361,15 @@ class A10DualOperator(BaseOperator):
                                      else row[JOINTS] - self.last_target[JOINTS])
             self.last_target = row.copy()
             sent += 1
-            self.log('sent', cycle=cycle, frame=sent, target=row, scheduled_s=deadline,
-                     **({'unfused_target': raw_rows[sent-1]} if raw_rows is not None else {}),
+            self.log('sent', cycle=cycle, frame=index+1, target=row, scheduled_s=deadline,
+                     **({'unfused_target': raw_rows[index]} if raw_rows is not None else {}),
+                     continuous_clock=continuous_clock,
+                     persistent_sender=stream_updates,
                      send_started_s=send_started, send_finished_s=finished,
                      check_s=checked - checking, send_s=finished - send_started,
                      check_lag_s=lag, send_hz=1/dt,
                      point_role=('policy' if self.timed_enabled or self.tail_config['enabled'] else None),
-                     policy_frame=(sent if self.timed_enabled or self.tail_config['enabled'] else None),
+                     policy_frame=(index+1 if self.timed_enabled or self.tail_config['enabled'] else None),
                      repeat_index=(1 if self.timed_enabled or self.tail_config['enabled'] else None),
                      stream_id=timing.get('stream_id') if isinstance(timing, dict) else None,
                      stream_index=timing.get('index') if isinstance(timing, dict) else None,
@@ -264,11 +378,15 @@ class A10DualOperator(BaseOperator):
                      udp_send_finished_s=timing.get('udp_send_finished_s') if isinstance(timing, dict) else None)
             if self.timed_enabled and self._last_packet_send_s - deadline > lag_limit:
                 raise RuntimeError('timed_aj UDP submission exceeded send deadline; no retry')
-            done = sent >= n
+            done = index >= n-1
             if done:
                 self.trace.arm(cycle, row, finished)
-                break
-            slot = sent
+                if not stream_updates or final:
+                    if stream_updates:
+                        with self._stream_mailbox_lock:
+                            self._stream_accepting = False
+                    break
+            index += 1
         self._sleep_publishing(max(0., start + n * dt - self.clock.monotonic()), stop_event)
         self.log('execution_end', cycle=cycle, sent=sent,
                  finished_s=self.clock.monotonic(), physical_arrival_confirmed=False)
@@ -495,6 +613,11 @@ class A10DualOperator(BaseOperator):
 
     def _stop_trajectory(self, reason):
         self._traj_stop_event.set()
+        with self._stream_mailbox_lock:
+            # Discard unpublished work even if the physical stop cannot be
+            # confirmed. A failed stop must never leave a replayable mailbox.
+            self._stream_pending = None
+            self._stream_accepting = False
         self.trace.finish(reason, self.clock.monotonic())
         if self.attempted:
             try:
@@ -509,6 +632,7 @@ class A10DualOperator(BaseOperator):
             if self.timed_enabled:
                 self.last_target = self.last_target_step = None
         self.action_fusion.reset()
+        self.reference_clock.reset()
 
     def is_trajectory_running(self):
         return getattr(self, '_trajectory_running', False)

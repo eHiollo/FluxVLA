@@ -28,6 +28,9 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(runner.ros_operator.action_fusion.config['enabled'])
         self.assertEqual(runner.ros_operator.action_fusion.config['method'], 'velocity')
         self.assertEqual(runner.ros_operator.action_fusion.config['gripper_alpha'], .35)
+        self.assertTrue(runner.ros_operator.action_fusion.config['continuous_clock'])
+        self.assertTrue(runner.ros_operator.action_fusion.config['persistent_sender'])
+        self.assertEqual(runner.ros_operator.action_fusion.config['position_gain'], 2.0)
         self.assertEqual(cfg.grippers.left.reversal_confirm_s, .25)
         self.assertEqual(cfg.grippers.right.reversal_deadband_raw, 450)
 

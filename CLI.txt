@@ -115,7 +115,13 @@ python scripts/inference.py --config configs/a10/a10_dual_inference.py --model o
 
 OpenPI异步＋指数融合（无模型RTC要求，WS/8001，30Hz，K=0）：
 python scripts/inference.py --config configs/a10/a10_dual_openpi_async_inference.py
+
+实机确认后，OpenPI 异步入口的位置修正增益默认为 2.0。对照原设定可加 --cfg-options inference.action_fusion.position_gain=6.0。
 使用速度融合＋持续位置校正：权重0.25、6点入场、12点退出；不增加播放缓冲。
+跨块共用连续30Hz参考网格；UDP迟发不重新起钟，过期参考槽跳过，不追赶补发。
+常驻发送线程持续供点，普通换块仅替换容量1的预测邮箱；不取消/重建发送线程。
+仅回退常驻线程：--cfg-options inference.action_fusion.persistent_sender=False
+仅回退本次时钟优化：--cfg-options inference.action_fusion.continuous_clock=False
 异步入口夹爪独立融合α=.35；反向变化需超过450 raw并持续250ms才换向，保留连续开度。
 同方向按45 raw死区跟随；实际换向也会多一次确认等待。只过滤夹爪，不改变当前手臂参数。
 最新记录回放：块中段/两侧速度比0.874→0.981，软件目标jerk RMS再降27.1%，目标偏移RMS基本不变。

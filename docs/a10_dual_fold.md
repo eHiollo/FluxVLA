@@ -14,20 +14,18 @@ ssh -N -o ExitOnForwardFailure=yes \
   -L 127.0.0.1:8765:127.0.0.1:8765 jupyter-xiaoj@10.18.1.7
 ```
 
-现场电脑终端二检查服务，然后启动只记录、不发送运动目标的客户端：
+现场电脑终端二直接启动运动客户端：
 
 ```bash
-curl -fsS http://127.0.0.1:8765/health
 conda activate fluxvla
 python scripts/inference.py --config configs/a10/a10_dual_inference.py \
-  --model longwam --cfg-options inference.mode=read_only inference.cycles=3 \
-  inference.remote_inference.timeout_s=30
+  --model longwam
 ```
 
-`--model longwam` 切换时默认使用 `read_only`；环境变量
+`--model longwam` 与其他后端一样默认使用 `motion`；环境变量
 `A10_MODEL_BACKEND=longwam` 和兼容配置 `configs/a10/a10_dual_longwam_remote.py`
-也可选择该后端。`preview` 仅检查配置，不连接模型或设备。
-确认预测和时间日志后，可显式指定 `inference.mode=motion`；不要用该命令作为连通性检查。
+也可选择该后端。只记录预测时显式加 `--cfg-options inference.mode=read_only`；
+`inference.mode=preview` 仅检查配置，不连接模型或设备。显式模式在切换后端时保留。
 夹爪标定、故障和机器人状态检查继续使用原有机制。
 
 三路后台相机各保留 64 帧原始 640×480 RGB（约 169 MiB 图像内存），

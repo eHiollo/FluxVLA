@@ -139,16 +139,23 @@ class LongWamTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             camera.snapshot_window(12.1)
 
-    def test_longwam_backend_defaults_and_explicit_motion(self):
+    def test_longwam_backend_defaults_to_motion_and_preserves_explicit_mode(self):
         cfg = Config.fromfile('configs/a10/a10_dual_inference.py')
         select_a10_backend(cfg, 'longwam')
-        self.assertEqual(cfg.inference.mode, 'read_only')
+        self.assertEqual(cfg.inference.mode, 'motion')
         self.assertEqual(cfg.inference.remote_inference.server_port, 8765)
         self.assertNotIn('inference_model', cfg)
         self.assertNotIn('dataset', cfg.inference)
         runner = A10DualInferenceRunner(**{key: value for key, value in cfg.inference.items() if key != 'type'})
         runner.run_setup()
         self.assertEqual(runner.action_chunk, 32)
+        for mode in ('read_only', 'preview'):
+            cfg.inference.mode = mode
+            select_a10_backend(cfg, 'openpi')
+            select_a10_backend(cfg, 'longwam')
+            self.assertEqual(cfg.inference.mode, mode)
+            select_a10_backend(cfg, 'longwam', {'inference.mode': mode})
+            self.assertEqual(cfg.inference.mode, mode)
         select_a10_backend(cfg, 'longwam', {'inference.mode': 'motion'})
         self.assertEqual(cfg.inference.mode, 'motion')
         select_a10_backend(cfg, 'openpi')
@@ -158,7 +165,7 @@ class LongWamTests(unittest.TestCase):
                          'configs/a10/a10_dual_longwam_remote.py'):
                 configured = Config.fromfile(path)
                 select_a10_backend(configured)
-                self.assertEqual(configured.inference.mode, 'read_only')
+                self.assertEqual(configured.inference.mode, 'motion')
                 self.assertEqual(configured.inference.remote_inference.protocol, 'longwam_http')
 
     def test_serial_motion_starts_at_zero_regardless_of_inference_delay(self):

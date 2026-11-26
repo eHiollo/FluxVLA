@@ -1,4 +1,4 @@
-"""Backend selection for dual A10 control; LongWAM starts read-only."""
+"""Backend selection for dual A10 control; mode is shared across backends."""
 
 from copy import deepcopy
 from pathlib import Path
@@ -34,7 +34,7 @@ def backend_settings(name, checkpoint_dir):
 def select_a10_backend(cfg, backend=None, overrides=None):
     """Resolve a CLI backend override after mmengine's general config overrides.
 
-    LongWAM starts read-only unless the CLI explicitly overrides its mode.
+    Backend selection preserves the configured motion/read-only/preview mode.
     Other control settings and explicit endpoint/timeout overrides remain intact.
     Replacing the transport also replaces its default port and wire-specific
     client settings; the model checkpoint belongs exclusively to the server.
@@ -55,8 +55,6 @@ def select_a10_backend(cfg, backend=None, overrides=None):
         for key in ('dataset', 'denormalize_action', 'task_suite_name'):
             cfg.inference.pop(key, None)
         cfg.inference.prompt = settings['prompt']
-        if selected == 'longwam':
-            cfg.inference.mode = 'read_only'
         for key, value in settings.items():
             if key not in ('remote_inference', 'prompt'):
                 cfg.inference[key] = deepcopy(value)

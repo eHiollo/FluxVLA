@@ -14,6 +14,10 @@ from test_a10_dual_inference import SETTINGS
 
 
 class FusionTests(unittest.TestCase):
+    def test_invalid_continuous_clock_config_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'continuous_clock'):
+            fusion_config(dict(continuous_clock=1))
+
     def test_gripper_fusion_joins_same_time_apertures_and_leaves_arms_identical(self):
         config = dict(enabled=True, method='velocity', alpha=.25,
                       handover_steps=6, tail_steps=12)

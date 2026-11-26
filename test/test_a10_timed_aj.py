@@ -154,6 +154,20 @@ class LiveAdapterTests(unittest.TestCase):
                      'ensure_motor_acceleration', 'set_speed_override'):
             getattr(d.robot, name).assert_not_called()
 
+    def test_start_claim_denied_vs_uncertain_start_cleanup(self):
+        for error, should_stop in (
+            (PermissionError('Another session owns the follower; stop it before starting inference'), False),
+            (TimeoutError('start reply lost'), True),
+        ):
+            with self.subTest(error=error):
+                d, _ = self.device()
+                d.robot.start_timed_aj.side_effect = error
+                with self.assertRaises(type(error)):
+                    d.start()
+                self.assertEqual(d.attempted, should_stop)
+                d.stop()
+                self.assertEqual(d.robot.stop_timed_aj.call_count, int(should_stop))
+
     def test_fixed_A_does_not_require_or_rewrite_motor_acceleration_250(self):
         d, _ = self.device()
         d.robot.read_motor_config.return_value[0] = dict(max_acc=375., min_acc=-375.)
@@ -468,6 +482,19 @@ class SharedTimedLoopbackTests(unittest.TestCase):
             a.send_timed_joint_target([0.]*12)
         self.assertEqual(self.service.owner, console._connection.session_id)
         console.stop_timed_aj()
+
+    def test_console_releases_old_lease_after_controller_reset(self):
+        c, console = self.client(), self.client('console')
+        self.start(c)
+        self.current.update(stream_id=0, active=False, ready=False, accepting=False, state=5)
+        with self.assertRaisesRegex(RuntimeError, 'stream changed'):
+            console.stop_follower()
+        self.assertEqual(self.service.owner, c._connection.session_id)
+        self.controller.motion = 'Stopped'
+        count = self.controller.commands.count('taj_stop')
+        console.stop_follower()
+        self.assertIsNone(self.service.owner)
+        self.assertEqual(self.controller.commands.count('taj_stop'), count)
 
     def test_stop_timeout_retains_lease_and_blocks_other_client(self):
         c, other = self.client(), self.client()

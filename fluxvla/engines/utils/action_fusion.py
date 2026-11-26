@@ -13,13 +13,17 @@ def fusion_config(value=None):
     config = dict(enabled=False, method='position', alpha=.25, tail_steps=8, handover_steps=0,
                   position_gain=6., correction_tau_s=.15, correction_fraction=1.,
                   correction_floor_deg_s=3., correction_max_deg_s=30., endpoint_steps=12,
-                  gripper_alpha=None)
+                  gripper_alpha=None, continuous_clock=False, persistent_sender=False)
     value = dict(value or {})
     if value.keys() - config.keys():
         raise ValueError(f'Unknown action_fusion options: {sorted(value.keys() - config.keys())}')
     config.update(value)
     if type(config['enabled']) is not bool:
         raise ValueError('action_fusion.enabled must be boolean')
+    if type(config['continuous_clock']) is not bool:
+        raise ValueError('action_fusion.continuous_clock must be boolean')
+    if type(config['persistent_sender']) is not bool:
+        raise ValueError('action_fusion.persistent_sender must be boolean')
     if config['method'] not in ('position', 'velocity'):
         raise ValueError('action_fusion.method must be position or velocity')
     alpha = config['alpha']
@@ -153,7 +157,9 @@ class ExponentialActionFusion:
                     alpha=self.config['alpha'], tail_steps=self.config['tail_steps'],
                     handover_steps=self.config['handover_steps'],
                     start_s=float(start_s), history_expired=False,
-                    gripper_alpha=self.config['gripper_alpha'], gripper_fusion_applied=False)
+                    gripper_alpha=self.config['gripper_alpha'], gripper_fusion_applied=False,
+                    continuous_clock=self.config['continuous_clock'],
+                    persistent_sender=self.config['persistent_sender'])
         fused = targets.copy()
         old, x, old_weight = None, None, None
         if self.config['enabled'] and self.plan is not None:

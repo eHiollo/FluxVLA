@@ -575,7 +575,19 @@ class LiveDevices:
             # derive tracking limits from XML nor rewrite site motor settings.
             self._timed_initial_state = self._robot_state()
             self.attempted = True  # Also clean up an uncertain asynchronous start.
-            status = self.robot.start_timed_aj(cfg)
+            try:
+                status = self.robot.start_timed_aj(cfg)
+            except PermissionError as exc:
+                # These relay claim denials precede any downstream Plan start.
+                # Other errors (including lost replies) still require cleanup.
+                if str(exc) in (
+                    'Another session owns the follower; stop it before starting inference',
+                    'Console command is still running',
+                    'An unmanaged follower is active; the shared service will not take it over',
+                ):
+                    self.attempted = False
+                    self._timed_initial_state = None
+                raise
             self._timed_stream_id, self._timed_index = status['stream_id'], 0
             self._timed_final = False
             self.log('timed_stream_start', status=status, independent_block=False)

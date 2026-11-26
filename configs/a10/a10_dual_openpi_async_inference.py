@@ -15,7 +15,10 @@ inference = dict(
     execute_horizon=0,
     rtc_config=dict(enabled=False),
     action_fusion=dict(enabled=True, method='velocity', alpha=.25, tail_steps=12,
-                       handover_steps=6, position_gain=6., correction_tau_s=.15,
+                       handover_steps=6, position_gain=2., correction_tau_s=.15,
                        correction_fraction=1., correction_floor_deg_s=3.,
-                       correction_max_deg_s=30., endpoint_steps=12, gripper_alpha=.35),
+                       correction_max_deg_s=30., endpoint_steps=12, gripper_alpha=.35,
+                       # One publisher keeps its 30Hz grid; revisions only
+                       # replace the latest prediction mailbox at a tick.
+                       continuous_clock=True, persistent_sender=True),
 )

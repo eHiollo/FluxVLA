@@ -1,8 +1,39 @@
 """Shared chunk timing for robot runners; operators own the publishing clock."""
 
+import math
+
 import numpy as np
 
 from .trajectory_utils import resample_remaining
+
+
+class StreamReferenceClock:
+    """One nominal reference grid across replacements; never follow send jitter."""
+
+    def __init__(self, dt):
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError('StreamReferenceClock requires positive finite dt')
+        self.dt = float(dt)
+        self.reset()
+
+    def reset(self):
+        self.origin_s = self.last_s = None
+
+    def next_slot(self, now):
+        if not math.isfinite(now):
+            raise ValueError('StreamReferenceClock requires finite now')
+        if self.origin_s is None:
+            self.origin_s = float(now)
+        minimum = self.origin_s if self.last_s is None else self.last_s+self.dt
+        tick = max(0, math.ceil((max(now, minimum)-self.origin_s)/self.dt-1e-8))
+        return self.origin_s+tick*self.dt
+
+    def record(self, reference_s):
+        tick = (reference_s-self.origin_s)/self.dt
+        if (not math.isfinite(reference_s) or abs(tick-round(tick)) > 1e-6
+                or (self.last_s is not None and reference_s-self.last_s < self.dt-1e-8)):
+            raise ValueError('Stream reference must advance on its original grid')
+        self.last_s = float(reference_s)
 
 
 def select_action_chunk(actions, context, previous, *, now, dt,

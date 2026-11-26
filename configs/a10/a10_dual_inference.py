@@ -1,7 +1,7 @@
 """Common dual A10 inference control; select only the remote model backend.
 
 Default: onsite OpenPI WS/8001. Select fluxvla or longwam with --model or
-A10_MODEL_BACKEND. LongWAM starts read-only; robot motion limits stay shared.
+A10_MODEL_BACKEND. All backends default to motion; control settings stay shared.
 """
 import os
 from pathlib import Path
@@ -39,7 +39,7 @@ grippers = dict(left=dict(_gripper_inference), right=dict(_gripper_inference))
 
 inference = dict(
     type="A10DualInferenceRunner",
-    mode="read_only" if model_backend == "longwam" else "motion",
+    mode="motion",
     manual_speed_percent=None,
     timed_aj=dict(
         enabled=True, plan_ws_port=5888, udp_host='192.168.0.150', udp_port=10000,

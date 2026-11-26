@@ -189,6 +189,13 @@ class TimedAjTransport:
 
     def stop(self):
         status = self.status()
+        # A controller reset can clear the stream ID while the relay still
+        # owns the old lease. Confirm idle without issuing a stop to a new ID.
+        if self.stream_id is not None and status['stream_id'] == 0 and not status['active']:
+            info = self.robot_state()['ret_context']['robot_msg']
+            if info.get('motion') == 'Stopped':
+                self.close()
+                return status
         if self.stream_id is None or status['stream_id'] != self.stream_id:
             raise RuntimeError('timed_aj stream changed or start uncertain; no foreign stream stopped')
         # ACK means requested, never completed. Keep the lease on every failure.

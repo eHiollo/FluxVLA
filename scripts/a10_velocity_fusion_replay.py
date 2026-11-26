@@ -247,7 +247,7 @@ def main():
               '停止/重启清理位置、运动速度及位置校正状态。下游实际限速、限加速度和限jerk继续生效，'
               '本对照没有运行下游控制器，软件目标差分峰值不能作为物理限幅验收。', '',
               '## 实际使用', '',
-              '`python scripts/inference.py --config configs/a10/a10_dual_openpi_async_inference.py`', '',
+              '`python scripts/inference.py --config configs/a10/a10_dual_inference.py --model openpi`', '',
               '保持OpenPI WS/8001、30Hz、K=0、每个输出点单发。夹爪维持最新目标与45 raw死区。'
               '复现旧位置融合可加 `--cfg-options inference.action_fusion.method=position`。'
               '本轮没有自动启动实机。']

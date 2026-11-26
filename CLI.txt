@@ -114,7 +114,8 @@ python scripts/inference.py --config configs/a10/a10_dual_inference.py
 python scripts/inference.py --config configs/a10/a10_dual_inference.py --model openpi
 
 OpenPI异步＋指数融合（无模型RTC要求，WS/8001，30Hz，K=0）：
-python scripts/inference.py --config configs/a10/a10_dual_openpi_async_inference.py
+python scripts/inference.py --config configs/a10/a10_dual_inference.py --model openpi
+默认开启异步融合，启动时加 --rtc close 可切回同步推理。
 
 实机确认后，OpenPI 异步入口的位置修正增益默认为 2.0。对照原设定可加 --cfg-options inference.action_fusion.position_gain=6.0。
 使用速度融合＋持续位置校正：权重0.25、6点入场、12点退出；不增加播放缓冲。

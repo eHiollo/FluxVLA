@@ -80,6 +80,21 @@ inference = dict(
     max_joint_step_rad=0.2,
 )
 
+# --rtc enables client-side asynchronous fusion for the selected model.
+rtc_overrides = {
+    'inference.async_execution': True,
+    'inference.execute_horizon': 0,
+    'inference.rtc_config.enabled': False,
+    'inference.action_fusion.position_gain': 2.,
+    'inference.action_fusion.gripper_alpha': .35,
+    'inference.action_fusion.continuous_clock': True,
+    'inference.action_fusion.persistent_sender': True,
+    'grippers.left.reversal_deadband_raw': 450,
+    'grippers.left.reversal_confirm_s': .25,
+    'grippers.right.reversal_deadband_raw': 450,
+    'grippers.right.reversal_confirm_s': .25,
+}
+
 # These transforms run on the native model server, never on the robot client.
 for _key in ("dataset", "denormalize_action", "task_suite_name"):
     if _key in _model:

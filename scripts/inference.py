@@ -42,6 +42,8 @@ def parse_args():
     )
     parser.add_argument("--model", choices=["fluxvla", "openpi", "longwam"], default=None,
                         help="Select the model backend in the common dual A10 config")
+    parser.add_argument('--rtc', nargs='?', const='open', choices=('open', 'close'),
+                        help='Client-side asynchronous fusion, enabled by default for A10 OpenPI')
     parser.add_argument(
         '--ckpt-path',
         type=str,
@@ -58,10 +60,16 @@ def parse_args():
     return args, unknown
 
 
-if __name__ == '__main__':
-    configure_inference_attention_defaults()
-    args, _ = parse_args()
+def load_config(args):
     cfg = Config.fromfile(args.config)
+    if 'rtc_overrides' not in cfg and args.rtc is not None:
+        raise ValueError('--rtc requires the unified A10 inference config')
+    overrides = args.cfg_options or {}
+    backend = args.model or overrides.get('model_backend', cfg.get('model_backend'))
+    default_rtc = ('rtc_overrides' in cfg and backend == 'openpi'
+                   and not cfg.inference.get('rtc_config', {}).get('enabled', False))
+    if args.rtc == 'open' or (args.rtc is None and default_rtc):
+        cfg.merge_from_dict(cfg.rtc_overrides)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
     from fluxvla.engines.utils.a10_inference_backends import select_a10_backend
@@ -70,6 +78,13 @@ if __name__ == '__main__':
     select_inference_acceleration(cfg, args.acceleration)
     cfg.inference.cfg = cfg
     cfg.inference.ckpt_path = args.ckpt_path
+    return cfg
+
+
+if __name__ == '__main__':
+    configure_inference_attention_defaults()
+    args, _ = parse_args()
+    cfg = load_config(args)
     inference_runner = build_runner_from_cfg(cfg.inference)
     inference_runner.run_setup()
     inference_runner.run()

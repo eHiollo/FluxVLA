@@ -11,6 +11,57 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BackendTests(unittest.TestCase):
+    def test_model_independent_async_preset_builds_without_rtc_capabilities(self):
+        from fluxvla.engines import build_runner_from_cfg
+        with patch.dict(os.environ, {'A10_MODEL_BACKEND': 'fluxvla'}):
+            cfg = Config.fromfile(ROOT / 'configs/a10/a10_dual_openpi_async_inference.py')
+        select_a10_backend(cfg)
+        cfg.inference.mode = 'preview'
+        cfg.inference.cfg = cfg
+        runner = build_runner_from_cfg(cfg.inference)
+        runner.run_setup()
+        self.assertEqual(runner.remote['protocol'], 'openpi_ws')
+        self.assertEqual(runner.remote['server_port'], 8001)
+        self.assertTrue(runner.async_execution)
+        self.assertEqual(runner.execute_horizon, 0)
+        self.assertFalse(runner.rtc_config['enabled'])
+        self.assertTrue(runner.ros_operator.action_fusion.config['enabled'])
+        self.assertEqual(runner.ros_operator.action_fusion.config['method'], 'velocity')
+        self.assertEqual(runner.ros_operator.action_fusion.config['gripper_alpha'], .35)
+        self.assertEqual(cfg.grippers.left.reversal_confirm_s, .25)
+        self.assertEqual(cfg.grippers.right.reversal_deadband_raw, 450)
+
+    def test_onsite_defaults_and_rtc_entrypoint_resolve_to_openpi_8001(self):
+        from fluxvla.engines import build_runner_from_cfg
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('A10_MODEL_BACKEND', None)
+            common = Config.fromfile(ROOT / 'configs/a10/a10_dual_inference.py')
+        self.assertEqual(common.model_backend, 'openpi')
+        self.assertEqual(common.inference.remote_inference.protocol, 'openpi_ws')
+        self.assertEqual(common.inference.remote_inference.server_port, 8001)
+        self.assertFalse(common.inference.rtc_config.enabled)
+        with patch.dict(os.environ, {'A10_MODEL_BACKEND': 'fluxvla'}):
+            rtc = Config.fromfile(ROOT / 'configs/a10/a10_dual_rtc_inference.py')
+        select_a10_backend(rtc)
+        self.assertEqual(rtc.model_backend, 'openpi')
+        self.assertEqual(rtc.inference.remote_inference.protocol, 'openpi_ws')
+        self.assertEqual(rtc.inference.remote_inference.server_port, 8001)
+        self.assertNotIn('inference_model', rtc)
+        self.assertNotIn('dataset', rtc.inference)
+        rtc.inference.mode = 'preview'
+        rtc.inference.cfg = rtc
+        runner = build_runner_from_cfg(rtc.inference)
+        runner.run_setup()
+        self.assertEqual(runner.remote['protocol'], 'openpi_ws')
+        self.assertTrue(runner.rtc_config['enabled'])
+
+    def test_native_compatibility_entry_still_resolves_its_own_pipeline(self):
+        with patch.dict(os.environ, {'A10_MODEL_BACKEND': 'openpi'}):
+            cfg = Config.fromfile(ROOT / 'configs/a10/a10_dual_fold_inference.py')
+        self.assertEqual(cfg.inference.remote_inference.protocol, 'fluxvla_zmq')
+        self.assertEqual(cfg.inference.remote_inference.server_port, 5556)
+        self.assertEqual(cfg.inference.dataset.type, 'A10NativeInferenceDataset')
+
     def config(self):
         with patch.dict(os.environ, {'A10_MODEL_BACKEND': 'fluxvla',
                                      'A10_DUAL_CHECKPOINT': '/tmp/absent-a10-50k'}):
@@ -26,11 +77,11 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(native.inference.remote_inference.protocol, protocol)
             self.assertEqual(native.inference.remote_inference.server_port, port)
             self.assertEqual(native.inference.remote_inference.timeout_s, 3600.)
-            self.assertEqual(native.operator.joint_follower_velocity_percent, 12)
+            self.assertIsNone(native.operator.joint_follower_velocity_percent)
             self.assertEqual(native.inference.mode, 'motion')
             self.assertEqual(native.inference.cycles, 1_000_000)
             self.assertEqual(native.inference.execute_horizon, 20)
-            self.assertEqual(native.inference.manual_speed_percent, 100)
+            self.assertIsNone(native.inference.manual_speed_percent)
             self.assertEqual(native.grippers.left.drop_alarm_policy, 'warn')
             self.assertEqual(native.grippers.right.drop_alarm_policy, 'warn')
             self.assertEqual('inference_model' in native, selected == 'fluxvla')

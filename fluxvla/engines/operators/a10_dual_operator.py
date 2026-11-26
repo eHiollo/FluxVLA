@@ -13,6 +13,7 @@ import numpy as np
 
 from ..utils.root import OPERATORS
 from ..utils.a10_execution_trace import JOINTS, TailExecutionTrace
+from ..utils.action_fusion import ExponentialActionFusion
 from .base_operator import BaseOperator
 
 
@@ -28,7 +29,6 @@ class A10DualOperator(BaseOperator):
         self.devices, self.log = devices, log or (lambda *a, **k: None)
         self.clock = clock or time
         self.command_mode = 'joint'
-        self._trajectory_lock = threading.Lock()
         self.cycle = 0
         self.attempted = self.closed = False
         self.trace = TailExecutionTrace(self.log)
@@ -39,6 +39,7 @@ class A10DualOperator(BaseOperator):
         self._last_packet_send_s = None
         self._last_packet_clock = None
         self.stream_final = False
+        self.action_fusion = ExponentialActionFusion(self.settings.get('action_fusion'))
         from ..utils.a10_follower_tail import tail_config
         self.tail_config = tail_config(self.settings.get('follower_tail'))
         self._lifecycle_lock = threading.RLock()
@@ -70,6 +71,7 @@ class A10DualOperator(BaseOperator):
                            query_started_s=query_started_s, controller_target=target)
 
     def get_frame(self, slop=None, *, include_history=True):
+        self.raise_trajectory_error()
         if self._arrival_pending:
             raise RuntimeError('Previous target arrival unconfirmed; observation blocked')
         from .camera_operator import CameraHistoryNotReady
@@ -114,9 +116,16 @@ class A10DualOperator(BaseOperator):
             self.devices.start()
 
     def execute_trajectory(self, arm_trajectories, gripper_trajectories=None,
-                           head_trajectory=None, dt=1 / 30, async_exec=False):
-        if async_exec is not False or head_trajectory is not None:
-            raise ValueError('Dual A10 baseline requires synchronous arm execution without a head')
+                           head_trajectory=None, dt=1 / 30, async_exec=False,
+                           reference_time=None):
+        if type(async_exec) is not bool or head_trajectory is not None:
+            raise ValueError('Dual A10 requires boolean async_exec and has no head')
+        if async_exec and self.tail_config['enabled']:
+            raise ValueError('Asynchronous publishing cannot use per-block arrival/stop')
+        if reference_time is not None and (
+                not async_exec or not self.action_fusion.config['enabled']
+                or not math.isfinite(reference_time)):
+            raise ValueError('reference_time requires asynchronous action fusion and a finite timestamp')
         if set(arm_trajectories) != {'left', 'right'} or set(gripper_trajectories or {}) != {'left', 'right'}:
             raise ValueError('Both physical arms and normalized gripper trajectories are required')
         n = self._validate_trajectory_lengths(arm_trajectories, gripper_trajectories)
@@ -134,39 +143,76 @@ class A10DualOperator(BaseOperator):
             raise ValueError('Trajectory dt must match the configured model action_dt')
         if np.any((rows[:, [6, 13]] < 0) | (rows[:, [6, 13]] > 1)):
             raise ValueError('Dual gripper closure must be within 0..1')
-        if not self._trajectory_lock.acquire(blocking=False):
-            raise RuntimeError('A dual A10 trajectory is already running')
-        self._trajectory_running = True
-        try:
-            self._execute_rows(rows, dt)
-        finally:
-            self._trajectory_running = False
-            self._trajectory_lock.release()
+        rows = rows.copy()  # The caller may reuse its action array during inference.
+        cycle, final = self.cycle, self.stream_final
 
-    def _execute_rows(self, rows, dt):
+        def publish(stop_event):
+            self._trajectory_running = True
+            try:
+                if async_exec:
+                    origin = self.last_target if self.last_target is not None else self.last_frame['qpos']
+                    published, raw, start = rows, None, None
+                    if self.action_fusion.config['enabled']:
+                        # The previous writer has joined. Align only once, to
+                        # the next permitted wire slot, before fusing forecasts.
+                        from ..utils.trajectory_utils import resample_remaining
+                        start = self.clock.monotonic()
+                        if self._last_packet_send_s is not None:
+                            start = max(start, self._last_packet_send_s + dt)
+                        raw = (resample_remaining(rows, max(0., (start-reference_time)/dt))
+                               if reference_time is not None else rows)
+                        if not len(raw):
+                            raise RuntimeError('Prediction expired before fusion; no target sent')
+                        self.bridge.check_steps(raw, origin, self.settings['max_joint_step_rad'])
+                        published, info = self.action_fusion.fuse(raw, start_s=start, dt=dt)
+                        self.log('action_fusion', cycle=cycle, reference_time=reference_time,
+                                 raw_targets=raw, fused_targets=published, **info)
+                    self.bridge.check_steps(published, origin, self.settings['max_joint_step_rad'])
+                    self._send_rows(published, dt, stop_event=stop_event, cycle=cycle,
+                                    final=final, start_s=start, raw_rows=raw)
+                else:
+                    self._execute_rows(rows, dt, stop_event=stop_event, cycle=cycle, final=final)
+            finally:
+                self._trajectory_running = False
+
+        with self._trajectory_submission_lock:
+            if self.closed:
+                raise RuntimeError('A10 operator is closed')
+            return self._submit_trajectory(publish, async_exec=async_exec)
+
+    def _execute_rows(self, rows, dt, *, stop_event=None, cycle=None, final=None):
         if self.timed_enabled:
-            return self._send_rows(rows, dt)
+            return self._send_rows(rows, dt, stop_event=stop_event, cycle=cycle, final=final)
         if self.tail_config['enabled']:
             return self._execute_follower_tail(rows, dt)
-        return self._send_rows(rows, dt)
+        return self._send_rows(rows, dt, stop_event=stop_event, cycle=cycle, final=final)
 
-    def _send_rows(self, rows, dt):
+    def _send_rows(self, rows, dt, *, stop_event=None, cycle=None, final=None,
+                   start_s=None, raw_rows=None):
         n = len(rows)
-        self._traj_stop_event.clear()
+        if stop_event is None:
+            stop_event = self._traj_stop_event
+            stop_event.clear()
+        cycle = self.cycle if cycle is None else cycle
+        final = self.stream_final if final is None else final
         self.start_follower()
         period = dt
         sent = 0
         # A new block may follow an arbitrary inference/hold gap. Only its
         # local 30 Hz pacing starts here; target numbering stays in the client.
-        start = self.clock.monotonic()
-        self.log('execution_start', cycle=self.cycle, started_s=start, selected=n)
+        start = self.clock.monotonic() if start_s is None else start_s
+        if start_s is None and self._last_packet_send_s is not None:
+            start = max(start, self._last_packet_send_s + period)
+        self.log('execution_start', cycle=cycle, started_s=start, selected=n)
         slot = 0
         while True:
-            if self._traj_stop_event.is_set():
+            if stop_event.is_set():
                 raise InterruptedError('Dual A10 trajectory cancelled')
             checking = self.clock.monotonic()
             deadline = start + slot * period
-            self.clock.sleep(max(0., deadline - self.clock.monotonic()))
+            self._sleep_publishing(max(0., deadline - self.clock.monotonic()), stop_event)
+            if stop_event.is_set():
+                raise InterruptedError('Dual A10 trajectory cancelled')
             lag_limit = self.settings['max_send_lag_s']
             if self.clock.monotonic() - deadline > lag_limit:
                 raise RuntimeError('Joint send deadline missed')
@@ -178,12 +224,12 @@ class A10DualOperator(BaseOperator):
                 checking = checked  # There was no feedback query in this slot.
             lag = checked - deadline
             if lag > lag_limit:
-                self.log('send_deadline_missed', cycle=self.cycle, frame=sent + 1,
+                self.log('send_deadline_missed', cycle=cycle, frame=sent + 1,
                          phase='feedback_check', check_s=checked - checking, lag_s=lag)
                 raise RuntimeError('Feedback check exceeded joint send deadline')
             row = rows[sent]
             send_started = self.clock.monotonic()
-            timing = (self.devices.send(row, final=self.stream_final and sent == n - 1) if self.timed_enabled
+            timing = (self.devices.send(row, final=final and sent == n - 1) if self.timed_enabled
                       else self.devices.send(row))
             finished = self.clock.monotonic()
             wire_time = timing.get('udp_send_started_s') if isinstance(timing, dict) else None
@@ -192,7 +238,7 @@ class A10DualOperator(BaseOperator):
             if sent == 0:
                 if self.last_target is not None:
                     jump = row[JOINTS] - self.last_target[JOINTS]
-                    self.log('chunk_boundary', cycle=self.cycle,
+                    self.log('chunk_boundary', cycle=cycle,
                              previous_target=self.last_target, next_target=row,
                              target_jump_rad=jump,
                              reverses_previous_target_direction=(None if self.last_target_step is None
@@ -203,7 +249,8 @@ class A10DualOperator(BaseOperator):
                                      else row[JOINTS] - self.last_target[JOINTS])
             self.last_target = row.copy()
             sent += 1
-            self.log('sent', cycle=self.cycle, frame=sent, target=row, scheduled_s=deadline,
+            self.log('sent', cycle=cycle, frame=sent, target=row, scheduled_s=deadline,
+                     **({'unfused_target': raw_rows[sent-1]} if raw_rows is not None else {}),
                      send_started_s=send_started, send_finished_s=finished,
                      check_s=checked - checking, send_s=finished - send_started,
                      check_lag_s=lag, send_hz=1/dt,
@@ -219,15 +266,22 @@ class A10DualOperator(BaseOperator):
                 raise RuntimeError('timed_aj UDP submission exceeded send deadline; no retry')
             done = sent >= n
             if done:
-                self.trace.arm(self.cycle, row, finished)
+                self.trace.arm(cycle, row, finished)
                 break
             slot = sent
-        self.clock.sleep(max(0., start + n * dt - self.clock.monotonic()))
-        self.log('execution_end', cycle=self.cycle, sent=sent,
+        self._sleep_publishing(max(0., start + n * dt - self.clock.monotonic()), stop_event)
+        self.log('execution_end', cycle=cycle, sent=sent,
                  finished_s=self.clock.monotonic(), physical_arrival_confirmed=False)
+
+    def _sleep_publishing(self, duration, stop_event):
+        if self.clock is time:
+            stop_event.wait(duration)
+        else:
+            self.clock.sleep(duration)
 
     def finish_timed_stream(self):
         """Only the true end of a run drains final before releasing the Plan."""
+        self.wait_trajectory()
         if not self.timed_enabled or not self.attempted or not self.stream_final:
             return
         self._arrival_pending = True
@@ -389,7 +443,7 @@ class A10DualOperator(BaseOperator):
 
     @contextmanager
     def inference_feedback(self):
-        """Optional measurement only: no reads overlap the target sending loop."""
+        """Optional measurement on the shared state connection; never sends targets."""
         enabled = self.settings.get('trace_inference_feedback', False)
         reader = getattr(self.devices, '_robot_state', None)
         if not enabled or reader is None:
@@ -422,8 +476,22 @@ class A10DualOperator(BaseOperator):
             raise ConnectionError('Diagnostic feedback query failed') from failures[0]
 
     def stop_trajectory(self, reason='run_exit'):
+        self._traj_stop_event.set()
+        with self._trajectory_submission_lock:
+            self._cancel_trajectory_worker()
+            with self._lifecycle_lock:
+                result = self._stop_trajectory(reason)
+                self._trajectory_error = None
+                return result
+
+    def _on_trajectory_error(self, error):
+        # The worker must halt hardware even while the model RPC is blocked.
+        # Do not acquire the submission lock: another thread may be joining us.
         with self._lifecycle_lock:
-            return self._stop_trajectory(reason)
+            try:
+                self._stop_trajectory('publisher_error')
+            except BaseException as stop_error:
+                self.log('publisher_stop_failed', error=str(error), stop_error=str(stop_error))
 
     def _stop_trajectory(self, reason):
         self._traj_stop_event.set()
@@ -440,12 +508,14 @@ class A10DualOperator(BaseOperator):
             self.attempted = False
             if self.timed_enabled:
                 self.last_target = self.last_target_step = None
+        self.action_fusion.reset()
 
     def is_trajectory_running(self):
         return getattr(self, '_trajectory_running', False)
 
     def close(self):
-        with self._lifecycle_lock:
+        self._traj_stop_event.set()
+        with self._trajectory_submission_lock:
             if self.closed:
                 return
             self.closed = True

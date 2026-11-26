@@ -1,4 +1,4 @@
-"""Synchronous KAANH A10 inference runner; hardware timing belongs to operator."""
+"""KAANH A10 runners using the shared chunk lifecycle and operator clocks."""
 
 import logging
 import json
@@ -119,9 +119,14 @@ class A10InferenceRunner(BaseInferenceRunner):
         rtc_request = None
         rtc_info = None
         if self.rtc_config.get('enabled', False):
-            rtc_request = dict(config=self.rtc_config, absolute_actions=self._rtc_remaining)
+            from ..utils.a10_rtc import resolve_rtc_config
+            request_config = resolve_rtc_config(
+                self.rtc_config, elapsed_s=(self.last_cycle or {}).get('infer_s', 0.),
+                dt=self.action_dt, available=(len(self._rtc_remaining) if self._rtc_remaining is not None
+                                               else self.action_chunk), action_chunk=self.action_chunk)
+            rtc_request = dict(config=request_config, absolute_actions=self._rtc_remaining)
             if self._use_remote:
-                inputs['a10_rtc_config'] = json.dumps(self.rtc_config)
+                inputs['a10_rtc_config'] = json.dumps(request_config)
                 if self._rtc_remaining is not None:
                     inputs['a10_rtc_actions'] = self._rtc_remaining
         if self._use_remote and self._recorder is not None:
@@ -272,7 +277,8 @@ class A10InferenceRunner(BaseInferenceRunner):
             if not isinstance(instruction, str) or not instruction.strip():
                 raise ValueError('Provide a nonempty A10 task instruction')
             self.run_setup()
-            with torch.inference_mode():
+            mode_context = torch.no_grad if self.rtc_config.get('use_vjp', False) else torch.inference_mode
+            with mode_context():
                 while self.max_publish_step is None or steps < self.max_publish_step:
                     self._debug_cycle += 1
                     started = time.monotonic()
@@ -472,6 +478,8 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         state_dim=14,
         publish_rate=None,
         async_execution=False,
+        rtc_config=None,
+        action_fusion=None,
     ):
         del dataset, denormalize_action, debug_log  # Model-server settings, not client transforms.
         if ckpt_path is not None:
@@ -485,14 +493,24 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             raise ValueError(f'Dual A10 policy requires action_chunk={expected_chunk} and state_dim=14')
         if longwam and not math.isclose(action_dt, 1 / 30):
             raise ValueError('LongWAM requires action_dt=1/30')
-        if async_execution is not False:
-            raise ValueError('Dual A10 framework baseline requires async_execution=False')
+        if type(async_execution) is not bool:
+            raise ValueError('async_execution must be boolean')
+        from ..utils.a10_rtc import validate_rtc
+        self.rtc_config = validate_rtc(rtc_config, expected_chunk, execute_horizon)
+        from ..utils.action_fusion import fusion_config
+        self.action_fusion = fusion_config(action_fusion)
+        if self.action_fusion['enabled'] and async_execution and self.rtc_config.get('enabled'):
+            raise ValueError('Use action_fusion or model RTC separately; disable action_fusion for model RTC')
+        if (self.rtc_config.get('enabled')
+                and remote_inference.get('protocol') not in ('fluxvla_zmq', 'openpi_ws')):
+            raise ValueError('RTC requires an OpenPI WS or FluxVLA ZMQ server with absolute-prefix support')
         if publish_rate is not None and (isinstance(publish_rate, bool)
                 or not isinstance(publish_rate, (int, float))
                 or not math.isfinite(publish_rate)
                 or not math.isclose(publish_rate, 1 / action_dt)):
             raise ValueError('publish_rate must equal 1/action_dt')
-        self.async_execution = False
+        self.async_execution = async_execution
+        self.dt = float(action_dt)
         self.config = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(cfg or {})
         # The standard entrypoint injects cfg into cfg.inference; omit that back-reference.
         self.config.get("inference", {}).pop("cfg", None)
@@ -513,6 +531,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
             trace_inference_feedback=trace_inference_feedback,
             follower_tail=follower_tail,
             timed_aj=timed_aj,
+            action_fusion=dict(self.action_fusion, enabled=self.action_fusion['enabled'] and async_execution),
         )
         if longwam:
             self.settings['longwam_history'] = True
@@ -537,10 +556,11 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         if type(self.cycles) is not int or self.cycles < 1:
             raise ValueError("cycles must be positive")
         horizon = self.settings["execute_horizon"]
-        if type(horizon) is not int or not 1 <= horizon <= 30:
-            raise ValueError("execute_horizon must be 1..30")
+        minimum = 0 if self.async_execution else 1
+        if type(horizon) is not int or not minimum <= horizon <= self.action_chunk:
+            raise ValueError(f"execute_horizon must be {minimum}..{self.action_chunk}")
         for key, value in self.settings.items():
-            if key in ('follower_tail', 'timed_aj'):
+            if key in ('follower_tail', 'timed_aj', 'execute_horizon', 'action_fusion'):
                 continue
             if key == 'trace_inference_feedback':
                 if type(value) is not bool:
@@ -560,6 +580,10 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         tail = tail_config(self.settings['follower_tail'])
         if tail['enabled'] and horizon != 20:
             raise ValueError('follower_tail requires execute_horizon=20')
+        if tail['enabled'] and self.async_execution:
+            raise ValueError('async_execution cannot use per-block arrival/stop')
+        if self.async_execution and horizon >= self.action_chunk:
+            raise ValueError('async_execution needs execute_horizon < action_chunk for inference overlap')
         from ..communication.a10_timed_aj import timed_config
         timed = timed_config(self.settings['timed_aj'])
         self.settings['timed_aj'] = timed
@@ -600,6 +624,22 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                 raise ValueError(f"grippers.{side}.feedback_mode must be full or motion")
             if type(device.get("compact_trigger", False)) is not bool:
                 raise ValueError(f"grippers.{side}.compact_trigger must be bool")
+            deadband = device.get('target_deadband_raw', 0)
+            if type(deadband) is not int or not 0 <= deadband <= 9000:
+                raise ValueError(f'grippers.{side}.target_deadband_raw must be an integer within 0..9000')
+            reverse_band = device.get('reversal_deadband_raw', 0)
+            if type(reverse_band) is not int or not 0 <= reverse_band <= 9000:
+                raise ValueError(f'grippers.{side}.reversal_deadband_raw must be an integer within 0..9000')
+            reverse_time = device.get('reversal_confirm_s', 0.)
+            if (isinstance(reverse_time, bool) or not isinstance(reverse_time, (int, float))
+                    or not math.isfinite(reverse_time) or not 0 <= reverse_time <= 1.):
+                raise ValueError(f'grippers.{side}.reversal_confirm_s must be within [0, 1]')
+            bias = device.get('closure_bias_raw', 0)
+            if type(bias) is not int or not 0 <= bias <= 9000:
+                raise ValueError(f'grippers.{side}.closure_bias_raw must be an integer within 0..9000')
+            fade = device.get('closure_bias_fade_raw', 900)
+            if type(fade) is not int or not 1 <= fade <= 9000:
+                raise ValueError(f'grippers.{side}.closure_bias_fade_raw must be an integer within 1..9000')
             policy = device.get("drop_alarm_policy", "stop")
             if policy not in ("stop", "warn"):
                 raise ValueError(
@@ -617,10 +657,11 @@ class A10DualInferenceRunner(BaseInferenceRunner):
 
     @classmethod
     def from_components(cls, devices, policy, settings, log, *, cycles=2,
-                        read_only=False, clock=time, bridge=None):
+                        read_only=False, clock=time, bridge=None, remote_inference=None):
         """Offline/legacy entrypoint; uses the same framework chunk lifecycle."""
         from ..operators.a10_dual_operator import A10DualOperator
-        runner = cls(dict(protocol='openpi_ws', server_host='127.0.0.1', server_port=8001),
+        remote = remote_inference or dict(protocol='openpi_ws', server_host='127.0.0.1', server_port=8001)
+        runner = cls(remote,
                      mode='read_only' if read_only else 'simulate', cycles=cycles, **settings)
         runner.ros_operator = A10DualOperator(devices=devices, settings=settings,
                                              log=log, clock=clock, bridge=bridge)
@@ -659,10 +700,51 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                                 for name, frames in history.items()})
         with self.ros_operator.inference_feedback():
             started = self._clock.monotonic()
+            self._action_ctx.inference_start = started
+            prefix = None
+            if self.rtc_config.get('enabled'):
+                previous = self._prev_ctx
+                if previous is not None:
+                    from ..utils.chunk_execution import remaining_action_prefix
+                    prefix = remaining_action_prefix(
+                        previous.actions, action_timestamp=previous.action_timestamp,
+                        now=started, dt=self.dt)
+                    if not len(prefix):
+                        raise RuntimeError('RTC old trajectory exhausted before observation; shorten execute_horizon')
+                from ..utils.a10_rtc import resolve_rtc_config
+                request_config = resolve_rtc_config(
+                    self.rtc_config,
+                    elapsed_s=getattr(previous, 'inference_elapsed', 0.) if previous is not None else 0.,
+                    dt=self.dt, available=len(prefix) if prefix is not None else self.action_chunk,
+                    action_chunk=self.action_chunk)
+                wire['a10_rtc_config'] = json.dumps(request_config)
+                wire['a10_rtc_execution'] = ('asynchronous_time_aligned' if self.async_execution
+                                              else 'synchronous_remaining_prefix')
+                if prefix is not None:
+                    wire['a10_rtc_actions'] = prefix
             self.log('inference_start', cycle=self._cycle, started_s=started,
                      observation_received_s=inputs['robot_time'])
             response = self._policy.infer(wire)
             finished = self._clock.monotonic()
+            self.ros_operator.raise_trajectory_error()
+            if self.rtc_config.get('enabled'):
+                info = (response.get('debug') or {}).get('rtc')
+                if (not info or info.get('enabled') is not True
+                        or info.get('method') != self.rtc_config['method']):
+                    raise RuntimeError('Model server did not acknowledge the requested RTC method')
+                if prefix is not None and info.get('applied') is not True:
+                    raise RuntimeError('Model server did not apply RTC prefix')
+                if prefix is not None and info.get('prefix_len') != min(len(prefix), request_config['prefix_len']):
+                    raise RuntimeError('Model server acknowledged a different RTC prefix length')
+                if prefix is not None and self.async_execution:
+                    covered_s = min(len(prefix), request_config['prefix_len']) * self.dt
+                    self._action_ctx.rtc_covered_until = started + covered_s
+                    if finished - started >= covered_s:
+                        self.log('rtc_prefix_expired', cycle=self._cycle,
+                                 request_s=finished-started, covered_s=covered_s,
+                                 retained_steps=len(prefix))
+                        raise RuntimeError('RTC inference exceeded the committed prefix window; shorten execute_horizon or increase prefix_len')
+                self.log('rtc_guidance', cycle=self._cycle, **info)
             timing = {}
             if self.remote['protocol'] == 'openpi_ws':
                 timing['response_received_s'] = getattr(self._policy, 'response_received_s', None)
@@ -678,6 +760,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
         self._action_ctx.raw_response = response
         self._action_ctx.inference_start = started
         self._action_ctx.inference_finished = finished
+        self._action_ctx.inference_elapsed = finished - started
         return response
 
     def _postprocess_actions(self, raw_action):
@@ -696,21 +779,67 @@ class A10DualInferenceRunner(BaseInferenceRunner):
 
     def _execute_actions(self, actions, rate=None):
         del rate  # The operator owns the one hardware clock, as in ALOHA.
+        from ..utils.chunk_execution import select_action_chunk
+        selected = select_action_chunk(
+            actions, self._action_ctx, self._prev_ctx,
+            now=self._clock.monotonic(), dt=self.dt,
+            async_execution=self.async_execution, execute_horizon=self.execute_horizon)
+        if not len(selected):
+            raise RuntimeError('Prediction expired during inference; no target sent')
         if self.mode == 'read_only':
             return
-        current = self.ros_operator.validate_actions(actions)
+        current = self.ros_operator.validate_actions(selected if self.async_execution else actions)
+        if self.async_execution:
+            # Finish the first controller handshake before starting the action
+            # clock or counting K periods towards the next observation.
+            self.ros_operator.start_follower()
+            selected = select_action_chunk(
+                actions, self._action_ctx, self._prev_ctx,
+                now=self._clock.monotonic(), dt=self.dt,
+                async_execution=True, execute_horizon=self.execute_horizon)
+            if not len(selected):
+                raise RuntimeError('Prediction expired before publishing; no target sent')
+            covered_until = getattr(self._action_ctx, 'rtc_covered_until', None)
+            if covered_until is not None and self._clock.monotonic() >= covered_until:
+                raise RuntimeError('RTC prefix window expired before publishing; no target sent')
         joints = [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
         self.log('pre_execution_feedback', cycle=self._cycle, state=current,
                  received_monotonic_s=self.ros_operator.last_frame['robot_time'],
                  observation_received_s=self.observation_window[-1]['robot_time'],
                  joint_motion_since_observation_rad=current[joints] - self._action_ctx.state[joints],
-                 first_target_error_rad=actions[0, joints] - current[joints])
-        selected = actions[:self.execute_horizon]
+                 first_target_error_rad=selected[0, joints] - current[joints])
+        self.log('chunk_schedule', cycle=self._cycle, async_execution=self.async_execution,
+                 action_timestamp=self._action_ctx.action_timestamp,
+                 execution_offset=self._action_ctx.execution_offset,
+                 predicted=len(actions), selected=len(selected),
+                 execute_horizon=self.execute_horizon)
         self.ros_operator.stream_final = self._cycle + 1 >= self.cycles
+        fused_execution = self.async_execution and self.action_fusion['enabled']
+        publication = actions if fused_execution else selected
         self.ros_operator.execute_trajectory(
-            arm_trajectories={'left': selected[:, :6], 'right': selected[:, 7:13]},
-            gripper_trajectories={'left': selected[:, 6], 'right': selected[:, 13]},
-            dt=self.settings['action_dt'], async_exec=False)
+            arm_trajectories={'left': publication[:, :6], 'right': publication[:, 7:13]},
+            gripper_trajectories={'left': publication[:, 6], 'right': publication[:, 13]},
+            dt=self.dt, async_exec=self.async_execution,
+            **({'reference_time': self._action_ctx.action_timestamp} if fused_execution else {}))
+        if self.async_execution:
+            if self.ros_operator.stream_final:
+                self.ros_operator.wait_trajectory()
+            else:
+                # Same observation cadence as AlohaInferenceRunner. Publishing
+                # continues through the next observation and model RPC.
+                self._clock.sleep(self.execute_horizon * self.dt)
+                self.ros_operator.raise_trajectory_error()
+
+    def _validate_policy_capabilities(self):
+        if not self.rtc_config.get('enabled'):
+            return
+        capability = self._policy.metadata.get('rtc', {})
+        if (capability.get('absolute_prefix_version') != 1
+                or 14 not in capability.get('state_dims', [])
+                or self.rtc_config['method'] not in capability.get('methods', [])):
+            raise RuntimeError(
+                f"{self.remote['protocol']} model server does not advertise dual-arm RTC; "
+                'connect model-side absolute-prefix RTC support before enabling rtc_config')
 
     def cleanup(self):
         try:
@@ -730,7 +859,9 @@ class A10DualInferenceRunner(BaseInferenceRunner):
 
         if not self._ready:
             self.run_setup()
-        print(json.dumps(dict(mode=self.mode, remote_inference=self.remote, **self.settings), indent=2), flush=True)
+        print(json.dumps(dict(mode=self.mode, remote_inference=self.remote,
+                              async_execution=self.async_execution, rtc_config=self.rtc_config,
+                              **self.settings), indent=2), flush=True)
         if self.mode == 'preview':
             return
         journal = None
@@ -746,6 +877,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                 (directory / 'config.json').write_text(json.dumps(control.plain(self.config), indent=2))
                 journal = control.Journal(directory / 'events.jsonl', metadata=dict(
                     settings=self.settings, mode=self.mode,
+                    async_execution=self.async_execution, rtc_config=self.rtc_config,
                     runner=type(self).__name__, operator=type(self.ros_operator).__name__,
                     loop='BaseInferenceRunner._run_action_chunk'))
                 self.log = journal
@@ -765,6 +897,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                 else:
                     self._policy = control.ZmqPolicy(*args, prompt=self.settings['prompt'])
                 server_metadata = self._policy.metadata
+                self._validate_policy_capabilities()
                 model = server_metadata.get('model') if isinstance(server_metadata, dict) else None
                 model = control.plain(model) if isinstance(model, dict) and model else None
                 identity = dict(backend=remote['protocol'], server=self._server_address,
@@ -772,6 +905,8 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                 (directory / 'model.json').write_text(json.dumps(identity, indent=2) + '\n')
                 self.log('connected', metadata=server_metadata, mode=self.mode, model_identity=identity)
                 self.ros_operator.connect()
+            else:
+                self._validate_policy_capabilities()
             instruction = self.settings['prompt'] if initial_instruction is None else initial_instruction
             while self._cycle < self.cycles:
                 self.ros_operator.cycle = self._cycle
@@ -784,6 +919,7 @@ class A10DualInferenceRunner(BaseInferenceRunner):
                     continue
                 self._cycle += 1
                 if paused:
+                    self.ros_operator.stop_trajectory('keyboard_pause')
                     self.log('paused', cycles=self._cycle)
                     break
             self.ros_operator.finish_timed_stream()

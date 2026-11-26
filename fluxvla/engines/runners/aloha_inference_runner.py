@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from ..utils.root import RUNNERS
-from ..utils.trajectory_utils import resample_remaining
+from ..utils.chunk_execution import select_action_chunk
 from .base_inference_runner import BaseInferenceRunner
 
 
@@ -255,14 +255,10 @@ class AlohaInferenceRunner(BaseInferenceRunner):
 
         ctx = self._action_ctx
 
-        if self.async_execution and self._prev_ctx is not None:
-            ctx.action_timestamp = ctx.inference_start
-            offset = (time.time() - ctx.action_timestamp) / self.dt
-            actions = resample_remaining(actions, offset)
-        else:
-            ctx.action_timestamp = time.time()
-            if self.execute_horizon is not None:
-                actions = actions[:self.execute_horizon]
+        actions = select_action_chunk(
+            actions, ctx, self._prev_ctx, now=time.time(), dt=self.dt,
+            async_execution=self.async_execution,
+            execute_horizon=self.execute_horizon)
 
         self.ros_operator.execute_trajectory(
             actions[:, :7],

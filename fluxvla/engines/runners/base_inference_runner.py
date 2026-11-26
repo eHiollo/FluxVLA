@@ -368,8 +368,8 @@ class BaseInferenceRunner:
     def _run_action_chunk(self, instruction, rate=None):
         """Common chunk lifecycle, independent of ROS and the hardware clock.
 
-        Operators finish publishing the chunk before this returns. A configured
-        operator may also require actual-position arrival before returning.
+        The operator may publish synchronously or keep publishing in the
+        background. The runner's execution phase chooses the observation cadence.
         """
         self._action_ctx = SimpleNamespace(instruction=instruction)
         inputs = self._preprocess(instruction)

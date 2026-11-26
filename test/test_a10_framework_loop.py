@@ -158,7 +158,9 @@ class FrameworkParityTests(unittest.TestCase):
         runner = A10DualInferenceRunner(remote, publish_rate=30, action_chunk=30,
                                         state_dim=14, async_execution=False)
         self.assertEqual(runner.publish_rate, 30)
-        for kwargs in (dict(publish_rate=60), dict(async_execution=True), dict(action_dt=0)):
+        asynchronous = A10DualInferenceRunner(remote, async_execution=True)
+        self.assertTrue(asynchronous.async_execution)
+        for kwargs in (dict(publish_rate=60), dict(async_execution='yes'), dict(action_dt=0)):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 A10DualInferenceRunner(remote, **kwargs)
 

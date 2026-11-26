@@ -74,6 +74,8 @@ class BaseOperator:
         self._last_empty_frame_warning_at = 0.0
         self._traj_thread = None
         self._traj_stop_event = threading.Event()
+        self._trajectory_submission_lock = threading.RLock()
+        self._trajectory_error = None
 
     def build_observation_specs(self):
         """Return topic specs to synchronize.
@@ -325,18 +327,10 @@ class BaseOperator:
         n = self._validate_trajectory_lengths(arm_trajectories,
                                               gripper_trajectories)
 
-        self._traj_stop_event.set()
-        self._traj_stop_event = threading.Event()
-        stop_event = self._traj_stop_event
-        args = (arm_trajectories, gripper_trajectories, head_trajectory, n, dt,
-                stop_event)
-
-        if async_exec:
-            self._traj_thread = threading.Thread(
-                target=self._run_trajectory, args=args, daemon=True)
-            self._traj_thread.start()
-        else:
-            self._run_trajectory(*args)
+        return self._submit_trajectory(
+            lambda stop_event: self._run_trajectory(
+                arm_trajectories, gripper_trajectories, head_trajectory,
+                n, dt, stop_event), async_exec=async_exec)
 
     @staticmethod
     def _validate_trajectory_lengths(arm_trajectories, gripper_trajectories):
@@ -356,6 +350,61 @@ class BaseOperator:
         if len(unique_lengths) != 1:
             raise ValueError(f'Trajectory length mismatch: {lengths}')
         return unique_lengths.pop()
+
+    def _submit_trajectory(self, worker, *, async_exec=False):
+        """Replace a publishing worker, never queue chunks or overlap writers.
+
+        ``worker(stop_event)`` must honor its own event. Hardware-specific
+        operators can reuse this lifecycle without importing ROS.
+        """
+        with self._trajectory_submission_lock:
+            self._cancel_trajectory_worker()
+            self.raise_trajectory_error()
+            self._traj_stop_event = threading.Event()
+            stop_event = self._traj_stop_event
+            if not async_exec:
+                self._traj_thread = None
+                return worker(stop_event)
+
+            def execute():
+                try:
+                    worker(stop_event)
+                except InterruptedError as exc:
+                    if not stop_event.is_set():
+                        self._trajectory_error = exc
+                        self._on_trajectory_error(exc)
+                except BaseException as exc:
+                    self._trajectory_error = exc
+                    stop_event.set()
+                    self._on_trajectory_error(exc)
+
+            self._traj_thread = threading.Thread(
+                target=execute, name=f'{type(self).__name__}-trajectory', daemon=True)
+            self._traj_thread.start()
+
+    def _cancel_trajectory_worker(self):
+        self._traj_stop_event.set()
+        thread = self._traj_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.)
+            if thread.is_alive():
+                raise TimeoutError('Previous trajectory publisher did not exit')
+
+    def wait_trajectory(self, timeout=None):
+        """Wait for publishing completion and surface background errors."""
+        thread = self._traj_thread
+        if thread is not None:
+            thread.join(timeout)
+            if thread.is_alive():
+                raise TimeoutError('Trajectory publisher did not finish')
+        self.raise_trajectory_error()
+
+    def raise_trajectory_error(self):
+        if self._trajectory_error is not None:
+            raise self._trajectory_error
+
+    def _on_trajectory_error(self, error):
+        """Hardware adapters may stop the controller after a publisher failure."""
 
     def _run_trajectory(self, arm_trajectories, gripper_trajectories,
                         head_trajectory, num_steps, dt, stop_event):

@@ -107,11 +107,22 @@ python -m fluxvla.engines.runners.serving.serve \
   --config configs/a10/a10_dual_inference.py \
   --model fluxvla --from-config --dtype fp32 --host 127.0.0.1 --port 5556
 
-统一双臂客户端（默认motion，操作前确认现场状态并手动使能）：
+统一双臂客户端（默认OpenPI WS/8001、motion，操作前确认现场状态并手动使能）：
 python scripts/inference.py --config configs/a10/a10_dual_inference.py
 
 选择OpenPI模型（服务在OpenPI侧启动）：
 python scripts/inference.py --config configs/a10/a10_dual_inference.py --model openpi
+
+OpenPI异步＋指数融合（无模型RTC要求，WS/8001，30Hz，K=0）：
+python scripts/inference.py --config configs/a10/a10_dual_openpi_async_inference.py
+使用速度融合＋持续位置校正：权重0.25、6点入场、12点退出；不增加播放缓冲。
+异步入口夹爪独立融合α=.35；反向变化需超过450 raw并持续250ms才换向，保留连续开度。
+同方向按45 raw死区跟随；实际换向也会多一次确认等待。只过滤夹爪，不改变当前手臂参数。
+最新记录回放：块中段/两侧速度比0.874→0.981，软件目标jerk RMS再降27.1%，目标偏移RMS基本不变。
+这些是软件参考指标；2026-11-26用户现场反馈机器人顺滑、夹爪正常，尚无量化实机验收。复现旧位置融合加：
+  --cfg-options inference.action_fusion.method=position
+参数和复现见 docs/a10_action_fusion.md。复现裸异步加：
+  --cfg-options inference.action_fusion.enabled=False
 
 仅预览、不连接模型或设备：
 python scripts/inference.py --config configs/a10/a10_dual_inference.py \
@@ -123,12 +134,17 @@ python scripts/inference.py --config configs/a10/a10_dual_inference.py \
 新版下游可在同步推理空档保持末点并续接；上游允许块间等待，不发送补偿保持点。
 无参启动后从ready状态取得实际内部编号，通信层自动递增点号；模型和操作者不填编号。
 现场已确认网络入口配置完成，默认UDP发送到192.168.0.150:10000，network_ready=True。
+现场下游原40ms主动播放缓冲已关闭；上游不添加该等待，也不自动重新启用。
 此标记不代表UDP接收或实机运动已验证，不会自动使能或发送目标。
 详情与协议核对见 docs/a10_timed_aj.md。未执行实机运动验证。
 默认100万轮、单次模型超时3600秒、双夹爪报警warn；故障和过期反馈保护保留。
 可选推理等待期只读反馈诊断：--cfg-options inference.trace_inference_feedback=True。
 推理夹爪速度30%，位置/速度/电流按100Hz上限读取；丢读跳过、不重试、不等待到位。
 读写共用串口，连续换目标时实际反馈频率低于100Hz；启动时检查报警/使能，循环内不重复读。
+推理两侧夹爪默认增加最多450 raw闭合偏置（0全开、9000全闭），限幅9000；
+模型0～900 raw时偏置线性减小，模型全开0仍下发0。原始模型输出和实测反馈不改。
+调整示例：--cfg-options grippers.left.closure_bias_raw=300 grippers.right.closure_bias_raw=300
+设两侧closure_bias_raw=0可关闭偏置；改配置后重启推理客户端。
 
 
 m_init 不再读取或修改电机加速度，也不临时切换/恢复加速度；保持原5%回位倍率及到位、停止核验。

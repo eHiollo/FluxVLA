@@ -209,6 +209,56 @@ class GripperFault(RuntimeError):
     """Recoverable gripper fault; motion must pause until acknowledged."""
 
 
+def gripper_target_raw(closure, device):
+    """Return unbiased and compensated targets; never accumulate on feedback.
+
+    Both onsite grippers close toward 9000. Fade the offset near full open so
+    small positive model noise does not become a large closing command.
+    """
+    model_target = int(round(closure * 9000))
+    bias = device.get('closure_bias_raw', 0)
+    fade = device.get('closure_bias_fade_raw', 900)
+    offset = int(round(bias * min(1., max(0., model_target / fade))))
+    return model_target, min(9000, max(0, model_target + offset))
+
+
+class GripperReversalGuard:
+    """Confirm sustained opposite commands without blocking the arm publisher.
+
+    The reference is the last acknowledged command, never measured aperture:
+    contact and tracking lag must not manufacture a new motion direction.
+    """
+
+    def __init__(self, deadband_raw=0, confirm_s=0.):
+        self.deadband_raw, self.confirm_s = deadband_raw, confirm_s
+        self.reset()
+
+    def reset(self):
+        self.target, self.direction, self.pending_s = None, 0, None
+
+    def allows(self, target, now):
+        if self.target is None:
+            return True
+        delta = target-self.target
+        direction = (delta > 0)-(delta < 0)
+        if not direction or not self.direction or direction == self.direction:
+            self.pending_s = None
+            return True
+        # Endpoints still require time confirmation, but a tiny residual
+        # aperture must never prevent an intentional complete release.
+        if abs(delta) < self.deadband_raw and target not in (0, 9000):
+            self.pending_s = None
+            return False
+        if self.pending_s is None:
+            self.pending_s = now
+        return now-self.pending_s >= self.confirm_s-1e-12
+
+    def acknowledge(self, target):
+        if self.target is not None and target != self.target:
+            self.direction = 1 if target > self.target else -1
+        self.target, self.pending_s = target, None
+
+
 class LiveDevices:
     def __init__(self, config, log, motion=False, *, command_mode="joint"):
         from fluxvla.engines.operators.a10_operator import A10Operator
@@ -297,6 +347,10 @@ class LiveDevices:
         health_received_s = None
         last_warning = None
         last_command_id = None
+        last_command_target = None
+        target_deadband = device.get('target_deadband_raw', 0)
+        reversal = GripperReversalGuard(device.get('reversal_deadband_raw', 0),
+                                        device.get('reversal_confirm_s', 0.))
         period = 1 / device.get("io_hz", 20.)
         try:
             while not self.quit.is_set():
@@ -323,6 +377,7 @@ class LiveDevices:
                             print(f"[A10] {side} gripper warning A=0x{warning[0]:04X} B=0x{warning[1]:04X}; continuing", flush=True)
                         last_warning = warning
                 except ZXGripperError as exc:
+                    last_command_target = None
                     with self.lock:
                         previous = self.feedback.get(side)
                     # A bad motion sample is dropped, never replaced with a
@@ -336,6 +391,7 @@ class LiveDevices:
                         self.quit.wait(max(0., period - (time.monotonic() - started)))
                         continue
                     self._gripper_fault(side, exc)
+                    reversal.reset()
                     health = None
                     grip.disconnect()
                     self.quit.wait(0.2)
@@ -347,6 +403,7 @@ class LiveDevices:
                     # age is recorded separately, never presented as fresh.
                     self.feedback[side] = (state.position_raw, received_s, health.enabled)
                     target = self.target
+                    final_target = getattr(self, '_gripper_target_final', False)
                 self.log("gripper_feedback", side=side,
                          position_raw=state.position_raw, received_s=received_s,
                          target_raw=getattr(state, "target_raw", None),
@@ -360,7 +417,21 @@ class LiveDevices:
                 if target is not None and not self.cancel.is_set():
                     row, deadline = target
                     index = 6 if side == "left" else 13
-                    if time.monotonic() < deadline:
+                    model_target, requested_target = gripper_target_raw(row[index], device)
+                    # Compare with the last acknowledged target, so slow
+                    # intended motion accumulates past the deadband. Exact
+                    # open/closed endpoints always pass through unchanged.
+                    changed = (target_deadband == 0 or last_command_target is None or requested_target in (0, 9000)
+                               or abs(requested_target-last_command_target) > target_deadband)
+                    fresh = time.monotonic() < deadline
+                    allowed = reversal.allows(requested_target, time.monotonic()) if fresh else False
+                    # An explicit task endpoint is committed, unlike an
+                    # ordinary replaceable forecast. Its TTL may be shorter
+                    # than confirmation; issue it once while it is fresh.
+                    allowed = allowed or (fresh and final_target)
+                    if not fresh:
+                        reversal.pending_s = None
+                    if fresh and changed and allowed:
                         if not health.enabled:
                             self._gripper_fault(side, "Gripper must already be enabled; no automatic enable")
                             self.quit.wait(0.2)
@@ -372,7 +443,7 @@ class LiveDevices:
                                            if device.get("compact_trigger", False) else {})
                                 command_id = grip.set_position_raw(
                                     device["device_id"],
-                                    int(round(row[index] * 9000)),
+                                    requested_target,
                                     speed=device["speed"], torque=device["torque"],
                                     feedback=health,
                                     motion_deadline_s=deadline,
@@ -380,19 +451,27 @@ class LiveDevices:
                                 )
                                 if command_id != last_command_id:
                                     self.log("gripper_command", side=side,
-                                             target_raw=int(round(row[index] * 9000)),
+                                             target_raw=requested_target,
+                                             model_target_raw=model_target,
+                                             applied_bias_raw=requested_target - model_target,
                                              command_id=command_id,
                                              write_started_s=write_started,
                                              acknowledged_s=time.monotonic(),
                                              speed=device["speed"], torque=device["torque"])
                                 last_command_id = command_id
+                                last_command_target = requested_target
+                                reversal.acknowledge(requested_target)
                             except ZXGripperInputExpired as exc:
                                 self.log("gripper_target_discarded", side=side,
                                          error=str(exc), cancelled=self.cancel.is_set())
                             except ZXGripperError as exc:
                                 self._gripper_fault(side, exc)
+                                reversal.reset()
                                 health = None
                                 grip.disconnect()
+                else:
+                    last_command_target = None
+                    reversal.reset()
                 # No catch-up burst after a slow read/write; use latest target.
                 self.quit.wait(max(0., period - (time.monotonic() - started)))
         except BaseException as exc:
@@ -603,6 +682,7 @@ class LiveDevices:
             else:
                 timing = self.robot.send_joints({mapping[1]: row[:6], mapping[0]: row[7:13]})
             self.target = (row.copy(), time.monotonic() + 0.1)
+            self._gripper_target_final = bool(final)
         return timing
 
     def arrival_feedback(self):
@@ -731,6 +811,8 @@ class ZmqPolicy:
             status = MsgSerializer.from_bytes(self.socket.recv())
             if isinstance(status, dict) and isinstance(status.get('model'), dict):
                 self.metadata['model'] = status['model']
+            if isinstance(status, dict) and isinstance(status.get('rtc'), dict):
+                self.metadata['rtc'] = status['rtc']
         except BaseException:
             self.close()
             raise
@@ -747,6 +829,9 @@ class ZmqPolicy:
             task_description=observation.get("prompt", self.prompt),
         )
         obs.update({name: observation[f"observation/images/{alias}"] for name, alias in CAMERAS.items()})
+        for key in ('a10_rtc_config', 'a10_rtc_actions', 'a10_rtc_execution'):
+            if key in observation:
+                obs[key] = observation[key]
         self.socket.send(encode_predict_request(obs, "", fmt="msgpack", compress=False))
         response = decode_predict_response(self.socket.recv(), fmt=0)
         if "error" in response:
@@ -754,7 +839,7 @@ class ZmqPolicy:
         actions = np.load(io.BytesIO(response["action_data"]), allow_pickle=False)
         if actions.ndim == 3 and actions.shape[0] == 1:
             actions = actions[0]
-        return dict(actions=actions)
+        return dict(actions=actions, debug=response.get('debug', {}))
 
     def close(self):
         self.socket.close(linger=0)

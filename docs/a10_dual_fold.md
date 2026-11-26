@@ -58,7 +58,8 @@ HTTP超时、设备反馈新鲜度、关节步长和故障检查继续生效；�
 ## 共用推理控制配置与后端选择
 
 双臂推理统一使用 `configs/a10/a10_dual_inference.py`。默认选择
-`fluxvla`，权重目录为 `checkpoints/FluxVLA-Cloth-Folding-04-50k`。
+`openpi`，连接现场 `127.0.0.1:8001` WebSocket 服务。
+选择 `fluxvla` 时使用 `checkpoints/FluxVLA-Cloth-Folding-04-50k` 模型包及ZMQ/5556服务。
 模型选择仅改变传输协议、默认服务端口、提示词和服务器数据预处理，
 OpenPI 与 FluxVLA 共用 timed_aj 固定 A、20 个 30Hz 策略点各发一次
 （30Hz、20 包）的控制流程。上游保留现场倍率与电机配置。
@@ -73,13 +74,13 @@ python -m fluxvla.engines.runners.serving.serve \
   --host 127.0.0.1 --port 5556
 ```
 
-服务就绪后启动运动客户端：
+FluxVLA服务就绪后，显式选择对应的运动客户端后端：
 
 ```bash
-python scripts/inference.py --config configs/a10/a10_dual_inference.py
+python scripts/inference.py --config configs/a10/a10_dual_inference.py --model fluxvla
 ```
 
-切回已经启动的 OpenPI 服务，只改后端选择：
+使用现场已有 OpenPI 服务（也是不指定模型时的默认选择）：
 
 ```bash
 python scripts/inference.py --config configs/a10/a10_dual_inference.py \
@@ -98,6 +99,9 @@ FluxVLA 默认连接 `127.0.0.1:5556`。端点和超时仍可通过
 模型结构、权重、tokenizer、统计文件须来自同一兼容模型包。
 
 ## 控制流程与参数
+
+执行接口支持项目通用的 `async_execution` 与 `rtc_config`；默认仍是下面的同步基线。
+异步供点、时间对齐、RTC 模型服务及启动方式见 [公共执行框架](a10_framework_execution.md)。
 
 每轮依次执行：新观测 → 模型输出 → 完整动作校验 → 发送20个策略点 → 下一轮观测。
 普通块尾不等待实际位置、不发stop/start、不标final。启动确认一次，发送阶段没有逐点GET/taj_status查询。
@@ -125,6 +129,15 @@ FluxVLA模型服务使用模型包内的tokenizer、统计及预处理；客户�
 读写共用串口，100Hz不是连续写入时的实收保证；单独采样约99Hz，
 同一故障片段两次连续换目标测试实收左约70–74Hz、右约64–65Hz。
 直接使用最新目标，不排队补发过期点，不等待到位或接触，不阻塞下一轮观测/推理。
+
+推理串口下发时，两侧默认增加 `closure_bias_raw=450` 的闭合偏置，
+在45 raw死区之前应用；例如模型8000对应下发8450，8800对应9000。
+模型位于0～`closure_bias_fade_raw=900`时，偏置按模型位置线性减小，
+所以全开0仍下发0，30只下发45，不把接近全开的模型噪声变成大幅闭合。
+每次都从本次模型目标计算，不累计、不等待到位；原始预测与实测反馈不变。
+`gripper_command`同时记录`model_target_raw`、最终`target_raw`和`applied_bias_raw`。
+两侧可分别用`--cfg-options grippers.left.closure_bias_raw=300 grippers.right.closure_bias_raw=300`
+调整；设为0关闭本侧偏置。该补偿是部署侧临时措施，不能替代夹持效果实机核验。
 
 训练适配示例保留在 `configs/pi05/pi05_paligemma_a10_dual_fold_10steps.py`，
 该10步示例用于接口验证；当前部署默认使用50k模型，不使用该测试权重。

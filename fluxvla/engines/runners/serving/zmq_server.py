@@ -241,7 +241,8 @@ def create_server(
         if isinstance(obs, dict) and 'a10_rtc_config' in obs:
             import json
             rtc_request = dict(config=json.loads(obs.pop('a10_rtc_config')),
-                               absolute_actions=obs.pop('a10_rtc_actions', None))
+                               absolute_actions=obs.pop('a10_rtc_actions', None),
+                               execution=obs.pop('a10_rtc_execution', 'synchronous_remaining_prefix'))
             if _wire_format == FORMAT_PROTOBUF:
                 raise ValueError('A10 RTC currently requires the msgpack serializer')
         rtc_info = None
@@ -342,6 +343,10 @@ def create_server(
         return {'status': 'ok'}
 
     def get_status() -> dict:
+        import inspect
+        normalizes_prefix = callable(getattr(denormalize_action, 'normalize_absolute', None))
+        supports_rtc = (normalizes_prefix
+                        and 'rtc_config' in inspect.signature(vla.predict_action).parameters)
         with lock:
             n = total_requests
             avg = (total_infer_time / n) if n > 0 else 0.0
@@ -350,6 +355,9 @@ def create_server(
             'uptime_s': time.time() - start_time,
             'total_requests': n,
             'avg_infer_time': avg,
+            'rtc': dict(absolute_prefix_version=1,
+                        state_dims=[getattr(denormalize_action, 'state_dim', 7)] if normalizes_prefix else [],
+                        methods=['guidance', 'prefix'] if supports_rtc else []),
             'model': {key: model_metadata[key] for key in
                       ('config_path', 'checkpoint_dir', 'checkpoint_path', 'dtype')
                       if model_metadata and model_metadata.get(key) is not None},

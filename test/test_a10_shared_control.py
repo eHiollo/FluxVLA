@@ -13,6 +13,52 @@ from fluxvla.engines.operators.kaanh_commands.m_init import move_to_init
 
 
 class SharedControlTest(unittest.TestCase):
+    def test_inference_can_select_tool_while_idle_then_start_cartesian(self):
+        self.controller.coordinate = 'Axis'
+        client = self.client('inference', command_mode='cartesian')
+        state = client.ensure_tool_coordinate()
+        self.assertEqual(state.raw['ret_context']['motion_msg']['jog_coordinate'], 'Tool')
+        self.assertIsNone(self.robot.owner)
+        self.assertFalse(self.controller.active)
+        client.start_follower('cartesian')
+        self.assertEqual(self.robot.owner, client._connection.session_id)
+        client.stop_follower()
+
+    def test_inference_tool_permission_never_grants_arbitrary_commands(self):
+        client = self.client('inference')
+        for command in ('manual_en', 'set_jog_coordinate --axis', 'set_jog_coordinate --tool --extra'):
+            with self.subTest(command=command), self.assertRaisesRegex(PermissionError, 'console role'):
+                client._connection.request(command)
+            self.assertNotIn(command, self.controller.commands)
+        with self.assertRaisesRegex(PermissionError, 'available control session'):
+            self.robot.handle(dict(session_id='status-only', role='inference', op='request',
+                                   status_channel=True, command='set_jog_coordinate --tool'))
+
+    def test_inference_tool_selection_cannot_preempt_owner_or_console_operation(self):
+        owner, client, console = self.client('teleop'), self.client('inference'), self.client('console')
+        owner.start_follower()
+        with self.assertRaisesRegex(PermissionError, 'available control session'):
+            client._connection.request('set_jog_coordinate --tool')
+        self.assertTrue(self.controller.active)
+        self.assertEqual(self.robot.owner, owner._connection.session_id)
+        self.assertNotIn('set_jog_coordinate --tool', self.controller.commands)
+        owner.stop_follower()
+        console.begin_shared_console_operation()
+        try:
+            with self.assertRaisesRegex(PermissionError, 'available control session'):
+                client._connection.request('set_jog_coordinate --tool')
+        finally:
+            console.end_shared_console_operation()
+
+    def test_inference_tool_selection_requires_confirmed_stop_at_service(self):
+        client = self.client('inference')
+        reply = status_reply(active=False)
+        reply['ret_context']['robot_msg']['motion'] = 'Running'
+        with patch.object(self.robot, 'read_state', return_value=reply):
+            with self.assertRaisesRegex(PermissionError, 'healthy Stopped'):
+                client._connection.request('set_jog_coordinate --tool')
+        self.assertNotIn('set_jog_coordinate --tool', self.controller.commands)
+
     def test_old_relay_byte_count_does_not_fabricate_udp_timestamp(self):
         from fluxvla.engines.communication.a10_shared_connection import _Datagram
         connection = Mock()

@@ -722,6 +722,8 @@ class A10Operator(BaseOperator):
             self._connection = _FollowerConnection(host, ws_port, udp_port, self.timeout_s,
                                                    joint_udp_port)
         self.last_stop_confirmed = False
+        self._own_timed_ee_stream_id = None
+        self._timed_ee_start_attempted = False
         self._status_connection = None
         self._status_thread = None
         self._status_stop = threading.Event()
@@ -874,6 +876,7 @@ class A10Operator(BaseOperator):
             self._confirmed_active = self._started_here = False
             self._start_confirmed = False
             self._follower_mode = None
+            self._own_timed_ee_stream_id = None
             self._reset_cartesian_encoding()
             errors = feedback_errors
             closers = [self._connection.close]
@@ -941,6 +944,87 @@ class A10Operator(BaseOperator):
         with self._io_lock:
             self._require_motion(allow_cancelled=True)
             return self._connection.call('timed_stop', allow_cancelled=True)
+
+    def timed_ee_status(self):
+        """Read command-FK status; this is not actual robot feedback."""
+        from ..communication.a10_shared_connection import SharedFollowerConnection
+        if not isinstance(self._connection, SharedFollowerConnection):
+            raise RuntimeError('timed_ee requires the managed shared control service')
+        return self._connection.call('timed_ee_status', allow_cancelled=True)
+
+    def start_timed_ee(self, options=None):
+        with self._io_lock:
+            self._require_motion()
+            from ..communication.a10_shared_connection import SharedFollowerConnection
+            if not isinstance(self._connection, SharedFollowerConnection):
+                raise RuntimeError('timed_ee requires the managed shared control service')
+            if self._own_timed_ee_stream_id is not None:
+                raise RuntimeError('Stop the owned timed_ee stream before starting another')
+            self.last_stop_confirmed = False
+            self._timed_ee_start_attempted = True  # Conservative until the relay confirms otherwise.
+            try:
+                result = self._connection.call('timed_ee_start', options=dict(options or {}))
+            except BaseException as exc:
+                state = getattr(exc, 'timed_ee_start_state', {})
+                if state.get('start_attempted') is False and state.get('lease_released') is True:
+                    self._timed_ee_start_attempted = False
+                    self.last_stop_confirmed = True  # No own task was started.
+                elif (state.get('start_attempted') is True and type(state.get('stream_id')) is int
+                      and state['stream_id'] > 0):
+                    self._own_timed_ee_stream_id = state['stream_id']
+                raise
+            self._own_timed_ee_stream_id = result['stream_id']
+            return result
+
+    @property
+    def timed_ee_start_attempted(self):
+        return getattr(self, '_timed_ee_start_attempted', False)
+
+    def send_timed_ee_target(self, pose_m_quat, *, final=False):
+        """Absolute tool1/wobj0 meters+xyzw, physical right ee0 then left ee1.
+
+        One RPC/UDP submission per new target. No feedback query or retries.
+        """
+        with self._io_lock:
+            self._require_motion()
+            from ..communication.a10_timed_ee import encode_target
+            packet = encode_target(1, 0, pose_m_quat, final)
+            poses = json.loads(packet)['pose_m_quat']
+            return self._connection.call('timed_ee_target',
+                stream_id=self._own_timed_ee_stream_id, pose_m_quat=poses, final=final)
+
+    def finish_timed_ee(self, *, timeout_s=None):
+        """Wait for final command convergence; separately verify actual feedback.
+
+        The lease remains owned until stop_timed_ee confirms task release.
+        """
+        with self._io_lock:
+            self._require_motion()
+            if timeout_s is not None and (isinstance(timeout_s, bool)
+                    or not isinstance(timeout_s, (int, float))
+                    or not math.isfinite(timeout_s) or timeout_s <= 0):
+                raise ValueError('timed_ee finish timeout must be positive and finite')
+            return self._connection.call('timed_ee_finish',
+                stream_id=self._own_timed_ee_stream_id,
+                finish_timeout_s=timeout_s,
+                timeout_s=(max(self.timeout_s, timeout_s) + 1.) if timeout_s is not None
+                else self.timeout_s + 1.)
+
+    def stop_timed_ee(self):
+        with self._io_lock:
+            self._require_motion(allow_cancelled=True)
+            if self._own_timed_ee_stream_id is None:
+                if self.timed_ee_start_attempted:
+                    raise RuntimeError('timed_ee start outcome uncertain; no stream ID confirmed; refusing to stop an unidentified task')
+                self.last_stop_confirmed = True
+                return dict(active=False, no_task_started=True)
+            self.last_stop_confirmed = False
+            result = self._connection.call('timed_ee_stop', allow_cancelled=True,
+                stream_id=self._own_timed_ee_stream_id)
+            self._own_timed_ee_stream_id = None
+            self._timed_ee_start_attempted = False
+            self.last_stop_confirmed = True
+            return result
 
     def _require_motion(self, *, allow_cancelled=False):
         if not self.allow_motion:

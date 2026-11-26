@@ -1,25 +1,107 @@
 {
   "embodiment": "teletwin_desktop/gripper-g",
-  "verified": false,
-  "purpose": "Read-only experiment: per-base origins, both model axes aligned with the forward rig frame",
+  "verified": true,
+  "verification": {
+    "confirmed_by": "user",
+    "confirmed_on": "2026-11-25",
+    "basis": "User stated mapping calibration was completed, confirmed this JSON file, and explicitly requested verified=true"
+  },
+  "read_only_validation": {
+    "passed_cycles": 3,
+    "report": "work_dirs/wallx/a10_forward_validation.json",
+    "robot_targets_sent": 0,
+    "remaining": "Full-chunk task execution and closed-loop/RTC timing validation"
+  },
+  "purpose": "User-confirmed A10 mapping: per-base origins, both model axes aligned with the forward rig frame",
+  "coordinate_audit": {
+    "axes": "Confirmed against a10_dual_vr.py per-hand matrices and the world-translation implementation",
+    "origins": "Defined at each A10 controller base frame; rig positions use the user-confirmed 1.15m base spacing and alignment",
+    "teleoperation_measures_absolute_origins": false,
+    "wallx_training_frame_verified_by_teleoperation": false,
+    "report": "work_dirs/wallx/a10_teleop_frame_audit.json",
+    "pendant_axes_confirmation": {
+      "confirmed_on": "2026-11-26",
+      "source": "user pendant observations in conversation",
+      "reference": "Forward toward table, left/right physical directions as reported by user",
+      "controller_world_axes": {
+        "left": {
+          "x": "forward",
+          "y": "left",
+          "z": "up"
+        },
+        "right": {
+          "x": "backward",
+          "y": "right",
+          "z": "up"
+        }
+      },
+      "tool_axes_at_reported_gripper_forward_posture": {
+        "x": "up",
+        "y": "right",
+        "z": "forward"
+      },
+      "tool_directions_are_posture_dependent": true,
+      "rotation_sign": "User reports positive rotation about each corresponding positive axis",
+      "scope": "Axis directions and relative 180 degree base yaw; no numeric before/after TCP data or Euler component ordering supplied"
+    }
+  },
   "model_frame_from_rig": {
-    "left": [0.0, -0.575, 0.0, 0.0, 0.0, 0.0, 1.0],
-    "right": [0.0, 0.575, 0.0, 0.0, 0.0, 0.0, 1.0]
+    "left": [
+      0.0,
+      -0.575,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "right": [
+      0.0,
+      0.575,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
   },
   "model_ee_in_grasp_m_xyzw": {
-    "left": [0.0, 0.0, -0.295, 0.0, 0.0, 0.0, 1.0],
-    "right": [0.0, 0.0, -0.295, 0.0, 0.0, 0.0, 1.0]
+    "left": [
+      0.0,
+      0.0,
+      -0.295,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "right": [
+      0.0,
+      0.0,
+      -0.295,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
   },
   "model_gripper_from_closure": {
-    "left": [1.526, 0.0],
-    "right": [1.526, 0.0]
+    "left": [
+      1.526,
+      0.0
+    ],
+    "right": [
+      1.526,
+      0.0
+    ]
   },
   "assumptions": [
-    "Each model origin is its own physical A10 base centre; both axis sets match the rig: x forward, y left, z up",
+    "Each model coordinate origin is defined at its own A10 controller base frame; rig positions use the user-confirmed base spacing and alignment",
+    "Both model axis sets match the rig: x forward, y left, z up; translation directions are consistent with the current teleoperation matrices",
     "This deliberately removes the A10 right native base's 180 degree yaw from model positions AND orientations",
     "Model EE is represented by A10 tool0, not its grasp centre",
     "A10 raw closure fraction maps linearly to model gripper opening in radians",
-    "The native-base trial produced state_coordinate_origin_ood and a 0.305m right first-step jump; this is a hypothesis for read-only validation, not a calibration"
+    "The earlier native-base trial produced state_coordinate_origin_ood and a 0.305m right first-step jump; forward-axis parameters were subsequently confirmed by the user"
   ],
   "sources": [
     "https://github.com/X-Square-Robot/xr-harness/blob/main/xr-cerebellum/docs/reference/VLA_POLICY_FRAMES.md",

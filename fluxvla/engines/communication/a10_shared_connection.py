@@ -122,8 +122,10 @@ class SharedFollowerConnection:
     def call(self, op, *, timeout_s=None, allow_cancelled=False, **data):
         with self._lock:
             if (not allow_cancelled and self.command_cancelled is not None
-                    and self.command_cancelled.is_set() and op in ('timed_start', 'timed_target')):
-                raise InterruptedError('当前命令已取消，未发送 timed_aj 控制命令')
+                    and self.command_cancelled.is_set() and op in (
+                        'timed_start', 'timed_target', 'timed_ee_start',
+                        'timed_ee_target', 'timed_ee_finish')):
+                raise InterruptedError('当前命令已取消，未发送 timed 控制命令')
             if (not allow_cancelled and self.command_cancelled is not None and self.command_cancelled.is_set()
                     and op in ('command', 'request')
                     and data.get('command', '').split(maxsplit=1)[0] not in ('get', 'read_motor', 'stop_follower', 'manual_stop')):
@@ -155,7 +157,10 @@ class SharedFollowerConnection:
                              InterruptedError=InterruptedError, PermissionError=PermissionError,
                              TimeoutError=TimeoutError, ConnectionError=ConnectionError,
                              A10ControllerError=A10ControllerError, A10ProtocolError=A10ProtocolError)
-                raise kinds.get(response.get('error_type'), RuntimeError)(response['error'])
+                error = kinds.get(response.get('error_type'), RuntimeError)(response['error'])
+                if isinstance(response.get('timed_ee_start_state'), dict):
+                    error.timed_ee_start_state = response['timed_ee_start_state']
+                raise error
             return response.get('result')
 
     def _note_failure(self, op, data, error):

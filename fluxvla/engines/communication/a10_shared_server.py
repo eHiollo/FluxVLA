@@ -15,6 +15,7 @@ from websockets.exceptions import ConnectionClosed
 from ..operators.a10_operator import _FollowerConnection, _parse_state, _set_controller_speed
 from .a10_shared_connection import ControlTransferredError
 from .a10_timed_aj import TimedAjTransport
+from .a10_timed_ee import TimedEeTransport
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,10 @@ class SharedControl:
         self.stopped = set()
         self.stop_requests = set()
         self.timed_owner = None
+        self.timed_ee_owner = None
+        self.timed_ee = TimedEeTransport(
+            self._timed_ee_command, self.read_state,
+            host, ws_port, status_ws_port, timeout_s)
         self.timed = TimedAjTransport(
             lambda *a, **k: self.control.request(*a, **k), self.read_state,
             host, ws_port, status_ws_port, timeout_s)
@@ -90,6 +95,19 @@ class SharedControl:
         self._poll_count = 0
         self._poll_started = None
         self._poll_last_duration_s = None
+
+    def _timed_ee_command(self, *args, **kwargs):
+        # Completion waits release this lock between status queries, allowing
+        # the console to stop the owned stream while another client waits.
+        with self._control_lock:
+            return self.control.request(*args, **kwargs)
+
+    def _require_timed_ee_owner(self, session_id, stream_id):
+        if (type(stream_id) is not int or stream_id <= 0
+                or self.owner != session_id or self.timed_ee_owner != session_id
+                or session_id in self.revoked or self.timed_ee.stream_id != stream_id):
+            raise ControlTransferredError(
+                "This session/stream no longer owns timed_ee; no foreign task controlled")
 
     def _remember_state(self, reply):
         # This is the actual robot receive time. Reading the cache must never
@@ -280,7 +298,10 @@ class SharedControl:
         self.revoked.add(owner)
         if reason.startswith('console'):
             self.preempted.add(owner)
-        if self.timed_owner == owner:
+        if self.timed_ee_owner == owner:
+            self.timed_ee.stop()
+            self.timed_ee_owner = None
+        elif self.timed_owner == owner:
             self.timed.stop()
             self.timed_owner = None
         else:
@@ -339,7 +360,7 @@ class SharedControl:
         with self._control_lock, self._target_lock:
             if self.owner != session_id:
                 raise ControlTransferredError('Control changed; no stop sent to the new owner')
-            if self.timed_owner == session_id:
+            if self.timed_owner == session_id or self.timed_ee_owner == session_id:
                 # The timed path retains its lease until stop is confirmed.
                 self.stop_owner('explicit_stop')
                 return dict(requested=True, confirmed=True)
@@ -391,6 +412,73 @@ class SharedControl:
                                             timeout_s=request.get('timeout_s'))
         if op == 'lease' and request['operation'] == 'status':
             return self.lease_status(session_id)
+        if op == 'timed_ee_status':
+            # Read-only: observing status never grants ownership or adopts IDs.
+            if request.get('raw', False):
+                return self._timed_ee_command('tee_status', raw=True)
+            return self.timed_ee.status()
+        if op == 'timed_ee_finish':
+            if request.get('status_channel'):
+                raise PermissionError('Status-only connections cannot finish timed_ee')
+            with self._target_lock:
+                self._require_timed_ee_owner(session_id, request.get('stream_id'))
+            # Do not hold the control/target lock for the whole wait: console
+            # stop must remain available. The callback locks each WS query.
+            result = self.timed_ee.finish(timeout_s=request.get('finish_timeout_s'))
+            with self._target_lock:
+                self._require_timed_ee_owner(session_id, request.get('stream_id'))
+            return result
+        if op == 'timed_ee_target':
+            if request.get('status_channel'):
+                raise PermissionError('Status-only connections cannot control timed_ee')
+            with self._target_lock:
+                self._require_timed_ee_owner(session_id, request.get('stream_id'))
+                with self._poll_lock:
+                    if self._poll_error is not None:
+                        raise self._poll_error
+                try:
+                    return self.timed_ee.send(request['pose_m_quat'], request['final'])
+                except BaseException:
+                    self.revoked.add(session_id)
+                    raise
+        if op in ('timed_ee_start', 'timed_ee_stop'):
+            if request.get('status_channel'):
+                raise PermissionError('Status-only connections cannot control timed_ee')
+            with self._control_lock, self._target_lock:
+                if op == 'timed_ee_start':
+                    if self.owner == session_id:
+                        raise RuntimeError('Stop the owned stream before starting another')
+                    try:
+                        self.claim(session_id, role)
+                    except BaseException as exc:
+                        exc.timed_ee_start_state = dict(start_attempted=False, stream_id=None,
+                                                       lease_released=self.owner != session_id)
+                        raise
+                    self.timed_ee_owner = session_id
+                    try:
+                        result = self.timed_ee.start(request.get('options', {}))
+                    except BaseException as exc:
+                        start_state = dict(start_attempted=self.timed_ee.start_attempted,
+                                           stream_id=self.timed_ee.stream_id, lease_released=False)
+                        self.revoked.add(session_id)
+                        if not self.timed_ee.start_attempted:
+                            self.timed_ee.close()
+                            self.timed_ee_owner = self.owner = None
+                            self.stopped.add(session_id)
+                            start_state['lease_released'] = True
+                        exc.timed_ee_start_state = start_state
+                        raise
+                    self.note('timed_ee_started', session_id=session_id,
+                              stream_id=result['stream_id'])
+                    return result
+                # A revoked owner may still stop its own uncertain task. The
+                # transport checks the controller ID again before tee_stop.
+                if (self.owner != session_id or self.timed_ee_owner != session_id
+                        or type(request.get('stream_id')) is not int
+                        or request['stream_id'] != self.timed_ee.stream_id):
+                    raise ControlTransferredError('This session/stream no longer owns timed_ee')
+                self.stop_owner('explicit_stop')
+                return dict(active=False, stopped_by_service=True)
         if op == 'timed_status':
             with self._control_lock:
                 return self.timed.status()
@@ -445,7 +533,7 @@ class SharedControl:
                 self.revoked.add(owner)
                 if owner != session_id:
                     self.preempted.add(owner)
-            if self.timed_owner is not None:
+            if self.timed_owner is not None or self.timed_ee_owner is not None:
                 with self._control_lock, self._target_lock:
                     self.stop_owner('console_stop')
                     return self.read_state()
@@ -464,9 +552,11 @@ class SharedControl:
             while not self._target_lock.acquire(timeout=.02):
                 if self.owner != session_id or session_id in self.revoked:
                     raise ControlTransferredError('Control was transferred to the console; no target sent')
-                if self.timed_owner is not None:
-                    raise PermissionError('Legacy targets cannot be sent to a timed_aj lease')
+                if self.timed_owner is not None or self.timed_ee_owner is not None:
+                    raise PermissionError('Legacy targets cannot be sent to a timed control lease')
             try:
+                if self.timed_owner is not None or self.timed_ee_owner is not None:
+                    raise PermissionError('Legacy targets cannot be sent to a timed control lease')
                 with self._poll_lock:
                     feedback_error = self._poll_error
                 if feedback_error is not None and session_id not in self._feedback_independent:
@@ -572,8 +662,8 @@ class SharedControl:
                 elif request['operation'] == 'acquire':
                     self.claim(session_id, role, require_feedback=request.get('require_feedback', True))
                 elif request['operation'] == 'acknowledge':
-                    if self.timed_owner is not None:
-                        raise PermissionError('Confirm timed_aj stop before acknowledging ownership')
+                    if self.timed_owner is not None or self.timed_ee_owner is not None:
+                        raise PermissionError('Confirm timed control stop before acknowledging ownership')
                     if (self.console_operation is not None or (self.owner is not None
                             and self.owner != session_id and self.owner not in self.revoked)):
                         raise PermissionError('Another session still owns control')
@@ -603,8 +693,8 @@ class SharedControl:
             command = request['command']
             name = command.split(maxsplit=1)[0]
             if name in ('follower_aj', 'follower_aj_tg', 'follower_cart'):
-                if self.timed_owner == session_id:
-                    raise PermissionError('Stop timed_aj before starting a native follower')
+                if self.timed_owner == session_id or self.timed_ee_owner == session_id:
+                    raise PermissionError('Stop timed control before starting a native follower')
                 self.claim(session_id, role)
                 return self.mode_command(command, True)
             if name == 'stop_follower':
@@ -628,6 +718,19 @@ class SharedControl:
                 if (self.owner not in (None, session_id) or session_id in self.preempted
                         or self.console_operation not in (None, session_id)):
                     raise ControlTransferredError('Console owns control; release VR grips before resuming')
+                return self.control.request(command)
+            if role == 'inference' and command == 'set_jog_coordinate --tool':
+                # EE inference needs the same Tool startup as teleoperation.
+                # Permit this exact command only, without console privileges,
+                # takeover, enable, or any target transmission.
+                if (request.get('status_channel') or self.owner not in (None, session_id)
+                        or session_id in self.preempted or session_id in self.revoked
+                        or self.console_operation not in (None, session_id)):
+                    raise PermissionError('Inference Tool selection requires an available control session')
+                state = _controller_state(self.read_state())
+                if (state.has_error or state.follower_active is not False
+                        or state.raw['ret_context'].get('robot_msg', {}).get('motion') != 'Stopped'):
+                    raise PermissionError('Inference Tool selection requires healthy Stopped feedback and inactive follower')
                 return self.control.request(command)
             if role != 'console':
                 raise PermissionError('Arbitrary controller commands require the console role')
@@ -665,6 +768,7 @@ class SharedControl:
                 self.stop_owner('service_shutdown')
             finally:
                 self.timed.close()
+                self.timed_ee.close()
                 self.control.close()
                 self.status.close()
                 if self.recorder is not None:
@@ -712,6 +816,8 @@ class _Handler(socketserver.StreamRequestHandler):
                     self.server.robot.note('request_error', session_id=session_id,
                                            error_type=type(exc).__name__, error=str(exc))
                     response = dict(error=str(exc), error_type=type(exc).__name__)
+                    if hasattr(exc, 'timed_ee_start_state'):
+                        response['timed_ee_start_state'] = exc.timed_ee_start_state
                 self.wfile.write(json.dumps(response, ensure_ascii=False).encode() + b'\n')
                 self.wfile.flush()
         finally:

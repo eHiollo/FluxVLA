@@ -23,11 +23,19 @@ def main(argv=None):
     from mmengine import Config
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/a10/a10_wallx_inference.py")
-    parser.add_argument("--mode", choices=("preview", "simulate", "capture", "read_only", "motion"))
+    parser.add_argument("--mode", choices=("preview", "simulate", "capture", "read_only", "motion", "trial"))
     parser.add_argument("--cycles", type=int)
+    parser.add_argument("--execute-horizon", type=int,
+                        help="Number of original future rows to execute per prediction (1..32, within valid_rows)")
     parser.add_argument("--prompt")
+    parser.add_argument("--backend", choices=("follower", "timed_ee"),
+                        help="Explicit EE backend; timed_ee requires its dedicated config")
+    parser.add_argument("--ee-action-mode", choices=("absolute", "delta"),
+                        help="delta: anchor each chunk's first future prediction at the current robot pose")
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env.wallx")
     parser.add_argument("--contract", type=Path, help="Explicit model frame/tool/gripper mapping JSON")
+    parser.add_argument("--trial-step", action="store_true",
+                        help="With --mode trial only: approach the first prediction by <=5 mm / 1 degree")
     args = parser.parse_args(argv)
     cfg = Config.fromfile(str(args.config), lazy_import=False).to_dict()
     settings = cfg["wallx"]
@@ -35,10 +43,23 @@ def main(argv=None):
         settings["mode"] = args.mode
     if args.cycles is not None:
         settings["cycles"] = args.cycles
+    if args.execute_horizon is not None:
+        settings["execute_horizon"] = args.execute_horizon
     if args.prompt is not None:
         settings["prompt"] = args.prompt
+    if args.backend is not None:
+        settings["backend"] = args.backend
+    if args.ee_action_mode is not None:
+        settings["ee_action_mode"] = args.ee_action_mode
     mode = settings["mode"]
+    if settings.get("backend", "follower") == "timed_ee" and mode == "trial":
+        raise ValueError("timed_ee requires motion/read_only/simulate; follower trial modes are separate")
+    if args.trial_step and mode != "trial":
+        raise ValueError("--trial-step requires --mode trial")
     ex = load("_wallx_ee_execution", ROOT / "fluxvla/projects/a10/wallx_execution.py")
+    if mode == "trial":
+        ex.validate_trial_cycles(settings["cycles"], args.trial_step)
+        settings = ex.trial_settings(settings)
     geometry_path = Path(settings["geometry"])
     if not geometry_path.is_absolute():
         geometry_path = ROOT / geometry_path
@@ -70,10 +91,13 @@ def main(argv=None):
 
         log("config", settings=settings, geometry=geometry.config, mode=mode)
         try:
+            timed_ee = settings.get("backend", "follower") == "timed_ee"
+            live_devices = ex.LiveTimedEEDevices if timed_ee else ex.LiveEEDevices
             if mode == "simulate":
-                devices, policy = ex.SimEEDevices(geometry), ex.SimPolicy()
+                devices = (ex.SimTimedEEDevices if timed_ee else ex.SimEEDevices)(geometry)
+                policy = ex.SimPolicy()
             elif mode == "capture":
-                devices = ex.LiveEEDevices(dict(cfg, bridge=settings), log, geometry, motion=False)
+                devices = live_devices(dict(cfg, bridge=settings), log, geometry, motion=False)
                 sample = devices.sample()
                 payload, geom = ex.observation(sample, geometry, contract, settings)
                 capture_dir = folder / "capture"
@@ -96,12 +120,13 @@ def main(argv=None):
                 policy = client.WallXClient(api_key, url, settings["timeout_s"])
                 if contract.embodiment not in client.public_embodiments(policy.metadata):
                     raise ValueError("Configured embodiment is absent from cloud metadata")
-                devices = ex.LiveEEDevices(dict(cfg, bridge=settings), log, geometry, motion=mode == "motion")
+                devices = live_devices(dict(cfg, bridge=settings), log, geometry, motion=mode in ("motion", "trial"))
             # run() owns cleanup after both resources have been constructed.
             owned_devices, owned_policy = devices, policy
             devices = policy = None
             result = ex.run(owned_devices, owned_policy, geometry, contract, settings, log,
-                            cycles=settings["cycles"], read_only=mode == "read_only")
+                            cycles=settings["cycles"], read_only=mode == "read_only", limited_trial=mode == "trial",
+                            trial_step=args.trial_step)
             log("complete", **result)
             print("A10_WALLX_EE_OK " + json.dumps(result), flush=True)
             return 0

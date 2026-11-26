@@ -7,7 +7,10 @@ operator = dict(motor_acceleration_deg_s2=None, joint_follower_velocity_percent=
 wallx = dict(
     mode="preview", cycles=1, prompt="fold the black cloth using both arms",
     geometry="configs/a10/a10_wallx_geometry.json",
-    timeout_s=120., execute_horizon=6, action_dt=.0337, interpolation_steps=3,
+    timeout_s=120., execute_horizon=6, action_dt=.0337, interpolation_steps=6,
+    # More substeps preserve the 5 mm tool0 bound; cap at the VR's 90 Hz.
+    # Execution may take longer than the model's nominal action duration.
+    max_control_hz=90.,
     max_robot_age_s=.15, max_camera_age_s=.15, max_gripper_age_s=.2, max_skew_s=.15,
     max_ee_step_m=.02, max_ee_step_rad=.10,
     max_control_step_m=.005, max_control_step_rad=.04,
